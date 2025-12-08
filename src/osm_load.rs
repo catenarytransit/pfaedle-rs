@@ -55,7 +55,11 @@ pub struct OsmData {
 pub struct OsmBuilder;
 
 impl OsmBuilder {
-    pub fn read(path: &Path, used_route_types: &HashSet<RouteType>) -> Result<OsmData> {
+    pub fn read(
+        path: &Path,
+        used_route_types: &HashSet<RouteType>,
+        bbox: Option<(f64, f64, f64, f64)>, // min_lon, min_lat, max_lon, max_lat
+    ) -> Result<OsmData> {
         println!("Reading OSM file {:?} in multiple passes...", path);
 
         // --- Data Structures to persist across passes ---
@@ -173,8 +177,18 @@ impl OsmBuilder {
                 if let OsmObj::Node(n) = obj {
                     let nid = n.id.0;
                     if needed_nodes.contains(&nid) {
+                        let lat = n.lat();
+                        let lon = n.lon();
+
+                        // Filter by Bounding Box if present
+                        if let Some((min_lon, min_lat, max_lon, max_lat)) = bbox {
+                            if lon < min_lon || lon > max_lon || lat < min_lat || lat > max_lat {
+                                continue;
+                            }
+                        }
+
                         let idx = graph.add_node(NodePL {
-                            point: Point::new(n.lon(), n.lat()),
+                            point: Point::new(lon, lat),
                         });
                         osm_node_to_graph_idx.insert(nid, idx);
 
@@ -848,6 +862,10 @@ mod tests {
     }
 }
 
-pub fn load_osm(path: &Path, used_route_types: &HashSet<RouteType>) -> Result<OsmData> {
-    OsmBuilder::read(path, used_route_types)
+pub fn load_osm(
+    path: &Path,
+    used_route_types: &HashSet<RouteType>,
+    bbox: Option<(f64, f64, f64, f64)>,
+) -> Result<OsmData> {
+    OsmBuilder::read(path, used_route_types, bbox)
 }

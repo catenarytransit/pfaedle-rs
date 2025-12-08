@@ -9,6 +9,7 @@ mod router;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use gtfs_structures::RouteType;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -71,7 +72,48 @@ fn main() -> Result<()> {
     let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)?;
 
     // 2. Load OSM
-    let osm_data = osm_load::load_osm(&args.osm_file, &gtfs_data.used_route_types)?;
+    // Calculate BBox from GTFS stops
+    let bbox = if gtfs_data.gtfs.stops.is_empty() {
+        None
+    } else {
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+
+        for stop in gtfs_data.gtfs.stops.values() {
+            min_lat = min_lat.min(stop.latitude);
+            max_lat = max_lat.max(stop.latitude);
+            min_lon = min_lon.min(stop.longitude);
+            max_lon = max_lon.max(stop.longitude);
+        }
+
+        let has_rail = gtfs_data.used_route_types.contains(&RouteType::Rail);
+        let padding_km = if has_rail { 200.0 } else { 100.0 };
+        println!(
+            "Stops BBox: lat [{:.4}, {:.4}], lon [{:.4}, {:.4}]. Padding: {} km",
+            min_lat, max_lat, min_lon, max_lon, padding_km
+        );
+
+        let lat_padding = padding_km / 111.132;
+        let center_lat = (min_lat + max_lat) / 2.0;
+        let cos_lat = center_lat.to_radians().cos().abs().max(0.1);
+        let lon_padding = padding_km / (111.132 * cos_lat);
+
+        let final_bbox = (
+            min_lon - lon_padding,
+            min_lat - lat_padding,
+            max_lon + lon_padding,
+            max_lat + lat_padding,
+        );
+        println!(
+            "Cropping OSM usage to BBox: lat [{:.4}, {:.4}], lon [{:.4}, {:.4}]",
+            final_bbox.1, final_bbox.3, final_bbox.0, final_bbox.2
+        );
+        Some(final_bbox)
+    };
+
+    let osm_data = osm_load::load_osm(&args.osm_file, &gtfs_data.used_route_types, bbox)?;
 
     // 3. Match
     let results = matcher::match_patterns(&gtfs_data, &osm_data);
