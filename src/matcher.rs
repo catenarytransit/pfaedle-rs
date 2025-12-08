@@ -43,15 +43,21 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
         // 2. Snap to nearest OSM nodes
         // Select Index based on RouteType
         let index_to_use = match pattern.route_type {
-            Some(RouteType::Tramway) | Some(RouteType::Subway) | Some(RouteType::Rail) => {
-                &osm.rail_tree
-            }
-            _ => &osm.bus_tree, // Default to bus/road for Bus, Ferry (?), etc.
+            Some(RouteType::Tramway) => osm.tram_tree.as_ref().or(osm.bus_tree.as_ref()),
+            Some(RouteType::Subway) => osm.metro_tree.as_ref(),
+            Some(RouteType::Rail) => osm.rail_tree.as_ref(),
+            _ => osm.bus_tree.as_ref(), // Bus, Ferry, etc uses road network
         };
+
+        if index_to_use.is_none() {
+            // println!("Warning: No spatial index found for route type {:?}", pattern.route_type);
+            continue;
+        }
+        let index = index_to_use.unwrap();
 
         let mut snapped_nodes = Vec::new();
         for point in &stop_coords {
-            let nearest = index_to_use.nearest_neighbor(&[point.x(), point.y()]);
+            let nearest = index.nearest_neighbor(&[point.x(), point.y()]);
             if let Some(sn) = nearest {
                 snapped_nodes.push(sn.index);
             }

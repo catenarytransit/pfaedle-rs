@@ -71,7 +71,7 @@ pub fn pathfind(
                 edge.from
             };
 
-            let tentative_g = current_g + edge.payload.weight;
+            let tentative_g = current_g + edge.payload.length();
 
             if tentative_g < *g_score.get(&neighbor).unwrap_or(&f64::INFINITY) {
                 came_from.insert(neighbor, (current, edge_idx));

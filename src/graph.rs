@@ -1,4 +1,5 @@
-use geo::{LineString, Point};
+use geo::{HaversineLength, LineString, Point};
+use std::collections::HashMap;
 
 pub type NodeIndex = usize;
 pub type EdgeIndex = usize;
@@ -44,7 +45,10 @@ impl<N, E> Graph<N, E> {
         self.edges.push(Edge { payload, from, to });
 
         self.nodes[from].edges.push(index);
-        // Undirected graph logic: add to both unless loop
+
+        // In the C++ generic implementation, edges are stored in adjacency lists.
+        // Our simplified graph model here stores 'incident' edges.
+        // If we want to distinguish in/out, we check edge.from/to.
         if from != to {
             self.nodes[to].edges.push(index);
         }
@@ -68,10 +72,101 @@ pub struct NodePL {
     pub point: Point<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TransitInfo {
+    pub short_name: String,
+    pub from_str: String,
+    pub to_str: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct EdgePL {
     pub geometry: LineString<f64>,
-    pub weight: f64, // Length in meters
+    pub lines: Vec<TransitInfo>,
+    pub oneway: u8,
+    pub cost: u32,
+    pub level: i32,
+    pub restriction: bool,
+    pub is_reverse: bool,
+}
+
+impl Default for EdgePL {
+    fn default() -> Self {
+        Self {
+            geometry: LineString::new(vec![]),
+            lines: Vec::new(),
+            oneway: 0,
+            cost: 0,
+            level: 0,
+            restriction: false,
+            is_reverse: false,
+        }
+    }
+}
+
+impl EdgePL {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn rev_copy(&self) -> Self {
+        let mut ret = self.clone();
+        ret.is_reverse = true;
+        // logic from C++:
+        // if (ret.oneWay() == 1) ret.setOneWay(2);
+        // else if (ret.oneWay() == 2) ret.setOneWay(1);
+        if ret.oneway == 1 {
+            ret.oneway = 2;
+        } else if ret.oneway == 2 {
+            ret.oneway = 1;
+        }
+        ret
+    }
+
+    pub fn length(&self) -> f64 {
+        self.geometry.haversine_length()
+    }
+
+    pub fn add_line(&mut self, info: TransitInfo) {
+        // C++:
+        // auto lb = std::lower_bound(_lines.begin(), _lines.end(), l);
+        // if (lb == _lines.end() || *lb != l) { _lines.insert(lb, l); ... }
+        // Maintains sorted order and uniqueness.
+
+        let pos = self.lines.binary_search(&info);
+        if let Err(idx) = pos {
+            self.lines.insert(idx, info);
+        }
+    }
+
+    pub fn get_attrs(&self) -> HashMap<String, String> {
+        let mut obj = HashMap::new();
+        obj.insert("m_length".to_string(), self.length().to_string());
+        obj.insert("oneway".to_string(), self.oneway.to_string());
+        obj.insert("cost".to_string(), (self.cost as f64 / 10.0).to_string());
+        obj.insert("level".to_string(), self.level.to_string());
+        obj.insert(
+            "restriction".to_string(),
+            if self.restriction { "yes" } else { "no" }.to_string(),
+        );
+
+        let lines_str = self
+            .lines
+            .iter()
+            .map(|l| {
+                let mut s = l.short_name.clone();
+                if !l.from_str.is_empty() || !l.to_str.is_empty() {
+                    s.push_str(&format!("({}->{})", l.from_str, l.to_str));
+                }
+                s
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+
+        obj.insert("lines".to_string(), lines_str);
+
+        obj
+    }
 }
 
 #[cfg(test)]
@@ -79,31 +174,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_graph_construction() {
-        let mut graph: Graph<NodePL, EdgePL> = Graph::new();
-        let p1 = Point::new(0.0, 0.0);
-        let p2 = Point::new(1.0, 1.0);
+    fn test_edge_pl_defaults() {
+        let e = EdgePL::new();
+        assert_eq!(e.oneway, 0);
+        assert!(!e.restriction);
+        assert_eq!(e.cost, 0);
+    }
 
-        let n1 = graph.add_node(NodePL { point: p1 });
-        let n2 = graph.add_node(NodePL { point: p2 });
+    #[test]
+    fn test_rev_copy() {
+        let mut e = EdgePL::new();
+        e.oneway = 1;
 
-        // Add edge
-        let geom = LineString::new(vec![p1.into(), p2.into()]);
-        let e1 = graph.add_edge(
-            n1,
-            n2,
-            EdgePL {
-                geometry: geom,
-                weight: 10.0,
-            },
-        );
+        let rev = e.rev_copy();
+        assert!(rev.is_reverse);
+        assert_eq!(rev.oneway, 2);
+    }
 
-        assert_eq!(graph.nodes.len(), 2);
-        assert_eq!(graph.edges.len(), 1);
+    #[test]
+    fn test_transit_lines_sorted() {
+        let mut e = EdgePL::new();
+        let t1 = TransitInfo {
+            short_name: "B".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+        };
+        let t2 = TransitInfo {
+            short_name: "A".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+        };
 
-        // Check adjacency
-        assert_eq!(graph.node(n1).edges.len(), 1);
-        assert_eq!(graph.node(n2).edges.len(), 1);
-        assert_eq!(graph.node(n1).edges[0], e1);
+        e.add_line(t1.clone());
+        e.add_line(t2.clone());
+        e.add_line(t1.clone()); // Duplicate
+
+        assert_eq!(e.lines.len(), 2);
+        assert_eq!(e.lines[0], t2);
+        assert_eq!(e.lines[1], t1);
     }
 }

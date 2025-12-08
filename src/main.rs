@@ -3,6 +3,7 @@ mod gtfs_load;
 mod matcher;
 mod osm_load;
 mod pathfinding;
+mod router;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -54,7 +55,7 @@ fn main() -> Result<()> {
     let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir)?;
 
     // 2. Load OSM
-    let osm_data = osm_load::load_osm(&args.osm_file)?;
+    let osm_data = osm_load::load_osm(&args.osm_file, &gtfs_data.used_route_types)?;
 
     // 3. Match
     let results = matcher::match_patterns(&gtfs_data, &osm_data);

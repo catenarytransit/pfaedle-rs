@@ -27,6 +27,7 @@ pub struct GtfsData {
     pub gtfs: Gtfs,
     // Map pattern to list of Trip references
     pub patterns: HashMap<StopPattern, Vec<String>>, // Using TripId
+    pub used_route_types: std::collections::HashSet<RouteType>,
 }
 
 pub fn load_gtfs(path: &Path) -> Result<GtfsData> {
@@ -65,7 +66,15 @@ pub fn load_gtfs(path: &Path) -> Result<GtfsData> {
         patterns.entry(pattern).or_default().push(trip_id.clone());
     }
 
-    println!("Found {} unique patterns", patterns.len());
+    let used_route_types: std::collections::HashSet<RouteType> =
+        patterns.keys().filter_map(|p| p.route_type).collect();
 
-    Ok(GtfsData { gtfs, patterns })
+    println!("Found {} unique patterns", patterns.len());
+    println!("Used route types: {:?}", used_route_types);
+
+    Ok(GtfsData {
+        gtfs,
+        patterns,
+        used_route_types,
+    })
 }
