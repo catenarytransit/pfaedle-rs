@@ -14,272 +14,271 @@ pub struct ShapeResult {
     pub matched_route_color: Option<String>,
 }
 
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, ShapeResult> {
-    let mut results = HashMap::new();
     let total_patterns = gtfs.patterns.len();
-    let mut processed = 0;
+    let processed = AtomicUsize::new(0);
 
     println!("Matching {} patterns...", total_patterns);
 
-    for (pattern, _trips) in &gtfs.patterns {
-        processed += 1;
-        if processed % 10 == 0 {
-            println!("Processed {}/{}", processed, total_patterns);
-        }
+    let results: HashMap<StopPattern, ShapeResult> = gtfs
+        .patterns
+        .par_iter()
+        .map(|(pattern, _trips)| {
+            let current_processed = processed.fetch_add(1, Ordering::Relaxed);
+            if current_processed % 100 == 0 {
+                println!("Processed {}/{}", current_processed, total_patterns);
+            }
 
-        // 1. Get Stop Coordinates
-        let mut stop_coords = Vec::new();
-        for stop_id in &pattern.stop_ids {
-            if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
-                // Geo: x=lon, y=lat. Handle Option fields.
-                if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
-                    stop_coords.push(Point::new(lon, lat));
+            // 1. Get Stop Coordinates
+            let mut stop_coords = Vec::new();
+            for stop_id in &pattern.stop_ids {
+                if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
+                    // Geo: x=lon, y=lat. Handle Option fields.
+                    if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
+                        stop_coords.push(Point::new(lon, lat));
+                    }
                 }
             }
-        }
 
-        if stop_coords.len() < 2 {
-            continue;
-        }
+            if stop_coords.len() < 2 {
+                return None;
+            }
 
-        let allowed_modes = match pattern.route_type {
-            Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
-            Some(RouteType::Subway) => MODE_SUBWAY,
-            Some(RouteType::Rail) => MODE_RAIL,
-            _ => MODE_BUS,
-        };
+            let allowed_modes = match pattern.route_type {
+                Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
+                Some(RouteType::Subway) => MODE_SUBWAY,
+                Some(RouteType::Rail) => MODE_RAIL,
+                _ => MODE_BUS,
+            };
 
-        // 2. Snap to nearest OSM nodes (Candidates)
-        // Select Index based on RouteType
-        let index_to_use = match pattern.route_type {
-            Some(RouteType::Tramway) => osm.tram_tree.as_ref().or(osm.bus_tree.as_ref()),
-            Some(RouteType::Subway) => osm.metro_tree.as_ref(),
-            Some(RouteType::Rail) => osm.rail_tree.as_ref(),
-            _ => osm.bus_tree.as_ref(), // Bus, Ferry, etc uses road network
-        };
+            // 2. Snap to nearest OSM nodes (Candidates)
+            // Select Index based on RouteType
+            let index_to_use = match pattern.route_type {
+                Some(RouteType::Tramway) => osm.tram_tree.as_ref().or(osm.bus_tree.as_ref()),
+                Some(RouteType::Subway) => osm.metro_tree.as_ref(),
+                Some(RouteType::Rail) => osm.rail_tree.as_ref(),
+                _ => osm.bus_tree.as_ref(), // Bus, Ferry, etc uses road network
+            };
 
-        if index_to_use.is_none() {
-            continue;
-        }
-        let index = index_to_use.unwrap();
+            if index_to_use.is_none() {
+                return None;
+            }
+            let index = index_to_use.unwrap();
 
-        let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
-        // How many candidates to consider per stop?
-        const K_NEAREST: usize = 50;
+            let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
+            // How many candidates to consider per stop?
+            const K_NEAREST: usize = 50;
 
-        for point in &stop_coords {
-            let candidates: Vec<usize> = index
-                .nearest_neighbor_iter(&[point.x(), point.y()])
-                .take(K_NEAREST)
-                .map(|sn| sn.index)
+            for point in &stop_coords {
+                let candidates: Vec<usize> = index
+                    .nearest_neighbor_iter(&[point.x(), point.y()])
+                    .take(K_NEAREST)
+                    .map(|sn| sn.index)
+                    .collect();
+
+                if candidates.is_empty() {
+                    // If we can't snap a stop, we can't route properly?
+                    // For now, keep empty vec, handle downstream
+                }
+                stop_candidates.push(candidates);
+            }
+
+            if stop_candidates.len() != stop_coords.len()
+                || stop_candidates.iter().any(|c| c.is_empty())
+            {
+                // If any stop failed to snap, we might have issues.
+                // But let's proceed if majority are there? No, hard fail for now or fallback?
+                // Actually original logic continued if len != len.
+                if stop_candidates.len() != stop_coords.len() {
+                    // println!("Warning: Could not snap all stops for pattern");
+                    return None;
+                }
+            }
+
+            // 3. Try Relation Matching
+            let mut full_path_geometry = Vec::new();
+            let mut relation_found = false;
+
+            // Relation Candidate logic
+            // Vote for relations based on ALL candidates
+            // Scoring: Calculate coverage ratio (stops covered / total stops)
+            // Map: Relation Index -> (Coverage Score, Average Distance to Candidates)
+            // Score = num_stops_covered / total_stops
+            // Prioritize: 1. Coverage Score (Desc), 2. Candidate Count (Desc, as heuristic for better fit)
+
+            let mut relation_scores: HashMap<usize, (f64, usize)> = HashMap::new();
+
+            for candidates in &stop_candidates {
+                // Identify unique relations covering this stop
+                let mut seen_for_stop = HashSet::new();
+                for &node_idx in candidates {
+                    if let Some(rels) = osm.node_to_relations.get(&node_idx) {
+                        for &r_idx in rels {
+                            if seen_for_stop.insert(r_idx) {
+                                // First time this relation covers this stop
+                                let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
+                                entry.0 += 1.0;
+                            }
+                            // Increment candidate count
+                            let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
+                            entry.1 += 1;
+                        }
+                    }
+                }
+            }
+
+            let mut candidates: Vec<usize> = relation_scores
+                .iter()
+                .filter(|(r_idx, (_covered_stops, _count))| {
+                    let rel = &osm.relations[**r_idx];
+
+                    // Heuristic: Must contain at least one candidate for the first stop AND one for the last stop
+                    // UNLESS coverage is very high (e.g. > 90%), then maybe we accept it even if endpoints are fuzzy?
+                    // But generally, the start/end requirement is good for directional correctness.
+                    if stop_candidates.is_empty() {
+                        return false;
+                    }
+
+                    let start_candidates = &stop_candidates[0];
+                    let end_candidates = stop_candidates.last().unwrap();
+                    let has_start = start_candidates.iter().any(|&n| rel.nodes.contains(&n));
+                    let has_end = end_candidates.iter().any(|&n| rel.nodes.contains(&n));
+
+                    // Relaxed condition: If coverage is > 80%, we accept even if start/end checks fail?
+                    // User said: "It needs to match the full line relation... If none is found, fall back to A*"
+                    // "Cuts short" implies we picked a partial relation.
+                    // If we enforce start && end, we avoid partial segments that don't span the whole route.
+                    // So keeping start && end is GOOD justification.
+
+                    has_start && has_end
+                })
+                .map(|(k, _)| *k)
                 .collect();
 
-            if candidates.is_empty() {
-                // If we can't snap a stop, we can't route properly?
-                // For now, keep empty vec, handle downstream
-            }
-            stop_candidates.push(candidates);
-        }
+            // Sort candidates by coverage (Desc), then Candidate Count (Desc)
+            candidates.sort_by(|&a, &b| {
+                let (score_a, count_a) = relation_scores[&a];
+                let (score_b, count_b) = relation_scores[&b];
 
-        if stop_candidates.len() != stop_coords.len()
-            || stop_candidates.iter().any(|c| c.is_empty())
-        {
-            // If any stop failed to snap, we might have issues.
-            // But let's proceed if majority are there? No, hard fail for now or fallback?
-            // Actually original logic continued if len != len.
-            if stop_candidates.len() != stop_coords.len() {
-                println!("Warning: Could not snap all stops for pattern");
-                continue;
-            }
-        }
+                // Compare scores (f64)
+                score_b
+                    .partial_cmp(&score_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| count_b.cmp(&count_a))
+            });
 
-        // 3. Try Relation Matching
-        let mut full_path_geometry = Vec::new();
-        let mut relation_found = false;
+            let mut matched_route_color = None;
 
-        // Relation Candidate logic
-        // Vote for relations based on ALL candidates
-        // Scoring: Calculate coverage ratio (stops covered / total stops)
-        // Map: Relation Index -> (Coverage Score, Average Distance to Candidates)
-        // Score = num_stops_covered / total_stops
-        // Prioritize: 1. Coverage Score (Desc), 2. Candidate Count (Desc, as heuristic for better fit)
+            for r_idx in candidates {
+                let rel = &osm.relations[r_idx];
 
-        let mut relation_scores: HashMap<usize, (f64, usize)> = HashMap::new();
+                let mut candidate_geometry = Vec::new();
+                let mut current_node_idx_opt = None; // Track the actual chosen node for the previous stop
 
-        for candidates in &stop_candidates {
-            // Identify unique relations covering this stop
-            let mut seen_for_stop = HashSet::new();
-            for &node_idx in candidates {
-                if let Some(rels) = osm.node_to_relations.get(&node_idx) {
-                    for &r_idx in rels {
-                        if seen_for_stop.insert(r_idx) {
-                            // First time this relation covers this stop
-                            let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
-                            entry.0 += 1.0;
+                // Select best start node for this relation
+                if let Some(first_candidates) = stop_candidates.first() {
+                    // Find closest candidate that is IN the relation
+                    // Candidates are already sorted by distance (nearest_neighbor_iter)
+                    if let Some(&start_node) =
+                        first_candidates.iter().find(|&n| rel.nodes.contains(n))
+                    {
+                        let start_pl = &osm.graph.node(start_node).payload;
+                        candidate_geometry.push((start_pl.point.y(), start_pl.point.x()));
+                        current_node_idx_opt = Some(start_node);
+                    }
+                }
+
+                if current_node_idx_opt.is_none() {
+                    continue; // Couldn't find valid start for this relation
+                }
+
+                let mut possible = true;
+                let mut current_node = current_node_idx_opt.unwrap();
+
+                for i in 0..stop_candidates.len() - 1 {
+                    let next_candidates = &stop_candidates[i + 1];
+
+                    // Find best target node for the next stop in this relation
+                    let next_node_opt = next_candidates.iter().find(|&n| rel.nodes.contains(n));
+
+                    if let Some(&next_node) = next_node_opt {
+                        if current_node == next_node {
+                            // Same node, no movement needed, but maybe record geometry?
+                            // Just continue loop
+                            continue;
                         }
-                        // Increment candidate count
-                        let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
-                        entry.1 += 1;
-                    }
-                }
-            }
-        }
 
-        let mut candidates: Vec<usize> = relation_scores
-            .iter()
-            .filter(|(r_idx, (_covered_stops, _count))| {
-                let rel = &osm.relations[**r_idx];
-
-                // Heuristic: Must contain at least one candidate for the first stop AND one for the last stop
-                // UNLESS coverage is very high (e.g. > 90%), then maybe we accept it even if endpoints are fuzzy?
-                // But generally, the start/end requirement is good for directional correctness.
-                if stop_candidates.is_empty() {
-                    return false;
-                }
-
-                let start_candidates = &stop_candidates[0];
-                let end_candidates = stop_candidates.last().unwrap();
-                let has_start = start_candidates.iter().any(|&n| rel.nodes.contains(&n));
-                let has_end = end_candidates.iter().any(|&n| rel.nodes.contains(&n));
-
-                // Relaxed condition: If coverage is > 80%, we accept even if start/end checks fail?
-                // User said: "It needs to match the full line relation... If none is found, fall back to A*"
-                // "Cuts short" implies we picked a partial relation.
-                // If we enforce start && end, we avoid partial segments that don't span the whole route.
-                // So keeping start && end is GOOD justification.
-
-                has_start && has_end
-            })
-            .map(|(k, _)| *k)
-            .collect();
-
-        // Sort candidates by coverage (Desc), then Candidate Count (Desc)
-        candidates.sort_by(|&a, &b| {
-            let (score_a, count_a) = relation_scores[&a];
-            let (score_b, count_b) = relation_scores[&b];
-
-            // Compare scores (f64)
-            score_b
-                .partial_cmp(&score_a)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| count_b.cmp(&count_a))
-        });
-
-        let mut matched_route_color = None;
-
-        for r_idx in candidates {
-            let rel = &osm.relations[r_idx];
-
-            let mut candidate_geometry = Vec::new();
-            let mut current_node_idx_opt = None; // Track the actual chosen node for the previous stop
-
-            // Select best start node for this relation
-            if let Some(first_candidates) = stop_candidates.first() {
-                // Find closest candidate that is IN the relation
-                // Candidates are already sorted by distance (nearest_neighbor_iter)
-                if let Some(&start_node) = first_candidates.iter().find(|&n| rel.nodes.contains(n))
-                {
-                    let start_pl = &osm.graph.node(start_node).payload;
-                    candidate_geometry.push((start_pl.point.y(), start_pl.point.x()));
-                    current_node_idx_opt = Some(start_node);
-                }
-            }
-
-            if current_node_idx_opt.is_none() {
-                continue; // Couldn't find valid start for this relation
-            }
-
-            let mut possible = true;
-            let mut current_node = current_node_idx_opt.unwrap();
-
-            for i in 0..stop_candidates.len() - 1 {
-                let next_candidates = &stop_candidates[i + 1];
-
-                // Find best target node for the next stop in this relation
-                let next_node_opt = next_candidates.iter().find(|&n| rel.nodes.contains(n));
-
-                if let Some(&next_node) = next_node_opt {
-                    if current_node == next_node {
-                        // Same node, no movement needed, but maybe record geometry?
-                        // Just continue loop
-                        continue;
-                    }
-
-                    if let Some(edges) = pathfinding::pathfind(
-                        &osm.graph,
-                        current_node,
-                        next_node,
-                        allowed_modes,
-                        Some(&rel.edges),
-                    ) {
-                        for edge_idx in edges {
-                            let edge = osm.graph.edge(edge_idx);
-                            for dp in edge.payload.geometry.coords().skip(1) {
-                                candidate_geometry.push((dp.y, dp.x));
+                        if let Some(edges) = pathfinding::pathfind(
+                            &osm.graph,
+                            current_node,
+                            next_node,
+                            allowed_modes,
+                            Some(&rel.edges),
+                        ) {
+                            for edge_idx in edges {
+                                let edge = osm.graph.edge(edge_idx);
+                                for dp in edge.payload.geometry.coords().skip(1) {
+                                    candidate_geometry.push((dp.y, dp.x));
+                                }
                             }
+                            current_node = next_node;
+                        } else {
+                            possible = false;
+                            break;
                         }
-                        current_node = next_node;
                     } else {
+                        // Next stop not in relation?
+                        // This creates a gap. Relation doesn't fully cover the route?
+                        // We can attempt to proceed if we allow gaps, but for "Relation Matching" we usually want full coverage.
+                        // Or we can try to pathfind to the *nearest* candidate even if not in relation?
+                        // But that defeats the purpose of "on relation".
                         possible = false;
                         break;
                     }
-                } else {
-                    // Next stop not in relation?
-                    // This creates a gap. Relation doesn't fully cover the route?
-                    // We can attempt to proceed if we allow gaps, but for "Relation Matching" we usually want full coverage.
-                    // Or we can try to pathfind to the *nearest* candidate even if not in relation?
-                    // But that defeats the purpose of "on relation".
-                    possible = false;
+                }
+
+                if possible {
+                    relation_found = true;
+                    full_path_geometry = candidate_geometry;
+                    matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
                     break;
                 }
             }
 
-            if possible {
-                relation_found = true;
-                full_path_geometry = candidate_geometry;
-                matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
-                break;
+            if !relation_found {
+                // 4. Fallback to Backtracking Pathfinding to handle dead ends
+                // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
+                if let Some(geometry) =
+                    match_sequence_with_backtracking(&stop_candidates, osm, allowed_modes)
+                {
+                    // println!("  Fallback successful!");
+                    full_path_geometry = geometry;
+                } else {
+                    // println!("  Fallback failed.");
+                }
             }
-        }
 
-        if !relation_found {
-            // 4. Fallback to Backtracking Pathfinding to handle dead ends
-            // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
-            if let Some(geometry) =
-                match_sequence_with_backtracking(&stop_candidates, osm, allowed_modes)
-            {
-                // println!("  Fallback successful!");
-                full_path_geometry = geometry;
-            } else {
-                // println!("  Fallback failed.");
-            }
-        }
+            // Create Shape ID
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut hasher = DefaultHasher::new();
+            pattern.hash(&mut hasher);
+            let shape_id = format!("shape_{}", hasher.finish());
 
-        // Create Shape ID
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        pattern.hash(&mut hasher);
-        let shape_id = format!("shape_{}", hasher.finish());
-
-        results.insert(
-            pattern.clone(),
-            ShapeResult {
-                shape_id,
-                points: full_path_geometry,
-                matched_route_color,
-            },
-        );
-
-        // Refactoring applied below to the whole match_patterns function involves significant change.
-        // Instead, I'll update the loop to capture the color.
-
-        // Wait, I can't easily reference the loop variable 'rel' after the loop.
-        // I need to update the ReplacementContent to include the loop logic change or do it in two steps.
-        // Since I have valid context, I will replace the struct definition AND the function content at once?
-        // No, the file is large.
-        // I will use `replace_file_content` for the struct definition first.
-    }
+            Some((
+                pattern.clone(),
+                ShapeResult {
+                    shape_id,
+                    points: full_path_geometry,
+                    matched_route_color,
+                },
+            ))
+        })
+        .filter_map(|x| x)
+        .collect();
 
     results
 }
