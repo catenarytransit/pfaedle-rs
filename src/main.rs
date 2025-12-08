@@ -1,3 +1,4 @@
+mod color;
 mod graph;
 mod gtfs_load;
 mod matcher;
@@ -32,6 +33,10 @@ struct Args {
     /// MOTs to calculate shapes for, comma sep.
     #[arg(short, long, default_value = "all")]
     mots: String,
+
+    /// Write colours to routes.txt
+    #[arg(long, visible_alias = "write-colors", default_value_t = false)]
+    write_colours: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -167,6 +172,105 @@ fn main() -> Result<()> {
 
     // Replace original trips.txt
     std::fs::rename(trips_out_path, trips_path)?;
+
+    if args.write_colours {
+        println!("Updating routes.txt with colors...");
+        // 1. Build map route_id -> (bg_color, fg_color)
+        let mut route_colors = std::collections::HashMap::new();
+        // Iterate over results: stop_pattern -> shape_result
+        for (pattern, shape_res) in &results {
+            if let Some(raw_color) = &shape_res.matched_route_color {
+                // Parse color
+                if let Some((bg, fg)) = color::parse_color(raw_color) {
+                    // Get trips for this pattern
+                    if let Some(trip_ids) = gtfs_data.patterns.get(pattern) {
+                        // Get route_id from first trip (all trips in pattern share route usually)
+                        if let Some(first_trip_id) = trip_ids.first() {
+                            if let Some(trip) = gtfs_data.gtfs.trips.get(first_trip_id) {
+                                let route_id = &trip.route_id;
+                                // Insert if not present. Maybe overwrite?
+                                // If multiple patterns map to same route but different colors, we have ambiguity.
+                                // First one wins for now.
+                                route_colors.entry(route_id.clone()).or_insert((bg, fg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Read/Update routes.txt
+        let routes_path = args.gtfs_dir.join("routes.txt");
+        let routes_out_path = out_dir.join("routes-new.txt");
+        let mut rdr = csv::Reader::from_path(&routes_path)?;
+        let headers = rdr.headers()?.clone();
+
+        // Check for existing color columns
+        let color_idx = headers.iter().position(|h| h == "route_color");
+        let text_color_idx = headers.iter().position(|h| h == "route_text_color");
+
+        let mut new_headers = headers.clone();
+        if color_idx.is_none() {
+            new_headers.push_field("route_color");
+        }
+        if text_color_idx.is_none() {
+            new_headers.push_field("route_text_color");
+        }
+
+        let mut wtr = csv::Writer::from_path(&routes_out_path)?;
+        wtr.write_record(&new_headers)?;
+
+        for result in rdr.records() {
+            let record = result?;
+            let route_id_col = headers
+                .iter()
+                .position(|h| h == "route_id")
+                .context("No route_id in routes.txt")?;
+            let route_id = &record[route_id_col];
+            let colors = route_colors.get(route_id);
+
+            let mut new_record = csv::StringRecord::new();
+
+            // Reconstruct record
+            for (i, field) in record.iter().enumerate() {
+                if Some(i) == color_idx {
+                    if let Some((bg, _)) = colors {
+                        new_record.push_field(bg);
+                    } else {
+                        new_record.push_field(field);
+                    }
+                } else if Some(i) == text_color_idx {
+                    if let Some((_, fg)) = colors {
+                        new_record.push_field(fg);
+                    } else {
+                        new_record.push_field(field);
+                    }
+                } else {
+                    new_record.push_field(field);
+                }
+            }
+
+            // Append new columns if missing in original
+            if color_idx.is_none() {
+                if let Some((bg, _)) = colors {
+                    new_record.push_field(bg);
+                } else {
+                    new_record.push_field("");
+                }
+            }
+            if text_color_idx.is_none() {
+                if let Some((_, fg)) = colors {
+                    new_record.push_field(fg);
+                } else {
+                    new_record.push_field("");
+                }
+            }
+
+            wtr.write_record(&new_record)?;
+        }
+        wtr.flush()?;
+        std::fs::rename(routes_out_path, routes_path)?;
+    }
 
     println!("Done!");
 

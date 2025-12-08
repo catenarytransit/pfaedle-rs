@@ -11,6 +11,7 @@ use crate::pathfinding;
 pub struct ShapeResult {
     pub shape_id: String,
     pub points: Vec<(f64, f64)>, // Lat, Lon
+    pub matched_route_color: Option<String>,
 }
 
 pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, ShapeResult> {
@@ -113,6 +114,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
             .cloned()
             .collect();
 
+        let mut matched_route_color = None;
         for r_idx in candidates {
             let rel = &osm.relations[r_idx];
             // Check order
@@ -130,6 +132,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                     // Verify intermediate coverage?
                     // For now, trust the relation if it connects start and end.
                     relation_found = true;
+                    matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
                     let first_node = rel.nodes[start_idx];
                     let p = &osm.graph.node(first_node).payload.point;
                     full_path_geometry.push((p.y(), p.x()));
@@ -177,6 +180,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                     // Backward match (relation defined in reverse? Or trip is return?)
                     // If relation is just a sequence, we can traverse reverse.
                     relation_found = true;
+                    matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
                     // For reverse, we can iterate start_idx down to end_idx,
                     // BUT pathfinding is directed. We need to find path u->v where u is current, v is next in TRAJECTORY (so prev in relation).
 
@@ -260,13 +264,26 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
         pattern.hash(&mut hasher);
         let shape_id = format!("shape_{}", hasher.finish());
 
+        // Extract color if available from the best candidate relation
+        // (Handled inside loop via matched_route_color)
+
         results.insert(
             pattern.clone(),
             ShapeResult {
                 shape_id,
                 points: full_path_geometry,
+                matched_route_color,
             },
         );
+
+        // Refactoring applied below to the whole match_patterns function involves significant change.
+        // Instead, I'll update the loop to capture the color.
+
+        // Wait, I can't easily reference the loop variable 'rel' after the loop.
+        // I need to update the ReplacementContent to include the loop logic change or do it in two steps.
+        // Since I have valid context, I will replace the struct definition AND the function content at once?
+        // No, the file is large.
+        // I will use `replace_file_content` for the struct definition first.
     }
 
     results
