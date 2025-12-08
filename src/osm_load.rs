@@ -52,114 +52,260 @@ pub struct OsmBuilder;
 
 impl OsmBuilder {
     pub fn read(path: &Path, used_route_types: &HashSet<RouteType>) -> Result<OsmData> {
-        println!("Reading OSM file {:?} ...", path);
-        let f = std::fs::File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
-        let mut pbf = OsmPbfReader::new(f);
+        println!("Reading OSM file {:?} in multiple passes...", path);
 
-        let objs = pbf
-            .get_objs_and_deps(|obj| if Self::keep_obj(obj) { true } else { false })
-            .context("Failed to read OSM PBF")?;
+        // --- Data Structures to persist across passes ---
 
-        println!("Loaded {} objects. Processing...", objs.len());
+        // Relation metadata found in Pass 1
+        struct PreRelation {
+            id: i64,
+            tags: Tags,
+            members: Vec<osmpbfreader::Ref>,
+        }
+        let mut pre_relations: Vec<PreRelation> = Vec::new();
 
-        // Step 1: Process Relations to map Ways -> TransitLines
-        let mut way_rels: HashMap<OsmId, Vec<OsmId>> = HashMap::new();
-        // let mut node_rels: HashMap<OsmId, Vec<OsmId>> = HashMap::new();
-        let mut relations_list: Vec<OsmRelation> = Vec::new(); // For final output
+        // Set of Way IDs that are members of any interesting relation.
+        let mut ways_in_relations: HashSet<i64> = HashSet::new();
 
-        for (id, obj) in &objs {
-            if let OsmObj::Relation(r) = obj {
-                for member in &r.refs {
-                    match member.member {
-                        OsmId::Way(w) => way_rels.entry(OsmId::Way(w)).or_default().push(*id),
-                        // OsmId::Node(n) => node_rels.entry(OsmId::Node(n)).or_default().push(*id),
-                        _ => {}
+        // Set of Node IDs that are required for the graph.
+        let mut needed_nodes: HashSet<i64> = HashSet::new();
+
+        // ------------------------------------------------
+        // PASS 1: Relations
+        // Goal: Identify interesting relations (Routes), store them, and identify which Ways they need.
+        // ------------------------------------------------
+        println!("Pass 1/4: Scanning relations...");
+        {
+            let mut pbf = Self::open_pbf(path)?;
+            for obj in pbf.iter() {
+                let obj = obj.context("Error reading PBF object in Pass 1")?;
+                if let OsmObj::Relation(r) = obj {
+                    // Check if relation is interesting
+                    let is_route =
+                        r.tags.contains_key("route") || r.tags.contains_key("public_transport");
+                    if is_route {
+                        // Store relevant info
+                        for member in &r.refs {
+                            if let OsmId::Way(wid) = member.member {
+                                ways_in_relations.insert(wid.0);
+                            } else if let OsmId::Node(nid) = member.member {
+                                needed_nodes.insert(nid.0); // Direct node members
+                            }
+                        }
+
+                        pre_relations.push(PreRelation {
+                            id: r.id.0,
+                            tags: r.tags,
+                            members: r.refs,
+                        });
                     }
                 }
             }
         }
+        println!(
+            "  Found {} relevant relations. Need {} ways.",
+            pre_relations.len(),
+            ways_in_relations.len()
+        );
 
-        // Step 2: Build Graph from Ways
+        // ------------------------------------------------
+        // PASS 2: Ways (Discovery)
+        // Goal: For every 'infrastructure' way OR 'relation-member' way, mark its nodes as needed.
+        // ------------------------------------------------
+        println!("Pass 2/4: Scanning ways to identify needed nodes...");
+        {
+            let mut pbf = Self::open_pbf(path)?;
+            for obj in pbf.iter() {
+                let obj = obj.context("Error reading PBF object in Pass 2")?;
+                if let OsmObj::Way(w) = obj {
+                    let wid = w.id.0;
+                    let is_infra = Self::is_infrastructure(&w);
+                    let is_rel_member = ways_in_relations.contains(&wid);
+
+                    if is_infra || is_rel_member {
+                        if !Self::is_valid_way(&w) {
+                            continue;
+                        }
+
+                        // Mark all nodes as needed
+                        for nid in &w.nodes {
+                            needed_nodes.insert(nid.0);
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "  Identified {} unique nodes needed for the graph.",
+            needed_nodes.len()
+        );
+
+        // ------------------------------------------------
+        // PASS 3: Nodes
+        // Goal: Load only the 'needed_nodes' into the Graph and build the ID map.
+        // ------------------------------------------------
+        println!("Pass 3/4: Loading nodes...");
         let mut graph = Graph::new();
-        let mut osm_node_to_graph_idx: HashMap<OsmId, NodeIndex> = HashMap::new();
+        // Map from OSM Node ID -> Graph NodeIndex
+        let mut osm_node_to_graph_idx: HashMap<i64, NodeIndex> = HashMap::new();
 
         let mut rail_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut tram_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut metro_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut bus_node_indices: HashSet<NodeIndex> = HashSet::new();
 
-        // Pass 3 (Edges) logic
-        for (id, obj) in &objs {
-            if let OsmObj::Way(w) = obj {
-                if !Self::is_valid_way(w) {
-                    continue;
+        {
+            let mut pbf = Self::open_pbf(path)?;
+            for obj in pbf.iter() {
+                let obj = obj.context("Error reading PBF object in Pass 3")?;
+                if let OsmObj::Node(n) = obj {
+                    let nid = n.id.0;
+                    if needed_nodes.contains(&nid) {
+                        let idx = graph.add_node(NodePL {
+                            point: Point::new(n.lon(), n.lat()),
+                        });
+                        osm_node_to_graph_idx.insert(nid, idx);
+                    }
                 }
+            }
+        }
+        // clear needed_nodes to free memory
+        needed_nodes.clear();
+        needed_nodes.shrink_to_fit();
 
-                let is_route_member = way_rels.contains_key(id);
-                if !Self::is_infrastructure(w) && !is_route_member {
-                    continue;
+        println!("  Graph loaded with {} nodes.", graph.nodes.len());
+
+        // ------------------------------------------------
+        // PASS 4: Edges & Finalizing
+        // Goal: Re-scan Ways. Build edges for infrastructure ways.
+        //       Cache node-lists for relation ways to rebuild relation geometries.
+        // ------------------------------------------------
+        println!("Pass 4/4: Building edges and relations...");
+
+        // Cache for ways used in relations: WayID -> Vec<GraphNodeIndex>
+        let mut way_id_to_node_indices: HashMap<i64, Vec<NodeIndex>> = HashMap::new();
+
+        // 4a. Build Way -> TransitInfo lookup
+        let mut way_transit_info: HashMap<i64, Vec<TransitInfo>> = HashMap::new();
+
+        let get_transit_info = |r: &PreRelation| -> Option<TransitInfo> {
+            let short_name = r
+                .tags
+                .get("ref")
+                .or_else(|| r.tags.get("name"))
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let from_str = r
+                .tags
+                .get("from")
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let to_str = r.tags.get("to").map(|s| s.to_string()).unwrap_or_default();
+
+            if !short_name.is_empty() || !from_str.is_empty() {
+                Some(TransitInfo {
+                    short_name,
+                    from_str,
+                    to_str,
+                })
+            } else {
+                None
+            }
+        };
+
+        for r in &pre_relations {
+            if let Some(info) = get_transit_info(r) {
+                for member in &r.members {
+                    if let OsmId::Way(wid) = member.member {
+                        way_transit_info
+                            .entry(wid.0)
+                            .or_default()
+                            .push(info.clone());
+                    }
                 }
+            }
+        }
+        for infos in way_transit_info.values_mut() {
+            infos.sort();
+            infos.dedup();
+        }
 
-                let (is_rail, is_tram, is_metro, is_bus) = Self::classify_way(w);
-                if !is_rail && !is_tram && !is_metro && !is_bus {
-                    if !is_route_member {
+        {
+            let mut pbf = Self::open_pbf(path)?;
+            for obj in pbf.iter() {
+                let obj = obj.context("Error reading PBF object in Pass 4")?;
+                if let OsmObj::Way(w) = obj {
+                    let wid = w.id.0;
+                    let is_rel_member = ways_in_relations.contains(&wid);
+                    let is_infra = Self::is_infrastructure(&w);
+
+                    if !is_infra && !is_rel_member {
                         continue;
                     }
-                }
+                    if !Self::is_valid_way(&w) {
+                        continue;
+                    }
 
-                let transit_lines = if let Some(rel_ids) = way_rels.get(id) {
-                    Self::get_lines(rel_ids, &objs)
-                } else {
-                    Vec::new()
-                };
-
-                let mut way_node_indices = Vec::new();
-                for nid in &w.nodes {
-                    let osm_nid = OsmId::Node(*nid);
-                    if let Some(OsmObj::Node(n)) = objs.get(&osm_nid) {
-                        let idx = *osm_node_to_graph_idx.entry(osm_nid).or_insert_with(|| {
-                            graph.add_node(NodePL {
-                                point: Point::new(n.lon(), n.lat()),
-                            })
-                        });
-                        way_node_indices.push(idx);
-
-                        if is_rail {
-                            rail_node_indices.insert(idx);
-                        }
-                        if is_tram {
-                            tram_node_indices.insert(idx);
-                        }
-                        if is_metro {
-                            metro_node_indices.insert(idx);
-                        }
-                        if is_bus {
-                            bus_node_indices.insert(idx);
+                    // Resolve Nodes
+                    let mut way_indices = Vec::with_capacity(w.nodes.len());
+                    for nid in &w.nodes {
+                        if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
+                            way_indices.push(idx);
                         }
                     }
-                }
 
-                if way_node_indices.len() > 1 {
-                    for i in 0..way_node_indices.len() - 1 {
-                        let u = way_node_indices[i];
-                        let v = way_node_indices[i + 1];
+                    // Helper to track node types
+                    let (is_rail, is_tram, is_metro, is_bus) = Self::classify_way(&w);
 
-                        let p1 = graph.nodes[u].payload.point;
-                        let p2 = graph.nodes[v].payload.point;
-                        let geom = LineString::new(vec![p1.into(), p2.into()]);
+                    if !way_indices.is_empty() {
+                        // categorize nodes for indices
+                        for &idx in &way_indices {
+                            if is_rail {
+                                rail_node_indices.insert(idx);
+                            }
+                            if is_tram {
+                                tram_node_indices.insert(idx);
+                            }
+                            if is_metro {
+                                metro_node_indices.insert(idx);
+                            }
+                            if is_bus {
+                                bus_node_indices.insert(idx);
+                            }
+                        }
+                    }
 
-                        let mut edge_pl = EdgePL::new();
-                        edge_pl.geometry = geom;
-                        edge_pl.lines = transit_lines.clone();
-                        edge_pl.level = Self::parse_level(&w.tags);
-                        edge_pl.oneway = Self::parse_oneway(&w.tags);
+                    // Store for Relation Reconstruction if needed
+                    if is_rel_member && !way_indices.is_empty() {
+                        way_id_to_node_indices.insert(wid, way_indices.clone());
+                    }
 
-                        let speed = Self::get_speed(&w.tags);
-                        let len = edge_pl.length();
-                        let time_sec = len / speed;
-                        edge_pl.cost = (time_sec * 10.0).ceil() as u32;
+                    // Build Edges
+                    // Only if infrastructure
+                    if is_infra && way_indices.len() > 1 {
+                        let transit_lines = way_transit_info.get(&wid).cloned().unwrap_or_default();
 
-                        graph.add_edge(u, v, edge_pl);
+                        for i in 0..way_indices.len() - 1 {
+                            let u = way_indices[i];
+                            let v = way_indices[i + 1];
+
+                            let p1 = graph.nodes[u].payload.point;
+                            let p2 = graph.nodes[v].payload.point;
+                            let geom = LineString::new(vec![p1.into(), p2.into()]);
+
+                            let mut edge_pl = EdgePL::new();
+                            edge_pl.geometry = geom;
+                            edge_pl.lines = transit_lines.clone();
+                            edge_pl.level = Self::parse_level(&w.tags);
+                            edge_pl.oneway = Self::parse_oneway(&w.tags);
+
+                            let speed = Self::get_speed(&w.tags);
+                            let len = edge_pl.length();
+                            let time_sec = len / speed;
+                            edge_pl.cost = (time_sec * 10.0).ceil() as u32;
+
+                            graph.add_edge(u, v, edge_pl);
+                        }
                     }
                 }
             }
@@ -169,46 +315,41 @@ impl OsmBuilder {
 
         // Build Output Relations
         let mut final_node_to_rels: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
+        let mut relations_list: Vec<OsmRelation> = Vec::new();
 
-        for (id, obj) in &objs {
-            if let OsmObj::Relation(r) = obj {
-                if r.tags.get("type").map(|s| s.as_str()) != Some("route") {
-                    continue;
-                }
+        for r_pre in pre_relations {
+            if r_pre.tags.get("type").map(|s| s.as_str()) != Some("route") {
+                continue;
+            }
 
-                let rel_idx = relations_list.len();
-                let mut rel_nodes = Vec::new();
+            let rel_idx = relations_list.len();
+            let mut rel_nodes = Vec::new();
 
-                for member in &r.refs {
-                    match member.member {
-                        OsmId::Node(nid) => {
-                            if let Some(&idx) = osm_node_to_graph_idx.get(&OsmId::Node(nid)) {
+            for member in &r_pre.members {
+                match member.member {
+                    OsmId::Node(nid) => {
+                        if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
+                            rel_nodes.push(idx);
+                            final_node_to_rels.entry(idx).or_default().push(rel_idx);
+                        }
+                    }
+                    OsmId::Way(wid) => {
+                        if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
+                            for &idx in nodes {
                                 rel_nodes.push(idx);
                                 final_node_to_rels.entry(idx).or_default().push(rel_idx);
                             }
                         }
-                        OsmId::Way(wid) => {
-                            if let Some(OsmObj::Way(w)) = objs.get(&OsmId::Way(wid)) {
-                                for nid in &w.nodes {
-                                    if let Some(&idx) =
-                                        osm_node_to_graph_idx.get(&OsmId::Node(*nid))
-                                    {
-                                        rel_nodes.push(idx);
-                                        final_node_to_rels.entry(idx).or_default().push(rel_idx);
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                    _ => {}
                 }
-
-                relations_list.push(OsmRelation {
-                    id: id.inner_id(),
-                    tags: r.tags.clone(),
-                    nodes: rel_nodes,
-                });
             }
+
+            relations_list.push(OsmRelation {
+                id: r_pre.id,
+                tags: r_pre.tags,
+                nodes: rel_nodes,
+            });
         }
 
         let build_tree = |indices: HashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
@@ -276,6 +417,11 @@ impl OsmBuilder {
         })
     }
 
+    fn open_pbf(path: &Path) -> Result<OsmPbfReader<std::fs::File>> {
+        let f = std::fs::File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
+        Ok(OsmPbfReader::new(f))
+    }
+
     fn post_process(graph: &mut Graph<NodePL, EdgePL>) {
         // writeODirEdgs: Add reverse edges
         let existing_edges: HashSet<(NodeIndex, NodeIndex)> =
@@ -304,26 +450,8 @@ impl OsmBuilder {
         }
     }
 
-    fn keep_obj(obj: &OsmObj) -> bool {
-        match obj {
-            OsmObj::Way(w) => {
-                if w.tags.contains_key("railway") {
-                    return true;
-                }
-                if let Some(h) = w.tags.get("highway") {
-                    let h_str = h.as_str();
-                    if matches!(h_str, "steps" | "corridor" | "cycleway" | "track") {
-                        return true;
-                    }
-                    return true;
-                }
-                false
-            }
-            OsmObj::Relation(r) => {
-                r.tags.contains_key("route") || r.tags.contains_key("public_transport")
-            }
-            OsmObj::Node(_) => true,
-        }
+    fn has_tag(tags: &Tags, key: &str, val: &str) -> bool {
+        tags.get(key).map(|s| s.as_str()) == Some(val)
     }
 
     fn is_valid_way(w: &osmpbfreader::Way) -> bool {
@@ -356,40 +484,6 @@ impl OsmBuilder {
         };
 
         (is_rail, is_tram, is_metro, is_bus)
-    }
-
-    fn get_lines(
-        rel_ids: &[OsmId],
-        objs: &std::collections::BTreeMap<OsmId, OsmObj>,
-    ) -> Vec<TransitInfo> {
-        let mut lines = Vec::new();
-        for rid in rel_ids {
-            if let Some(OsmObj::Relation(r)) = objs.get(rid) {
-                let short_name = r
-                    .tags
-                    .get("ref")
-                    .or_else(|| r.tags.get("name"))
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let from_str = r
-                    .tags
-                    .get("from")
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let to_str = r.tags.get("to").map(|s| s.to_string()).unwrap_or_default();
-
-                if !short_name.is_empty() || !from_str.is_empty() {
-                    lines.push(TransitInfo {
-                        short_name,
-                        from_str,
-                        to_str,
-                    });
-                }
-            }
-        }
-        lines.sort();
-        lines.dedup();
-        lines
     }
 
     fn parse_level(tags: &Tags) -> i32 {
