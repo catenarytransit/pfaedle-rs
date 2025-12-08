@@ -173,10 +173,13 @@ impl OsmBuilder {
                         osm_node_to_graph_idx.insert(nid, idx);
 
                         // Identify stop/platform nodes to filter from relations later
-                        let is_stop = n.tags.get("railway").map_or(false, |s| s == "stop")
-                            || n.tags
-                                .get("public_transport")
-                                .map_or(false, |s| s == "stop_position" || s == "platform");
+                        let is_stop = n
+                            .tags
+                            .get("railway")
+                            .map_or(false, |s| s == "stop" || s == "platform_edge")
+                            || n.tags.get("public_transport").map_or(false, |s| {
+                                s == "stop_position" || s == "platform" || s == "station"
+                            });
 
                         if is_stop {
                             stop_node_indices.insert(idx);
@@ -505,12 +508,12 @@ impl OsmBuilder {
 
     fn is_platform(w: &osmpbfreader::Way) -> bool {
         if let Some(r) = w.tags.get("railway") {
-            if r == "platform" || r == "stop" {
+            if r == "platform" || r == "stop" || r == "platform_edge" {
                 return true;
             }
         }
         if let Some(pt) = w.tags.get("public_transport") {
-            if pt == "platform" || pt == "stop_position" {
+            if pt == "platform" || pt == "stop_position" || pt == "station" {
                 return true;
             }
         }
