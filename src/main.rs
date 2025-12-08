@@ -82,10 +82,10 @@ fn main() -> Result<()> {
         let mut max_lon = f64::MIN;
 
         for stop in gtfs_data.gtfs.stops.values() {
-            min_lat = min_lat.min(stop.latitude);
-            max_lat = max_lat.max(stop.latitude);
-            min_lon = min_lon.min(stop.longitude);
-            max_lon = max_lon.max(stop.longitude);
+            min_lat = min_lat.min(stop.latitude.expect("Stop missing latitude"));
+            max_lat = max_lat.max(stop.latitude.expect("Stop missing latitude"));
+            min_lon = min_lon.min(stop.longitude.expect("Stop missing longitude"));
+            max_lon = max_lon.max(stop.longitude.expect("Stop missing longitude"));
         }
 
         let has_rail = gtfs_data.used_route_types.contains(&RouteType::Rail);
