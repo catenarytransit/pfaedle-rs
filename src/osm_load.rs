@@ -94,6 +94,11 @@ impl OsmBuilder {
                                 ways_in_relations.insert(wid.0);
                             } else if let OsmId::Node(nid) = member.member {
                                 needed_nodes.insert(nid.0); // Direct node members
+                            } else if let OsmId::Relation(_rid) = member.member {
+                                // Relation member - we will handle flattening later,
+                                // but we don't need to add ID to 'needed' sets here,
+                                // because we already iterate ALL relations.
+                                // However, we must ensure we KEEP this member in the PreRelation.
                             }
                         }
 
@@ -355,47 +360,107 @@ impl OsmBuilder {
         let mut final_node_to_rels: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
         let mut relations_list: Vec<OsmRelation> = Vec::new();
 
-        for r_pre in pre_relations {
+        let pre_rel_map: HashMap<i64, &PreRelation> =
+            pre_relations.iter().map(|r| (r.id, r)).collect();
+
+        for r_pre in &pre_relations {
             if r_pre.tags.get("type").map(|s| s.as_str()) != Some("route") {
                 continue;
+            }
+
+            // 5. Recursive Flattening of Relations
+            // Map created outside loop.
+
+            // Helper for recursion with cycle detection
+            fn flatten_relation(
+                r_id: i64,
+                pre_rel_map: &HashMap<i64, &PreRelation>,
+                osm_node_to_graph_idx: &HashMap<i64, NodeIndex>,
+                way_id_to_node_indices: &HashMap<i64, Vec<NodeIndex>>,
+                way_to_edge_indices: &HashMap<i64, Vec<EdgeIndex>>,
+                stop_node_indices: &HashSet<NodeIndex>,
+                visited: &mut HashSet<i64>,
+                out_nodes: &mut Vec<NodeIndex>,
+                out_edges: &mut HashSet<EdgeIndex>,
+                out_final_node_to_rels: &mut HashMap<NodeIndex, Vec<usize>>,
+                current_rel_idx: usize,
+            ) {
+                if !visited.insert(r_id) {
+                    return; // Cycle detected or already processed
+                }
+
+                if let Some(r_pre) = pre_rel_map.get(&r_id) {
+                    for member in &r_pre.members {
+                        match member.member {
+                            OsmId::Node(nid) => {
+                                if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
+                                    if !stop_node_indices.contains(&idx) {
+                                        out_nodes.push(idx);
+                                        out_final_node_to_rels
+                                            .entry(idx)
+                                            .or_default()
+                                            .push(current_rel_idx);
+                                    }
+                                }
+                            }
+                            OsmId::Way(wid) => {
+                                if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
+                                    for &idx in nodes {
+                                        out_nodes.push(idx);
+                                        out_final_node_to_rels
+                                            .entry(idx)
+                                            .or_default()
+                                            .push(current_rel_idx);
+                                    }
+                                }
+                                if let Some(edges) = way_to_edge_indices.get(&wid.0) {
+                                    for &e in edges {
+                                        out_edges.insert(e);
+                                    }
+                                }
+                            }
+                            OsmId::Relation(sub_rid) => {
+                                flatten_relation(
+                                    sub_rid.0,
+                                    pre_rel_map,
+                                    osm_node_to_graph_idx,
+                                    way_id_to_node_indices,
+                                    way_to_edge_indices,
+                                    stop_node_indices,
+                                    visited,
+                                    out_nodes,
+                                    out_edges,
+                                    out_final_node_to_rels,
+                                    current_rel_idx,
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             let rel_idx = relations_list.len();
             let mut rel_nodes = Vec::new();
             let mut rel_edges = HashSet::new();
+            let mut visited_rels = HashSet::new();
 
-            for member in &r_pre.members {
-                match member.member {
-                    OsmId::Node(nid) => {
-                        if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
-                            // Filter stop/platform nodes from explicit relation members
-                            // We only want the path geometry (Ways), not the stations/stops
-                            if !stop_node_indices.contains(&idx) {
-                                rel_nodes.push(idx);
-                                final_node_to_rels.entry(idx).or_default().push(rel_idx);
-                            }
-                        }
-                    }
-                    OsmId::Way(wid) => {
-                        if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
-                            for &idx in nodes {
-                                rel_nodes.push(idx);
-                                final_node_to_rels.entry(idx).or_default().push(rel_idx);
-                            }
-                        }
-                        if let Some(edges) = way_to_edge_indices.get(&wid.0) {
-                            for &e in edges {
-                                rel_edges.insert(e);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            flatten_relation(
+                r_pre.id,
+                &pre_rel_map,
+                &osm_node_to_graph_idx,
+                &way_id_to_node_indices,
+                &way_to_edge_indices,
+                &stop_node_indices,
+                &mut visited_rels,
+                &mut rel_nodes,
+                &mut rel_edges,
+                &mut final_node_to_rels,
+                rel_idx,
+            );
 
             relations_list.push(OsmRelation {
                 id: r_pre.id,
-                tags: r_pre.tags,
+                tags: r_pre.tags.clone(),
                 nodes: rel_nodes,
                 edges: rel_edges,
             });
@@ -484,7 +549,9 @@ impl OsmBuilder {
             let u = edge.from;
             let v = edge.to;
             if !existing_edges.contains(&(v, u)) {
-                let rev_pl = edge.payload.rev_copy();
+                let mut rev_pl = edge.payload.rev_copy();
+                // Penalize going backwards a bit (10% penalty)
+                rev_pl.cost = (rev_pl.cost as f64 * 1.1) as u32;
                 edges_to_add.push((v, u, rev_pl));
             }
         }
@@ -627,7 +694,10 @@ impl OsmBuilder {
         }
 
         if let Some(service) = tags.get("service") {
-            if service.as_str() == "yard" || service.as_str() == "siding" {
+            if service.as_str() == "yard"
+                || service.as_str() == "siding"
+                || service.as_str() == "spur"
+            {
                 penalized = true;
             }
         }
