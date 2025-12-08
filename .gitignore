@@ -3,3 +3,5 @@ metrolink_gtfs
 metrolinkgtfs.zip
 socal-latest.osm.pbf
 pfaedle/
+*.osm.pbf
+metrolink.geojson

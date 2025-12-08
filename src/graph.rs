@@ -4,6 +4,11 @@ use std::collections::HashMap;
 pub type NodeIndex = usize;
 pub type EdgeIndex = usize;
 
+pub const MODE_RAIL: u8 = 1;
+pub const MODE_TRAM: u8 = 2;
+pub const MODE_SUBWAY: u8 = 4;
+pub const MODE_BUS: u8 = 8;
+
 #[derive(Debug, Clone)]
 pub struct Node<N> {
     pub payload: N,
@@ -88,6 +93,7 @@ pub struct EdgePL {
     pub level: i32,
     pub restriction: bool,
     pub is_reverse: bool,
+    pub allowed_modes: u8,
 }
 
 impl Default for EdgePL {
@@ -100,6 +106,7 @@ impl Default for EdgePL {
             level: 0,
             restriction: false,
             is_reverse: false,
+            allowed_modes: 0,
         }
     }
 }
@@ -149,6 +156,7 @@ impl EdgePL {
             "restriction".to_string(),
             if self.restriction { "yes" } else { "no" }.to_string(),
         );
+        obj.insert("allowed_modes".to_string(), self.allowed_modes.to_string());
 
         let lines_str = self
             .lines
@@ -179,6 +187,7 @@ mod tests {
         assert_eq!(e.oneway, 0);
         assert!(!e.restriction);
         assert_eq!(e.cost, 0);
+        assert_eq!(e.allowed_modes, 0);
     }
 
     #[test]

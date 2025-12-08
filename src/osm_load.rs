@@ -5,7 +5,9 @@ use rstar::RTree;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use crate::graph::{EdgePL, Graph, NodeIndex, NodePL, TransitInfo};
+use crate::graph::{
+    EdgePL, Graph, MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodeIndex, NodePL, TransitInfo,
+};
 use gtfs_structures::RouteType;
 
 // RStar compatible struct for spatial indexing
@@ -120,7 +122,9 @@ impl OsmBuilder {
                 if let OsmObj::Way(w) = obj {
                     let wid = w.id.0;
                     let is_infra = Self::is_infrastructure(&w);
-                    let is_rel_member = ways_in_relations.contains(&wid);
+                    let is_platform = Self::is_platform(&w);
+                    // Pass 2: We only care about relation members if they are valid geometry (not platforms)
+                    let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
 
                     if is_infra || is_rel_member {
                         if !Self::is_valid_way(&w) {
@@ -236,7 +240,9 @@ impl OsmBuilder {
                 let obj = obj.context("Error reading PBF object in Pass 4")?;
                 if let OsmObj::Way(w) = obj {
                     let wid = w.id.0;
-                    let is_rel_member = ways_in_relations.contains(&wid);
+                    let is_platform = Self::is_platform(&w);
+                    // Filter platforms from relations here too
+                    let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
                     let is_infra = Self::is_infrastructure(&w);
 
                     if !is_infra && !is_rel_member {
@@ -299,10 +305,22 @@ impl OsmBuilder {
                             edge_pl.level = Self::parse_level(&w.tags);
                             edge_pl.oneway = Self::parse_oneway(&w.tags);
 
-                            let speed = Self::get_speed(&w.tags);
-                            let len = edge_pl.length();
-                            let time_sec = len / speed;
-                            edge_pl.cost = (time_sec * 10.0).ceil() as u32;
+                            let mut modes = 0;
+                            if is_rail {
+                                modes |= MODE_RAIL;
+                            }
+                            if is_tram {
+                                modes |= MODE_TRAM;
+                            }
+                            if is_metro {
+                                modes |= MODE_SUBWAY;
+                            }
+                            if is_bus {
+                                modes |= MODE_BUS;
+                            }
+                            edge_pl.allowed_modes = modes;
+
+                            edge_pl.cost = Self::calculate_cost(&w.tags, edge_pl.length());
 
                             graph.add_edge(u, v, edge_pl);
                         }
@@ -459,7 +477,24 @@ impl OsmBuilder {
     }
 
     fn is_infrastructure(w: &osmpbfreader::Way) -> bool {
+        if Self::is_platform(w) {
+            return false;
+        }
         w.tags.contains_key("railway") || w.tags.contains_key("highway")
+    }
+
+    fn is_platform(w: &osmpbfreader::Way) -> bool {
+        if let Some(r) = w.tags.get("railway") {
+            if r == "platform" {
+                return true;
+            }
+        }
+        if let Some(pt) = w.tags.get("public_transport") {
+            if pt == "platform" {
+                return true;
+            }
+        }
+        false
     }
 
     fn classify_way(w: &osmpbfreader::Way) -> (bool, bool, bool, bool) {
@@ -534,6 +569,119 @@ impl OsmBuilder {
         } else {
             10.0 // Slow
         }
+    }
+
+    fn calculate_cost(tags: &Tags, length_iters: f64) -> u32 {
+        let speed = Self::get_speed(tags);
+        let time_sec = length_iters / speed;
+        let mut cost_float = time_sec * 10.0;
+
+        // Apply penalties
+        let penalty_factor = 100000.0;
+        let mut penalized = false;
+
+        if let Some(service) = tags.get("service") {
+            if service.as_str() == "yard" || service.as_str() == "siding" {
+                penalized = true;
+            }
+        }
+        if let Some(usage) = tags.get("usage") {
+            if usage.as_str() == "industrial" || usage.as_str() == "military" {
+                penalized = true;
+            }
+        }
+
+        if penalized {
+            cost_float *= penalty_factor;
+        }
+
+        cost_float.ceil() as u32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use osmpbfreader::Tags;
+
+    #[test]
+    fn test_calculate_cost_normal() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "rail".into());
+        // Speed for rail is 100/3.6 approx 27.77 m/s
+        // Length 100m -> time ~3.6s -> cost ~36
+        let cost = OsmBuilder::calculate_cost(&tags, 100.0);
+        assert!(cost > 30 && cost < 40);
+    }
+
+    #[test]
+    fn test_calculate_cost_penalties() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "rail".into());
+        tags.insert("service".into(), "yard".into());
+
+        let cost_normal = {
+            let mut t = Tags::new();
+            t.insert("railway".into(), "rail".into());
+            OsmBuilder::calculate_cost(&t, 100.0)
+        };
+
+        let cost_yard = OsmBuilder::calculate_cost(&tags, 100.0);
+        assert!(cost_yard > cost_normal * 9); // Expect ~10x
+    }
+
+    #[test]
+    fn test_calculate_cost_industrial() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "rail".into());
+        tags.insert("usage".into(), "industrial".into());
+
+        let cost_normal = {
+            let mut t = Tags::new();
+            t.insert("railway".into(), "rail".into());
+            OsmBuilder::calculate_cost(&t, 100.0)
+        };
+
+        let cost_industrial = OsmBuilder::calculate_cost(&tags, 100.0);
+        assert!(cost_industrial > cost_normal * 9);
+    }
+
+    #[test]
+    fn test_is_infrastructure_platform() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "platform".into());
+
+        let way = osmpbfreader::Way {
+            id: osmpbfreader::WayId(1),
+            tags: tags.clone(),
+            nodes: vec![],
+        };
+        assert!(!OsmBuilder::is_infrastructure(&way));
+        assert!(OsmBuilder::is_platform(&way));
+
+        // Test mixed tags
+        tags.insert("highway".into(), "footway".into());
+        let way_mixed = osmpbfreader::Way {
+            id: osmpbfreader::WayId(2),
+            tags,
+            nodes: vec![],
+        };
+        assert!(!OsmBuilder::is_infrastructure(&way_mixed));
+        assert!(OsmBuilder::is_platform(&way_mixed));
+    }
+
+    #[test]
+    fn test_is_platform_public_transport() {
+        let mut tags = Tags::new();
+        tags.insert("public_transport".into(), "platform".into());
+
+        let way = osmpbfreader::Way {
+            id: osmpbfreader::WayId(1),
+            tags: tags.clone(),
+            nodes: vec![],
+        };
+        assert!(OsmBuilder::is_platform(&way));
+        assert!(!OsmBuilder::is_infrastructure(&way));
     }
 }
 

@@ -2,6 +2,7 @@ use geo::Point;
 use gtfs_structures::RouteType;
 use std::collections::HashMap;
 
+use crate::graph::{MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
 use crate::gtfs_load::{GtfsData, StopPattern};
 use crate::osm_load::OsmData;
 use crate::pathfinding;
@@ -153,7 +154,14 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                     continue;
                 }
 
-                if let Some(edges) = pathfinding::pathfind(&osm.graph, start, end) {
+                let allowed_modes = match pattern.route_type {
+                    Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
+                    Some(RouteType::Subway) => MODE_SUBWAY,
+                    Some(RouteType::Rail) => MODE_RAIL,
+                    _ => MODE_BUS,
+                };
+
+                if let Some(edges) = pathfinding::pathfind(&osm.graph, start, end, allowed_modes) {
                     for edge_idx in edges {
                         let edge = osm.graph.edge(edge_idx);
                         for coord in edge.payload.geometry.coords() {

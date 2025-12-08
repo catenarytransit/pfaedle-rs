@@ -32,6 +32,7 @@ pub fn pathfind(
     graph: &Graph<NodePL, EdgePL>,
     start: NodeIndex,
     end: NodeIndex,
+    allowed_modes: u8,
 ) -> Option<Vec<usize>> {
     // Returns list of EdgeIndices
     let end_point = graph.node(end).payload.point;
@@ -65,6 +66,12 @@ pub fn pathfind(
 
         for &edge_idx in &graph.node(current).edges {
             let edge = graph.edge(edge_idx);
+
+            // Filter by mode
+            if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                continue;
+            }
+
             let neighbor = if edge.from == current {
                 edge.to
             } else {
@@ -99,4 +106,52 @@ fn reconstruct_path(
     }
     path.reverse();
     path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{EdgePL, Graph, MODE_BUS, MODE_RAIL, NodePL};
+    use geo::Point;
+
+    #[test]
+    fn test_pathfind_modes() {
+        let mut graph = Graph::new();
+        let n0 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(1.0, 0.0), // Far enough to have cost
+        });
+
+        // Edge 0: Rail only
+        let mut e0 = EdgePL::new();
+        e0.allowed_modes = MODE_RAIL;
+        e0.cost = 10;
+        graph.add_edge(n0, n1, e0);
+
+        // Edge 1: Bus only (higher cost just to distinguish if needed, but we filter)
+        let mut e1 = EdgePL::new();
+        e1.allowed_modes = MODE_BUS;
+        e1.cost = 10;
+        graph.add_edge(n0, n1, e1);
+
+        // Test Rail
+        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL);
+        assert!(path_rail.is_some());
+        let edges = path_rail.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_RAIL);
+
+        // Test Bus
+        let path_bus = pathfind(&graph, n0, n1, MODE_BUS);
+        assert!(path_bus.is_some());
+        let edges = path_bus.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_BUS);
+
+        // Test None
+        let path_none = pathfind(&graph, n0, n1, 0);
+        assert!(path_none.is_none());
+    }
 }
