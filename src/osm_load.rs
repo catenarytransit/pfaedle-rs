@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::graph::{
-    EdgePL, Graph, MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodeIndex, NodePL, TransitInfo,
+    EdgeIndex, EdgePL, Graph, MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodeIndex, NodePL,
+    TransitInfo,
 };
 use gtfs_structures::RouteType;
 
@@ -37,7 +38,8 @@ impl rstar::RTreeObject for SpatialNode {
 pub struct OsmRelation {
     pub id: i64,
     pub tags: Tags,
-    pub nodes: Vec<NodeIndex>, // All nodes in the relation
+    pub nodes: Vec<NodeIndex>,     // All nodes in the relation
+    pub edges: HashSet<EdgeIndex>, // All edges in the relation
 }
 
 pub struct OsmData {
@@ -158,7 +160,6 @@ impl OsmBuilder {
         let mut metro_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut bus_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut stop_node_indices: HashSet<NodeIndex> = HashSet::new();
-        let mut stop_node_indices: HashSet<NodeIndex> = HashSet::new();
 
         {
             let mut pbf = Self::open_pbf(path)?;
@@ -203,6 +204,7 @@ impl OsmBuilder {
 
         // Cache for ways used in relations: WayID -> Vec<GraphNodeIndex>
         let mut way_id_to_node_indices: HashMap<i64, Vec<NodeIndex>> = HashMap::new();
+        let mut way_to_edge_indices: HashMap<i64, Vec<EdgeIndex>> = HashMap::new();
 
         // 4a. Build Way -> TransitInfo lookup
         let mut way_transit_info: HashMap<i64, Vec<TransitInfo>> = HashMap::new();
@@ -305,6 +307,7 @@ impl OsmBuilder {
                     // Only if infrastructure
                     if is_infra && way_indices.len() > 1 {
                         let transit_lines = way_transit_info.get(&wid).cloned().unwrap_or_default();
+                        let mut created_edges = Vec::new();
 
                         for i in 0..way_indices.len() - 1 {
                             let u = way_indices[i];
@@ -337,8 +340,10 @@ impl OsmBuilder {
 
                             edge_pl.cost = Self::calculate_cost(&w.tags, edge_pl.length());
 
-                            graph.add_edge(u, v, edge_pl);
+                            let idx = graph.add_edge(u, v, edge_pl);
+                            created_edges.push(idx);
                         }
+                        way_to_edge_indices.insert(wid, created_edges);
                     }
                 }
             }
@@ -357,6 +362,7 @@ impl OsmBuilder {
 
             let rel_idx = relations_list.len();
             let mut rel_nodes = Vec::new();
+            let mut rel_edges = HashSet::new();
 
             for member in &r_pre.members {
                 match member.member {
@@ -377,6 +383,11 @@ impl OsmBuilder {
                                 final_node_to_rels.entry(idx).or_default().push(rel_idx);
                             }
                         }
+                        if let Some(edges) = way_to_edge_indices.get(&wid.0) {
+                            for &e in edges {
+                                rel_edges.insert(e);
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -386,17 +397,21 @@ impl OsmBuilder {
                 id: r_pre.id,
                 tags: r_pre.tags,
                 nodes: rel_nodes,
+                edges: rel_edges,
             });
         }
 
         let build_tree = |indices: HashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
+            // Filter out stop nodes
+            let indices: Vec<NodeIndex> = indices.difference(&stop_node_indices).cloned().collect();
+
             if indices.is_empty() {
                 return None;
             }
             println!("Building {} index with {} nodes...", name, indices.len());
             let nodes: Vec<SpatialNode> = indices
-                .iter()
-                .map(|&idx| {
+                .into_iter()
+                .map(|idx| {
                     let p = graph.nodes[idx].payload.point;
                     SpatialNode {
                         index: idx,

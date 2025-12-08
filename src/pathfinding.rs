@@ -1,7 +1,7 @@
 use crate::graph::{EdgePL, Graph, NodeIndex, NodePL};
 use geo::algorithm::VincentyDistance;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Copy, Clone, PartialEq)]
 struct State {
@@ -33,6 +33,7 @@ pub fn pathfind(
     start: NodeIndex,
     end: NodeIndex,
     allowed_modes: u8,
+    allowed_edges: Option<&HashSet<usize>>, // EdgeIndices are usize
 ) -> Option<Vec<usize>> {
     // Returns list of EdgeIndices
     let end_point = graph.node(end).payload.point;
@@ -70,6 +71,13 @@ pub fn pathfind(
         let current_g = *g_score.get(&current).unwrap_or(&f64::INFINITY);
 
         for &edge_idx in &graph.node(current).edges {
+            // Check specific allowed edges if provided
+            if let Some(allowed) = allowed_edges {
+                if !allowed.contains(&edge_idx) {
+                    continue;
+                }
+            }
+
             let edge = graph.edge(edge_idx);
 
             // Filter by mode
@@ -143,21 +151,21 @@ mod tests {
         graph.add_edge(n0, n1, e1);
 
         // Test Rail
-        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL);
+        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, None);
         assert!(path_rail.is_some());
         let edges = path_rail.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_RAIL);
 
         // Test Bus
-        let path_bus = pathfind(&graph, n0, n1, MODE_BUS);
+        let path_bus = pathfind(&graph, n0, n1, MODE_BUS, None);
         assert!(path_bus.is_some());
         let edges = path_bus.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_BUS);
 
         // Test None
-        let path_none = pathfind(&graph, n0, n1, 0);
+        let path_none = pathfind(&graph, n0, n1, 0, None);
         assert!(path_none.is_none());
     }
 
@@ -195,7 +203,7 @@ mod tests {
         let idx_norm2 = graph.add_edge(n2, n1, e_normal2);
 
         // Pathfind
-        let path = pathfind(&graph, n0, n1, MODE_RAIL).expect("Should find path");
+        let path = pathfind(&graph, n0, n1, MODE_RAIL, None).expect("Should find path");
 
         // Should choose the detour (2 edges) because total cost 2000 < 1,000,000
         assert_eq!(path.len(), 2);

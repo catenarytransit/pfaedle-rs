@@ -85,12 +85,8 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
         let mut full_path_geometry = Vec::new();
         let mut relation_found = false;
 
-        // Heuristic: Find a relation that covers the stops
-        // We look for a relation that contains the first and last stop, and preserves order.
-        // Optimization: Just check start and end? Or check all?
-        // Checking all gives better confidence.
-
-        // Count votes for relations from all snapped nodes
+        // Relation Candidate logic
+        // Identify potential relations based on snapped nodes
         let mut relation_counts: HashMap<usize, usize> = HashMap::new();
         for &node_idx in &snapped_nodes {
             if let Some(rels) = osm.node_to_relations.get(&node_idx) {
@@ -100,137 +96,72 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
             }
         }
 
-        // Find best candidate
-        // Required: Must contain start and end nodes.
-        let candidates: Vec<usize> = relation_counts
-            .keys()
-            .filter(|&r_idx| {
-                // Heuristic: cover at least 50% of stops? Or just verify geometry?
-                // Let's be strict: must contain first and last.
-                let rel = &osm.relations[*r_idx];
+        // Candidates must contain start and end nodes? Or just be heavily voted?
+        // Let's stick to start and end for strong confidence.
+        let mut candidates: Vec<usize> = relation_counts
+            .iter()
+            .filter(|(r_idx, _count)| {
+                let rel = &osm.relations[**r_idx];
+                // Check if strict subset of stops?
+                // At minimum, let's require seeing at least one node to consider it.
+                // Re-using "contains start and end" heuristic is good for end-to-end lines.
                 rel.nodes.contains(&snapped_nodes[0])
                     && rel.nodes.contains(snapped_nodes.last().unwrap())
             })
-            .cloned()
+            .map(|(k, _)| *k)
             .collect();
 
+        // Sort candidates by coverage (vote count) descending?
+        candidates.sort_by_key(|&idx| std::cmp::Reverse(relation_counts[&idx]));
+
         let mut matched_route_color = None;
+
         for r_idx in candidates {
             let rel = &osm.relations[r_idx];
-            // Check order
-            let pos_first = rel.nodes.iter().position(|&n| n == snapped_nodes[0]);
-            let pos_last = rel
-                .nodes
-                .iter()
-                .rposition(|&n| n == *snapped_nodes.last().unwrap());
 
-            if let (Some(start_idx), Some(end_idx)) = (pos_first, pos_last) {
-                if start_idx < end_idx {
-                    // Forward match
-                    // We assume the relationship is a simple sequence of nodes.
-                    // Copy nodes from start_idx to end_idx
-                    // Verify intermediate coverage?
-                    // For now, trust the relation if it connects start and end.
-                    relation_found = true;
-                    matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
-                    let first_node = rel.nodes[start_idx];
-                    let p = &osm.graph.node(first_node).payload.point;
-                    full_path_geometry.push((p.y(), p.x()));
+            // Attempt to build path using ONLY relation edges (and nodes) via A*
+            // We go from stop to stop.
+            let mut candidate_geometry = Vec::new();
+            let start_node = snapped_nodes[0];
+            let start_pl = &osm.graph.node(start_node).payload;
+            candidate_geometry.push((start_pl.point.y(), start_pl.point.x()));
 
-                    for i in start_idx..end_idx {
-                        let u = rel.nodes[i];
-                        let v = rel.nodes[i + 1];
+            let mut possible = true;
 
-                        // Check if u -> v is directly connected
-                        let mut connected = false;
-                        for &e_idx in &osm.graph.node(u).edges {
-                            let edge = osm.graph.edge(e_idx);
-                            if edge.to == v && (edge.payload.allowed_modes & allowed_modes) != 0 {
-                                // Add geometry
-                                // Re-use path logic:
-                                for dp in edge.payload.geometry.coords().skip(1) {
-                                    full_path_geometry.push((dp.y, dp.x));
-                                }
-                                connected = true;
-                                break;
-                            }
-                        }
+            for i in 0..snapped_nodes.len() - 1 {
+                let u = snapped_nodes[i];
+                let v = snapped_nodes[i + 1];
 
-                        if !connected {
-                            // Gap detected! Try A*
-                            // println!("Gap in relation between {} and {}, filling...", u, v);
-                            if let Some(edges) =
-                                pathfinding::pathfind(&osm.graph, u, v, allowed_modes)
-                            {
-                                for edge_idx in edges {
-                                    let edge = osm.graph.edge(edge_idx);
-                                    for dp in edge.payload.geometry.coords().skip(1) {
-                                        full_path_geometry.push((dp.y, dp.x));
-                                    }
-                                }
-                            } else {
-                                // Fallback: Straight line
-                                let p_v = &osm.graph.node(v).payload.point;
-                                full_path_geometry.push((p_v.y(), p_v.x()));
-                            }
+                if u == v {
+                    continue;
+                }
+
+                if let Some(edges) =
+                    pathfinding::pathfind(&osm.graph, u, v, allowed_modes, Some(&rel.edges))
+                {
+                    for edge_idx in edges {
+                        let edge = osm.graph.edge(edge_idx);
+                        for dp in edge.payload.geometry.coords().skip(1) {
+                            candidate_geometry.push((dp.y, dp.x));
                         }
                     }
-                    break;
-                } else if start_idx > end_idx {
-                    // Backward match (relation defined in reverse? Or trip is return?)
-                    // If relation is just a sequence, we can traverse reverse.
-                    relation_found = true;
-                    matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
-                    // For reverse, we can iterate start_idx down to end_idx,
-                    // BUT pathfinding is directed. We need to find path u->v where u is current, v is next in TRAJECTORY (so prev in relation).
-
-                    let first_node = rel.nodes[start_idx];
-                    let p = &osm.graph.node(first_node).payload.point;
-                    full_path_geometry.push((p.y(), p.x()));
-
-                    // We are going from start_idx DOWN to end_idx
-                    // i goes from start_idx down to end_idx + 1
-                    for i in (end_idx + 1..=start_idx).rev() {
-                        let u = rel.nodes[i];
-                        let v = rel.nodes[i - 1]; // next node in trajectory
-
-                        let mut connected = false;
-                        for &e_idx in &osm.graph.node(u).edges {
-                            let edge = osm.graph.edge(e_idx);
-                            if edge.to == v && (edge.payload.allowed_modes & allowed_modes) != 0 {
-                                for dp in edge.payload.geometry.coords().skip(1) {
-                                    full_path_geometry.push((dp.y, dp.x));
-                                }
-                                connected = true;
-                                break;
-                            }
-                        }
-
-                        if !connected {
-                            if let Some(edges) =
-                                pathfinding::pathfind(&osm.graph, u, v, allowed_modes)
-                            {
-                                for edge_idx in edges {
-                                    let edge = osm.graph.edge(edge_idx);
-                                    for dp in edge.payload.geometry.coords().skip(1) {
-                                        full_path_geometry.push((dp.y, dp.x));
-                                    }
-                                }
-                            } else {
-                                let p_v = &osm.graph.node(v).payload.point;
-                                full_path_geometry.push((p_v.y(), p_v.x()));
-                            }
-                        }
-                    }
+                } else {
+                    possible = false;
                     break;
                 }
             }
+
+            if possible {
+                relation_found = true;
+                full_path_geometry = candidate_geometry;
+                matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
+                // println!("Matched relation {} for pattern.", r_idx);
+                break;
+            }
         }
 
-        if relation_found {
-            // println!("Used relation for match!");
-        } else {
-            // 4. Fallback to A* Pathfinding
+        if !relation_found {
+            // 4. Fallback to Unrestricted A* Pathfinding
             let first_node_pl = &osm.graph.node(snapped_nodes[0]).payload;
             full_path_geometry.push((first_node_pl.point.y(), first_node_pl.point.x()));
 
@@ -242,15 +173,18 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                     continue;
                 }
 
-                if let Some(edges) = pathfinding::pathfind(&osm.graph, start, end, allowed_modes) {
+                if let Some(edges) =
+                    pathfinding::pathfind(&osm.graph, start, end, allowed_modes, None)
+                {
                     for edge_idx in edges {
                         let edge = osm.graph.edge(edge_idx);
-                        for coord in edge.payload.geometry.coords() {
+                        for coord in edge.payload.geometry.coords().skip(1) {
                             full_path_geometry.push((coord.y, coord.x));
                         }
                     }
                 } else {
-                    // A* failed
+                    // A* failed completely
+                    // Draw straight line to next stop
                     let next_node_pl = &osm.graph.node(end).payload;
                     full_path_geometry.push((next_node_pl.point.y(), next_node_pl.point.x()));
                 }
