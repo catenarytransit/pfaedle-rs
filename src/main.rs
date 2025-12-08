@@ -1,6 +1,7 @@
 mod graph;
 mod gtfs_load;
 mod matcher;
+mod mots;
 mod osm_load;
 mod pathfinding;
 mod router;
@@ -27,6 +28,10 @@ struct Args {
     /// Wipe existing shapes.txt
     #[arg(short, long, default_value_t = false)]
     wipe_shapes: bool,
+
+    /// MOTs to calculate shapes for, comma sep.
+    #[arg(short, long, default_value = "all")]
+    mots: String,
 }
 
 #[derive(serde::Serialize)]
@@ -51,8 +56,14 @@ fn main() -> Result<()> {
         }
     }
 
+    // 0. Parse MOTS
+    let allowed_mots = mots::get_categories_from_string(&args.mots)
+        .map_err(|e| anyhow::anyhow!("Invalid MOTs string: {}", e))?;
+
+    println!("Allowed MOTS: {:?}", allowed_mots);
+
     // 1. Load GTFS
-    let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir)?;
+    let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)?;
 
     // 2. Load OSM
     let osm_data = osm_load::load_osm(&args.osm_file, &gtfs_data.used_route_types)?;

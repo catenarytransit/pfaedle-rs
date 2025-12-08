@@ -1,6 +1,8 @@
+use crate::mots::{self, MotCategory};
 use anyhow::Result;
 use gtfs_structures::{Gtfs, RouteType};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -30,7 +32,7 @@ pub struct GtfsData {
     pub used_route_types: std::collections::HashSet<RouteType>,
 }
 
-pub fn load_gtfs(path: &Path) -> Result<GtfsData> {
+pub fn load_gtfs(path: &Path, allowed_mots: &HashSet<MotCategory>) -> Result<GtfsData> {
     println!("Loading GTFS from {:?}", path);
     // Use ? to extract the Gtfs result, then wrap it in the GtfsData struct.
     // NOTE: gtfs_structures::Gtfs::new returns Result<Gtfs, Error>
@@ -46,6 +48,19 @@ pub fn load_gtfs(path: &Path) -> Result<GtfsData> {
     let mut patterns: HashMap<StopPattern, Vec<String>> = HashMap::new();
 
     for (trip_id, trip) in &gtfs.trips {
+        let route = gtfs.routes.get(&trip.route_id);
+
+        // Filter by MOT
+        if let Some(r) = route {
+            let cat = mots::map_route_type_to_category(r.route_type);
+            if !allowed_mots.contains(&cat) {
+                continue;
+            }
+        } else {
+            // If no route found, maybe skip? or process? safe to skip probably.
+            continue;
+        }
+
         // Sort stop_times by sequence just in case
         let mut stop_times = trip.stop_times.clone();
         stop_times.sort_by_key(|st| st.stop_sequence);
@@ -56,7 +71,6 @@ pub fn load_gtfs(path: &Path) -> Result<GtfsData> {
             continue;
         }
 
-        let route = gtfs.routes.get(&trip.route_id);
         let route_type = route.map(|r| r.route_type);
 
         let pattern = StopPattern {
