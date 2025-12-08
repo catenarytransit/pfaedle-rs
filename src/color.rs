@@ -66,7 +66,7 @@ mod tests {
     fn test_parse_hex() {
         let (bg, fg) = parse_color("#FF0000").unwrap();
         assert_eq!(bg, "FF0000");
-        assert_eq!(fg, "FFFFFF"); // Red needs white text usually? 
+        assert_eq!(fg, "000000"); // Red (255,0,0) has better contrast with Black (5.25) than White (4.0) 
         // Red luminance: ~0.21. Black contrast: (0.26/0.05)=5.2. White contrast: 1.05/0.26=4.0.
         // Wait, Red (255,0,0) is actually quite dark in relative luminance.
         // sRGB: 1, 0, 0. Linear: 1, 0, 0. Lum: 0.2126.

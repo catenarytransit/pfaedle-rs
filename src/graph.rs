@@ -1,5 +1,5 @@
+use ahash::AHashMap;
 use geo::{HaversineLength, LineString, Point};
-use std::collections::HashMap;
 
 pub type NodeIndex = usize;
 pub type EdgeIndex = usize;
@@ -94,6 +94,7 @@ pub struct EdgePL {
     pub restriction: bool,
     pub is_reverse: bool,
     pub allowed_modes: u8,
+    pub osmid: i64,
 }
 
 impl Default for EdgePL {
@@ -107,6 +108,7 @@ impl Default for EdgePL {
             restriction: false,
             is_reverse: false,
             allowed_modes: 0,
+            osmid: 0,
         }
     }
 }
@@ -146,8 +148,8 @@ impl EdgePL {
         }
     }
 
-    pub fn get_attrs(&self) -> HashMap<String, String> {
-        let mut obj = HashMap::new();
+    pub fn get_attrs(&self) -> AHashMap<String, String> {
+        let mut obj = AHashMap::new();
         obj.insert("m_length".to_string(), self.length().to_string());
         obj.insert("oneway".to_string(), self.oneway.to_string());
         obj.insert("cost".to_string(), (self.cost as f64 / 10.0).to_string());
@@ -157,6 +159,7 @@ impl EdgePL {
             if self.restriction { "yes" } else { "no" }.to_string(),
         );
         obj.insert("allowed_modes".to_string(), self.allowed_modes.to_string());
+        obj.insert("osmid".to_string(), self.osmid.to_string());
 
         let lines_str = self
             .lines

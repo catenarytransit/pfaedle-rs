@@ -1,7 +1,8 @@
 use crate::graph::{EdgePL, Graph, NodeIndex, NodePL};
-use geo::algorithm::VincentyDistance;
+use ahash::{AHashMap, AHashSet};
+use geo::algorithm::HaversineDistance;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 
 #[derive(Copy, Clone, PartialEq)]
 struct State {
@@ -33,7 +34,7 @@ pub fn pathfind(
     start: NodeIndex,
     end: NodeIndex,
     allowed_modes: u8,
-    allowed_edges: Option<&HashSet<usize>>, // EdgeIndices are usize
+    allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
 ) -> Option<Vec<usize>> {
     // Returns list of EdgeIndices
     let end_point = graph.node(end).payload.point;
@@ -45,7 +46,7 @@ pub fn pathfind(
     // Let's use 0.1 * distance to be safe and simple.
     let heuristic = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.vincenty_distance(&end_point).unwrap_or(0.0) * 0.1
+        p.haversine_distance(&end_point) * 0.1
     };
 
     let mut open_set = BinaryHeap::new();
@@ -54,8 +55,8 @@ pub fn pathfind(
         node: start,
     });
 
-    let mut came_from: HashMap<NodeIndex, (NodeIndex, usize)> = HashMap::new(); // Node -> (ParentNode, EdgeIndex)
-    let mut g_score: HashMap<NodeIndex, f64> = HashMap::new();
+    let mut came_from: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new(); // Node -> (ParentNode, EdgeIndex)
+    let mut g_score: AHashMap<NodeIndex, f64> = AHashMap::new();
 
     g_score.insert(start, 0.0);
 
@@ -110,7 +111,7 @@ pub fn pathfind(
 }
 
 fn reconstruct_path(
-    came_from: HashMap<NodeIndex, (NodeIndex, usize)>,
+    came_from: AHashMap<NodeIndex, (NodeIndex, usize)>,
     mut current: NodeIndex,
 ) -> Vec<usize> {
     let mut path = Vec::new();

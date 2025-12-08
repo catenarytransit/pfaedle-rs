@@ -1,18 +1,18 @@
 use crate::graph::EdgeIndex;
-use std::collections::{HashMap, HashSet};
+use ahash::{AHashMap, AHashSet};
 
 pub struct HopCache {
     // Maps (from_edge, to_edge) -> value
     // Value encoding (same as C++):
     // >= 0: Min value (not exact)
     // < 0: Exact value = (-v) - 1
-    cache: HashMap<(EdgeIndex, EdgeIndex), i64>,
+    cache: AHashMap<(EdgeIndex, EdgeIndex), i64>,
 }
 
 impl HopCache {
     pub fn new() -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: AHashMap::new(),
         }
     }
 
@@ -31,13 +31,13 @@ impl HopCache {
         self.cache.insert((a, b), -(v + 1));
     }
 
-    pub fn set_min_set(&mut self, a: EdgeIndex, b: &HashSet<EdgeIndex>, val: u32) {
+    pub fn set_min_set(&mut self, a: EdgeIndex, b: &AHashSet<EdgeIndex>, val: u32) {
         for &eb in b {
             self.set_min(a, eb, val);
         }
     }
 
-    pub fn set_min_from_set(&mut self, a: &HashSet<EdgeIndex>, b: EdgeIndex, val: u32) {
+    pub fn set_min_from_set(&mut self, a: &AHashSet<EdgeIndex>, b: EdgeIndex, val: u32) {
         for &ea in a {
             self.set_min(ea, b, val);
         }

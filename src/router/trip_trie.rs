@@ -1,7 +1,7 @@
 use crate::router::weights::RoutingAttrs;
+use ahash::AHashMap;
 use geo::Point;
 use gtfs_structures::Trip;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct TripTrieNd {
@@ -22,8 +22,8 @@ pub struct TripTrieNd {
 
 pub struct TripTrie {
     nds: Vec<TripTrieNd>,
-    nd_trips: HashMap<usize, Vec<String>>,
-    trip_nds: HashMap<String, usize>,
+    nd_trips: AHashMap<usize, Vec<String>>,
+    trip_nds: AHashMap<String, usize>,
 }
 
 impl TripTrie {
@@ -46,8 +46,8 @@ impl TripTrie {
 
         Self {
             nds: vec![root],
-            nd_trips: HashMap::new(),
-            trip_nds: HashMap::new(),
+            nd_trips: AHashMap::new(),
+            trip_nds: AHashMap::new(),
         }
     }
 
@@ -59,7 +59,7 @@ impl TripTrie {
         &self.nds[index]
     }
 
-    pub fn get_nd_trips(&self) -> &HashMap<usize, Vec<String>> {
+    pub fn get_nd_trips(&self) -> &AHashMap<usize, Vec<String>> {
         &self.nd_trips
     }
 

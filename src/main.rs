@@ -146,7 +146,7 @@ fn main() -> Result<()> {
     println!("Updating trips.txt...");
 
     // Create a mapping from trip_id to shape_id
-    let mut trip_to_shape = std::collections::HashMap::new();
+    let mut trip_to_shape = ahash::AHashMap::new();
     for (pattern, trip_ids) in &gtfs_data.patterns {
         if let Some(res) = results.get(pattern) {
             for t_id in trip_ids {
@@ -218,7 +218,7 @@ fn main() -> Result<()> {
     if args.write_colours {
         println!("Updating routes.txt with colors...");
         // 1. Build map route_id -> (bg_color, fg_color)
-        let mut route_colors = std::collections::HashMap::new();
+        let mut route_colors = ahash::AHashMap::new();
         // Iterate over results: stop_pattern -> shape_result
         for (pattern, shape_res) in &results {
             if let Some(raw_color) = &shape_res.matched_route_color {

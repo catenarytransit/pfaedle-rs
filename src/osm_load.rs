@@ -1,8 +1,9 @@
+use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use geo::{LineString, Point};
 use osmpbfreader::{OsmId, OsmObj, OsmPbfReader, Tags};
 use rstar::RTree;
-use std::collections::{HashMap, HashSet};
+
 use std::path::Path;
 
 use crate::graph::{
@@ -38,8 +39,8 @@ impl rstar::RTreeObject for SpatialNode {
 pub struct OsmRelation {
     pub id: i64,
     pub tags: Tags,
-    pub nodes: Vec<NodeIndex>,     // All nodes in the relation
-    pub edges: HashSet<EdgeIndex>, // All edges in the relation
+    pub nodes: Vec<NodeIndex>,      // All nodes in the relation
+    pub edges: AHashSet<EdgeIndex>, // All edges in the relation
 }
 
 pub struct OsmData {
@@ -49,7 +50,7 @@ pub struct OsmData {
     pub metro_tree: Option<RTree<SpatialNode>>,
     pub bus_tree: Option<RTree<SpatialNode>>,
     pub relations: Vec<OsmRelation>,
-    pub node_to_relations: HashMap<NodeIndex, Vec<usize>>,
+    pub node_to_relations: AHashMap<NodeIndex, Vec<usize>>,
 }
 
 pub struct OsmBuilder;
@@ -57,7 +58,7 @@ pub struct OsmBuilder;
 impl OsmBuilder {
     pub fn read(
         path: &Path,
-        used_route_types: &HashSet<RouteType>,
+        used_route_types: &AHashSet<RouteType>,
         bbox: Option<(f64, f64, f64, f64)>, // min_lon, min_lat, max_lon, max_lat
     ) -> Result<OsmData> {
         println!("Reading OSM file {:?} in multiple passes...", path);
@@ -73,10 +74,10 @@ impl OsmBuilder {
         let mut pre_relations: Vec<PreRelation> = Vec::new();
 
         // Set of Way IDs that are members of any interesting relation.
-        let mut ways_in_relations: HashSet<i64> = HashSet::new();
+        let mut ways_in_relations: AHashSet<i64> = AHashSet::new();
 
         // Set of Node IDs that are required for the graph.
-        let mut needed_nodes: HashSet<i64> = HashSet::new();
+        let mut needed_nodes: AHashSet<i64> = AHashSet::new();
 
         // ------------------------------------------------
         // PASS 1: Relations
@@ -162,13 +163,13 @@ impl OsmBuilder {
         println!("Pass 3/4: Loading nodes...");
         let mut graph = Graph::new();
         // Map from OSM Node ID -> Graph NodeIndex
-        let mut osm_node_to_graph_idx: HashMap<i64, NodeIndex> = HashMap::new();
+        let mut osm_node_to_graph_idx: AHashMap<i64, NodeIndex> = AHashMap::new();
 
-        let mut rail_node_indices: HashSet<NodeIndex> = HashSet::new();
-        let mut tram_node_indices: HashSet<NodeIndex> = HashSet::new();
-        let mut metro_node_indices: HashSet<NodeIndex> = HashSet::new();
-        let mut bus_node_indices: HashSet<NodeIndex> = HashSet::new();
-        let mut stop_node_indices: HashSet<NodeIndex> = HashSet::new();
+        let mut rail_node_indices: AHashSet<NodeIndex> = AHashSet::new();
+        let mut tram_node_indices: AHashSet<NodeIndex> = AHashSet::new();
+        let mut metro_node_indices: AHashSet<NodeIndex> = AHashSet::new();
+        let mut bus_node_indices: AHashSet<NodeIndex> = AHashSet::new();
+        let mut stop_node_indices: AHashSet<NodeIndex> = AHashSet::new();
 
         {
             let mut pbf = Self::open_pbf(path)?;
@@ -222,11 +223,11 @@ impl OsmBuilder {
         println!("Pass 4/4: Building edges and relations...");
 
         // Cache for ways used in relations: WayID -> Vec<GraphNodeIndex>
-        let mut way_id_to_node_indices: HashMap<i64, Vec<NodeIndex>> = HashMap::new();
-        let mut way_to_edge_indices: HashMap<i64, Vec<EdgeIndex>> = HashMap::new();
+        let mut way_id_to_node_indices: AHashMap<i64, Vec<NodeIndex>> = AHashMap::new();
+        let mut way_to_edge_indices: AHashMap<i64, Vec<EdgeIndex>> = AHashMap::new();
 
         // 4a. Build Way -> TransitInfo lookup
-        let mut way_transit_info: HashMap<i64, Vec<TransitInfo>> = HashMap::new();
+        let mut way_transit_info: AHashMap<i64, Vec<TransitInfo>> = AHashMap::new();
 
         let get_transit_info = |r: &PreRelation| -> Option<TransitInfo> {
             let short_name = r
@@ -356,6 +357,7 @@ impl OsmBuilder {
                                 modes |= MODE_BUS;
                             }
                             edge_pl.allowed_modes = modes;
+                            edge_pl.osmid = wid;
 
                             edge_pl.cost = Self::calculate_cost(&w.tags, edge_pl.length());
 
@@ -371,10 +373,10 @@ impl OsmBuilder {
         Self::post_process(&mut graph);
 
         // Build Output Relations
-        let mut final_node_to_rels: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
+        let mut final_node_to_rels: AHashMap<NodeIndex, Vec<usize>> = AHashMap::new();
         let mut relations_list: Vec<OsmRelation> = Vec::new();
 
-        let pre_rel_map: HashMap<i64, &PreRelation> =
+        let pre_rel_map: AHashMap<i64, &PreRelation> =
             pre_relations.iter().map(|r| (r.id, r)).collect();
 
         for r_pre in &pre_relations {
@@ -388,15 +390,15 @@ impl OsmBuilder {
             // Helper for recursion with cycle detection
             fn flatten_relation(
                 r_id: i64,
-                pre_rel_map: &HashMap<i64, &PreRelation>,
-                osm_node_to_graph_idx: &HashMap<i64, NodeIndex>,
-                way_id_to_node_indices: &HashMap<i64, Vec<NodeIndex>>,
-                way_to_edge_indices: &HashMap<i64, Vec<EdgeIndex>>,
-                stop_node_indices: &HashSet<NodeIndex>,
-                visited: &mut HashSet<i64>,
+                pre_rel_map: &AHashMap<i64, &PreRelation>,
+                osm_node_to_graph_idx: &AHashMap<i64, NodeIndex>,
+                way_id_to_node_indices: &AHashMap<i64, Vec<NodeIndex>>,
+                way_to_edge_indices: &AHashMap<i64, Vec<EdgeIndex>>,
+                stop_node_indices: &AHashSet<NodeIndex>,
+                visited: &mut AHashSet<i64>,
                 out_nodes: &mut Vec<NodeIndex>,
-                out_edges: &mut HashSet<EdgeIndex>,
-                out_final_node_to_rels: &mut HashMap<NodeIndex, Vec<usize>>,
+                out_edges: &mut AHashSet<EdgeIndex>,
+                out_final_node_to_rels: &mut AHashMap<NodeIndex, Vec<usize>>,
                 current_rel_idx: usize,
             ) {
                 if !visited.insert(r_id) {
@@ -455,8 +457,8 @@ impl OsmBuilder {
 
             let rel_idx = relations_list.len();
             let mut rel_nodes = Vec::new();
-            let mut rel_edges = HashSet::new();
-            let mut visited_rels = HashSet::new();
+            let mut rel_edges = AHashSet::new();
+            let mut visited_rels = AHashSet::new();
 
             flatten_relation(
                 r_pre.id,
@@ -480,7 +482,7 @@ impl OsmBuilder {
             });
         }
 
-        let build_tree = |indices: HashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
+        let build_tree = |indices: AHashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
             // Filter out stop nodes
             let indices: Vec<NodeIndex> = indices.difference(&stop_node_indices).cloned().collect();
 
@@ -555,7 +557,7 @@ impl OsmBuilder {
 
     fn post_process(graph: &mut Graph<NodePL, EdgePL>) {
         // writeODirEdgs: Add reverse edges
-        let existing_edges: HashSet<(NodeIndex, NodeIndex)> =
+        let existing_edges: AHashSet<(NodeIndex, NodeIndex)> =
             graph.edges.iter().map(|e| (e.from, e.to)).collect();
 
         let mut edges_to_add = Vec::new();
@@ -864,7 +866,7 @@ mod tests {
 
 pub fn load_osm(
     path: &Path,
-    used_route_types: &HashSet<RouteType>,
+    used_route_types: &AHashSet<RouteType>,
     bbox: Option<(f64, f64, f64, f64)>,
 ) -> Result<OsmData> {
     OsmBuilder::read(path, used_route_types, bbox)

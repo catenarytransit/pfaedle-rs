@@ -1,6 +1,6 @@
+use ahash::{AHashMap, AHashSet};
 use geo::Point;
 use gtfs_structures::RouteType;
-use std::collections::{HashMap, HashSet};
 
 use crate::graph::{MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
 use crate::gtfs_load::{GtfsData, StopPattern};
@@ -17,13 +17,13 @@ pub struct ShapeResult {
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, ShapeResult> {
+pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, ShapeResult> {
     let total_patterns = gtfs.patterns.len();
     let processed = AtomicUsize::new(0);
 
     println!("Matching {} patterns...", total_patterns);
 
-    let results: HashMap<StopPattern, ShapeResult> = gtfs
+    let results: AHashMap<StopPattern, ShapeResult> = gtfs
         .patterns
         .par_iter()
         .map(|(pattern, _trips)| {
@@ -70,14 +70,60 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
 
             let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
             // How many candidates to consider per stop?
-            const K_NEAREST: usize = 50;
+            // We fetch more initially, then filter down to a smaller set of diverse candidates.
+            const SEARCH_RADIUS_NODES: usize = 100;
+            const TARGET_CANDIDATES: usize = 20;
 
             for point in &stop_coords {
-                let candidates: Vec<usize> = index
+                let neighbors = index
                     .nearest_neighbor_iter(&[point.x(), point.y()])
-                    .take(K_NEAREST)
-                    .map(|sn| sn.index)
-                    .collect();
+                    .take(SEARCH_RADIUS_NODES);
+
+                let mut candidates: Vec<usize> = Vec::new();
+                let mut seen_ways: AHashSet<i64> = AHashSet::new();
+                let mut fallback_candidates: Vec<usize> = Vec::new();
+
+                for sn in neighbors {
+                    let node_idx = sn.index;
+                    let node = osm.graph.node(node_idx);
+
+                    // Identify ways this node belongs to
+                    let mut node_ways = Vec::new();
+                    for &edge_idx in &node.edges {
+                        let edge = osm.graph.edge(edge_idx);
+                        if edge.payload.osmid != 0 {
+                            node_ways.push(edge.payload.osmid);
+                        }
+                    }
+
+                    // Check if this node introduces a new way
+                    let is_new_way = node_ways.iter().any(|w| !seen_ways.contains(w));
+
+                    if is_new_way {
+                        candidates.push(node_idx);
+                        for w in node_ways {
+                            seen_ways.insert(w);
+                        }
+                    } else {
+                        fallback_candidates.push(node_idx);
+                    }
+
+                    if candidates.len() >= TARGET_CANDIDATES {
+                        break;
+                    }
+                }
+
+                // If we didn't find enough unique-way candidates, fill up with fallbacks
+                if candidates.len() < 5 {
+                    let needed = 5 - candidates.len();
+                    for &fb in fallback_candidates.iter().take(needed) {
+                        candidates.push(fb);
+                    }
+                }
+
+                // Limit to TARGET just in case fallbacks pushed over (unlikely with logic above but good for safety)
+                // Actually fallback logic above ensures we have at least 5 if possible.
+                // If we stopped loop at TARGET_CANDIDATES, we are good.
 
                 if candidates.is_empty() {
                     // If we can't snap a stop, we can't route properly?
@@ -109,11 +155,11 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
             // Score = num_stops_covered / total_stops
             // Prioritize: 1. Coverage Score (Desc), 2. Candidate Count (Desc, as heuristic for better fit)
 
-            let mut relation_scores: HashMap<usize, (f64, usize)> = HashMap::new();
+            let mut relation_scores: AHashMap<usize, (f64, usize)> = AHashMap::new();
 
             for candidates in &stop_candidates {
                 // Identify unique relations covering this stop
-                let mut seen_for_stop = HashSet::new();
+                let mut seen_for_stop = AHashSet::new();
                 for &node_idx in candidates {
                     if let Some(rels) = osm.node_to_relations.get(&node_idx) {
                         for &r_idx in rels {
@@ -278,7 +324,14 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
             ))
         })
         .filter_map(|x| x)
-        .collect();
+        .fold(AHashMap::new, |mut acc, (k, v)| {
+            acc.insert(k, v);
+            acc
+        })
+        .reduce(AHashMap::new, |mut acc, map| {
+            acc.extend(map);
+            acc
+        });
 
     results
 }
@@ -289,7 +342,7 @@ fn match_sequence_with_backtracking(
     allowed_modes: u8,
 ) -> Option<Vec<(f64, f64)>> {
     // visited: (stop_idx, candidate_node_idx) -> bool (dead end)
-    let mut visited: HashSet<(usize, usize)> = HashSet::new();
+    let mut visited: AHashSet<(usize, usize)> = AHashSet::new();
 
     // Recursive helper
     // Returns Option<Vec<(f64, f64)>>: The geometry of the rest of the path including connection from current
@@ -299,7 +352,7 @@ fn match_sequence_with_backtracking(
         stop_candidates: &[Vec<usize>],
         osm: &OsmData,
         allowed_modes: u8,
-        visited: &mut HashSet<(usize, usize)>,
+        visited: &mut AHashSet<(usize, usize)>,
     ) -> Option<Vec<(f64, f64)>> {
         // Base case: If we are at the last stop, we are done
         if current_stop_idx == stop_candidates.len() - 1 {
@@ -464,7 +517,7 @@ mod tests {
             metro_tree: None,
             bus_tree: None,
             relations: Vec::new(),
-            node_to_relations: HashMap::new(),
+            node_to_relations: AHashMap::new(),
         };
 
         // Candidates

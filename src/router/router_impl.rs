@@ -2,8 +2,9 @@ use crate::graph::{EdgeIndex, EdgePL, Graph, NodePL};
 use crate::router::hop_cache::HopCache;
 use crate::router::types::{EdgeCandGroup, EdgeListHops};
 use crate::router::weights::{RoutingAttrs, RoutingOpts, TransWeight};
+use ahash::{AHashMap, AHashSet};
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 
 const ROUTE_INF: u32 = 2_000_000_000;
@@ -46,12 +47,12 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
     pub fn route(
         &self,
         _trie: &crate::router::trip_trie::TripTrie, // Add imports if needed
-        _ecm: &std::collections::HashMap<EdgeIndex, Vec<usize>>,
+        _ecm: &AHashMap<EdgeIndex, Vec<usize>>,
         _r_opts: &RoutingOpts,
         _hop_cache: Option<&mut HopCache>,
         _no_fast_hops: bool,
-    ) -> HashMap<usize, EdgeListHops> {
-        HashMap::new()
+    ) -> AHashMap<usize, EdgeListHops> {
+        AHashMap::new()
     }
 
     fn get_edge_cost(
@@ -75,24 +76,24 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         mut hop_cache: Option<&mut HopCache>,
         max_cost: u32,
     ) {
-        let mut e_frs = HashSet::new();
+        let mut e_frs = AHashSet::new();
         for fr in froms {
             if let Some(e) = fr.edge {
                 e_frs.insert(e);
             }
         }
 
-        let mut e_tos = HashSet::new();
+        let mut e_tos = AHashSet::new();
         for to in tos {
             if let Some(e) = to.edge {
                 e_tos.insert(e);
             }
         }
 
-        let mut ecm_cost: HashMap<(EdgeIndex, EdgeIndex), u32> = HashMap::new();
+        let mut ecm_cost: AHashMap<(EdgeIndex, EdgeIndex), u32> = AHashMap::new();
 
         for &e_from in &e_frs {
-            let mut rem_tos = HashSet::new();
+            let mut rem_tos = AHashSet::new();
 
             for &e_to in &e_tos {
                 let cached = if let Some(cache) = &hop_cache {
@@ -179,11 +180,11 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
     fn run_dijkstra_1_to_n(
         &self,
         start: EdgeIndex,
-        targets: &HashSet<EdgeIndex>,
+        targets: &AHashSet<EdgeIndex>,
         max_cost: u32,
         r_opts: &RoutingOpts,
-    ) -> HashMap<EdgeIndex, u32> {
-        let mut dists = HashMap::new();
+    ) -> AHashMap<EdgeIndex, u32> {
+        let mut dists = AHashMap::new();
         let mut pq = BinaryHeap::new();
 
         dists.insert(start, 0);
@@ -224,7 +225,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             }
         }
 
-        let mut res = HashMap::new();
+        let mut res = AHashMap::new();
         for &t in targets {
             if let Some(&c) = dists.get(&t) {
                 res.insert(t, c);
@@ -246,11 +247,11 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         _hop_cache: Option<&mut HopCache>,
         max_cost: u32,
     ) {
-        let mut dists: HashMap<EdgeIndex, (u32, EdgeIndex)> = HashMap::new(); // Edge -> (Cost, SourceEdge)
+        let mut dists: AHashMap<EdgeIndex, (u32, EdgeIndex)> = AHashMap::new(); // Edge -> (Cost, SourceEdge)
         let mut pq = BinaryHeap::new();
 
-        let mut e_fr_cands: HashMap<EdgeIndex, Vec<usize>> = HashMap::new();
-        let mut e_to_cands: HashMap<EdgeIndex, Vec<usize>> = HashMap::new();
+        let mut e_fr_cands: AHashMap<EdgeIndex, Vec<usize>> = AHashMap::new();
+        let mut e_to_cands: AHashMap<EdgeIndex, Vec<usize>> = AHashMap::new();
 
         for (fr_id, fr) in froms.iter().enumerate() {
             if let Some(e) = fr.edge {

@@ -1,5 +1,5 @@
+use ahash::AHashSet;
 use gtfs_structures::RouteType;
-use std::collections::HashSet;
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +44,7 @@ impl FromStr for MotCategory {
     }
 }
 
-pub fn get_categories_from_string(s: &str) -> Result<HashSet<MotCategory>, String> {
+pub fn get_categories_from_string(s: &str) -> Result<AHashSet<MotCategory>, String> {
     if s == "all" {
         return Ok(vec![
             MotCategory::Tram,
@@ -65,7 +65,7 @@ pub fn get_categories_from_string(s: &str) -> Result<HashSet<MotCategory>, Strin
         .collect());
     }
 
-    let mut categories = HashSet::new();
+    let mut categories = AHashSet::new();
     for part in s.split(',') {
         let part = part.trim();
         if part.is_empty() {

@@ -1,8 +1,7 @@
 use crate::mots::{self, MotCategory};
+use ahash::{AHashMap, AHashSet};
 use anyhow::Result;
 use gtfs_structures::{Gtfs, RouteType};
-use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -28,11 +27,11 @@ impl std::hash::Hash for StopPattern {
 pub struct GtfsData {
     pub gtfs: Gtfs,
     // Map pattern to list of Trip references
-    pub patterns: HashMap<StopPattern, Vec<String>>, // Using TripId
-    pub used_route_types: std::collections::HashSet<RouteType>,
+    pub patterns: AHashMap<StopPattern, Vec<String>>, // Using TripId
+    pub used_route_types: AHashSet<RouteType>,
 }
 
-pub fn load_gtfs(path: &Path, allowed_mots: &HashSet<MotCategory>) -> Result<GtfsData> {
+pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<GtfsData> {
     println!("Loading GTFS from {:?}", path);
     // Use ? to extract the Gtfs result, then wrap it in the GtfsData struct.
     // NOTE: gtfs_structures::Gtfs::new returns Result<Gtfs, Error>
@@ -65,7 +64,7 @@ pub fn load_gtfs(path: &Path, allowed_mots: &HashSet<MotCategory>) -> Result<Gtf
         gtfs.trips.len()
     );
 
-    let mut patterns: HashMap<StopPattern, Vec<String>> = HashMap::new();
+    let mut patterns: AHashMap<StopPattern, Vec<String>> = AHashMap::new();
 
     for (trip_id, trip) in &gtfs.trips {
         let route = gtfs.routes.get(&trip.route_id);
@@ -100,7 +99,7 @@ pub fn load_gtfs(path: &Path, allowed_mots: &HashSet<MotCategory>) -> Result<Gtf
         patterns.entry(pattern).or_default().push(trip_id.clone());
     }
 
-    let used_route_types: std::collections::HashSet<RouteType> =
+    let used_route_types: AHashSet<RouteType> =
         patterns.keys().filter_map(|p| p.route_type).collect();
 
     println!("Found {} unique patterns", patterns.len());
