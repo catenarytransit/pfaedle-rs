@@ -36,8 +36,28 @@ pub fn load_gtfs(path: &Path, allowed_mots: &HashSet<MotCategory>) -> Result<Gtf
     println!("Loading GTFS from {:?}", path);
     // Use ? to extract the Gtfs result, then wrap it in the GtfsData struct.
     // NOTE: gtfs_structures::Gtfs::new returns Result<Gtfs, Error>
-    let gtfs = Gtfs::new(path.to_str().unwrap())
-        .map_err(|e| anyhow::anyhow!("Failed to load GTFS: {}", e))?;
+    // Load raw GTFS data first
+    let path_str = path.to_str().unwrap();
+    let mut raw = gtfs_structures::RawGtfs::from_path(path_str)
+        .map_err(|e| anyhow::anyhow!("Failed to load raw GTFS: {}", e))?;
+
+    // If shapes.txt is missing/invalid, ignore it and remove shape references from trips
+    let shapes_missing = match &raw.shapes {
+        Some(Ok(_)) => false,
+        _ => true,
+    };
+
+    if shapes_missing {
+        println!("shapes.txt missing or invalid, ignoring and clearing shape_ids from trips.");
+        raw.shapes = Some(Ok(vec![]));
+        if let Ok(ref mut trips) = raw.trips {
+            for trip in trips {
+                trip.shape_id = None;
+            }
+        }
+    }
+
+    let gtfs = Gtfs::try_from(raw).map_err(|e| anyhow::anyhow!("Failed to process GTFS: {}", e))?;
 
     println!(
         "Loaded {} stops, {} trips",
