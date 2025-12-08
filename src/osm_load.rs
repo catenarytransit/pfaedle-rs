@@ -157,6 +157,8 @@ impl OsmBuilder {
         let mut tram_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut metro_node_indices: HashSet<NodeIndex> = HashSet::new();
         let mut bus_node_indices: HashSet<NodeIndex> = HashSet::new();
+        let mut stop_node_indices: HashSet<NodeIndex> = HashSet::new();
+        let mut stop_node_indices: HashSet<NodeIndex> = HashSet::new();
 
         {
             let mut pbf = Self::open_pbf(path)?;
@@ -169,6 +171,16 @@ impl OsmBuilder {
                             point: Point::new(n.lon(), n.lat()),
                         });
                         osm_node_to_graph_idx.insert(nid, idx);
+
+                        // Identify stop/platform nodes to filter from relations later
+                        let is_stop = n.tags.get("railway").map_or(false, |s| s == "stop")
+                            || n.tags
+                                .get("public_transport")
+                                .map_or(false, |s| s == "stop_position" || s == "platform");
+
+                        if is_stop {
+                            stop_node_indices.insert(idx);
+                        }
                     }
                 }
             }
@@ -347,8 +359,12 @@ impl OsmBuilder {
                 match member.member {
                     OsmId::Node(nid) => {
                         if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
-                            rel_nodes.push(idx);
-                            final_node_to_rels.entry(idx).or_default().push(rel_idx);
+                            // Filter stop/platform nodes from explicit relation members
+                            // We only want the path geometry (Ways), not the stations/stops
+                            if !stop_node_indices.contains(&idx) {
+                                rel_nodes.push(idx);
+                                final_node_to_rels.entry(idx).or_default().push(rel_idx);
+                            }
                         }
                     }
                     OsmId::Way(wid) => {
@@ -480,17 +496,21 @@ impl OsmBuilder {
         if Self::is_platform(w) {
             return false;
         }
+        // Filter out industrial usage
+        if w.tags.get("usage").map_or(false, |u| u == "industrial") {
+            return false;
+        }
         w.tags.contains_key("railway") || w.tags.contains_key("highway")
     }
 
     fn is_platform(w: &osmpbfreader::Way) -> bool {
         if let Some(r) = w.tags.get("railway") {
-            if r == "platform" {
+            if r == "platform" || r == "stop" {
                 return true;
             }
         }
         if let Some(pt) = w.tags.get("public_transport") {
-            if pt == "platform" {
+            if pt == "platform" || pt == "stop_position" {
                 return true;
             }
         }
@@ -580,6 +600,14 @@ impl OsmBuilder {
         let penalty_factor = 100000.0;
         let mut penalized = false;
 
+        let is_rail = tags.get("railway").map_or(false, |r| r == "rail");
+        let is_industrial = tags.get("usage").map_or(false, |u| u == "industrial");
+
+        // Extreme penalty for industrial rail
+        if is_rail && is_industrial {
+            cost_float *= 10.0 * penalty_factor;
+        }
+
         if let Some(service) = tags.get("service") {
             if service.as_str() == "yard" || service.as_str() == "siding" {
                 penalized = true;
@@ -595,7 +623,7 @@ impl OsmBuilder {
             cost_float *= penalty_factor;
         }
 
-        cost_float.ceil() as u32
+        cost_float.min(u32::MAX as f64).ceil() as u32
     }
 }
 
@@ -682,6 +710,53 @@ mod tests {
         };
         assert!(OsmBuilder::is_platform(&way));
         assert!(!OsmBuilder::is_infrastructure(&way));
+        assert!(OsmBuilder::is_platform(&way));
+    }
+
+    #[test]
+    fn test_is_infrastructure_industrial() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "rail".into());
+        tags.insert("usage".into(), "industrial".into());
+
+        let way = osmpbfreader::Way {
+            id: osmpbfreader::WayId(1),
+            tags: tags.clone(),
+            nodes: vec![],
+        };
+        // Should be false because of usage=industrial
+        assert!(!OsmBuilder::is_infrastructure(&way));
+
+        // Without industrial, it should be true
+        let mut tags2 = Tags::new();
+        tags2.insert("railway".into(), "rail".into());
+        let way2 = osmpbfreader::Way {
+            id: osmpbfreader::WayId(2),
+            tags: tags2,
+            nodes: vec![],
+        };
+        assert!(OsmBuilder::is_infrastructure(&way2));
+    }
+
+    #[test]
+    fn test_calculate_cost_rail_industrial_extreme() {
+        let mut tags = Tags::new();
+        tags.insert("railway".into(), "rail".into());
+        tags.insert("usage".into(), "industrial".into());
+
+        // Normal cost ~36
+        // Penalized once: ~36 * 100,000 = 3,600,000
+        // Extreme penalty adds another 10x factor on top of the base penalty logic?
+        // Actually looking at the code:
+        // if is_rail && is_industrial { cost *= 10.0 * penalty_factor; } -> cost *= 1,000,000
+        // Then later: if usage=industrial { penalized=true } -> cost *= penalty_factor (100,000)
+        // Total multiplier = 1,000,000 * 100,000 = 10^11.
+        // Base cost ~36. Total ~3.6 * 10^12.
+        // Capped at u32::MAX (~4 * 10^9).
+        // So we expect u32::MAX.
+
+        let cost = OsmBuilder::calculate_cost(&tags, 100.0);
+        assert_eq!(cost, u32::MAX);
     }
 }
 

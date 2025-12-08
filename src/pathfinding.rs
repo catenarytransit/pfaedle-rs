@@ -37,9 +37,14 @@ pub fn pathfind(
     // Returns list of EdgeIndices
     let end_point = graph.node(end).payload.point;
 
+    // Heuristic needs to be admissible (<= actual cost).
+    // Cost is roughly time_seconds * 10
+    // Max speed ~ 100km/h ~ 27m/s.
+    // Min cost per meter = (1 / 27) * 10 ~ 0.37
+    // Let's use 0.1 * distance to be safe and simple.
     let heuristic = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.vincenty_distance(&end_point).unwrap_or(0.0)
+        p.vincenty_distance(&end_point).unwrap_or(0.0) * 0.1
     };
 
     let mut open_set = BinaryHeap::new();
@@ -78,7 +83,8 @@ pub fn pathfind(
                 edge.from
             };
 
-            let tentative_g = current_g + edge.payload.length();
+            // Use logical cost instead of physical length
+            let tentative_g = current_g + edge.payload.cost as f64;
 
             if tentative_g < *g_score.get(&neighbor).unwrap_or(&f64::INFINITY) {
                 came_from.insert(neighbor, (current, edge_idx));
@@ -153,5 +159,50 @@ mod tests {
         // Test None
         let path_none = pathfind(&graph, n0, n1, 0);
         assert!(path_none.is_none());
+    }
+
+    #[test]
+    fn test_pathfind_penalties() {
+        let mut graph = Graph::new();
+        let n0 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.1),
+        });
+
+        // Edge 0: Short but HIGH COST (e.g. industrial)
+        // Length ~ 11km.
+        let mut e_industrial = EdgePL::new();
+        e_industrial.allowed_modes = MODE_RAIL;
+        e_industrial.cost = 1_000_000;
+        let idx_ind = graph.add_edge(n0, n1, e_industrial);
+
+        // Edge 1: Long but LOW COST (normal rail)
+        // We'll simulate a detour via n2
+        let n2 = graph.add_node(NodePL {
+            point: Point::new(0.1, 0.05),
+        });
+
+        let mut e_normal1 = EdgePL::new();
+        e_normal1.allowed_modes = MODE_RAIL;
+        e_normal1.cost = 1000; // Low cost
+        let idx_norm1 = graph.add_edge(n0, n2, e_normal1);
+
+        let mut e_normal2 = EdgePL::new();
+        e_normal2.allowed_modes = MODE_RAIL;
+        e_normal2.cost = 1000; // Low cost
+        let idx_norm2 = graph.add_edge(n2, n1, e_normal2);
+
+        // Pathfind
+        let path = pathfind(&graph, n0, n1, MODE_RAIL).expect("Should find path");
+
+        // Should choose the detour (2 edges) because total cost 2000 < 1,000,000
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0], idx_norm1);
+        assert_eq!(path[1], idx_norm2);
+
+        // Ensure it didn't take the direct industrial route
+        assert!(!path.contains(&idx_ind));
     }
 }

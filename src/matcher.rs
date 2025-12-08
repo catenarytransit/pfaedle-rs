@@ -41,6 +41,17 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
             continue;
         }
 
+        if stop_coords.len() < 2 {
+            continue;
+        }
+
+        let allowed_modes = match pattern.route_type {
+            Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
+            Some(RouteType::Subway) => MODE_SUBWAY,
+            Some(RouteType::Rail) => MODE_RAIL,
+            _ => MODE_BUS,
+        };
+
         // 2. Snap to nearest OSM nodes
         // Select Index based on RouteType
         let index_to_use = match pattern.route_type {
@@ -119,20 +130,93 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                     // Verify intermediate coverage?
                     // For now, trust the relation if it connects start and end.
                     relation_found = true;
-                    for i in start_idx..=end_idx {
-                        let node_idx = rel.nodes[i];
-                        let pl = &osm.graph.node(node_idx).payload;
-                        full_path_geometry.push((pl.point.y(), pl.point.x()));
+                    let first_node = rel.nodes[start_idx];
+                    let p = &osm.graph.node(first_node).payload.point;
+                    full_path_geometry.push((p.y(), p.x()));
+
+                    for i in start_idx..end_idx {
+                        let u = rel.nodes[i];
+                        let v = rel.nodes[i + 1];
+
+                        // Check if u -> v is directly connected
+                        let mut connected = false;
+                        for &e_idx in &osm.graph.node(u).edges {
+                            let edge = osm.graph.edge(e_idx);
+                            if edge.to == v && (edge.payload.allowed_modes & allowed_modes) != 0 {
+                                // Add geometry
+                                // Re-use path logic:
+                                for dp in edge.payload.geometry.coords().skip(1) {
+                                    full_path_geometry.push((dp.y, dp.x));
+                                }
+                                connected = true;
+                                break;
+                            }
+                        }
+
+                        if !connected {
+                            // Gap detected! Try A*
+                            // println!("Gap in relation between {} and {}, filling...", u, v);
+                            if let Some(edges) =
+                                pathfinding::pathfind(&osm.graph, u, v, allowed_modes)
+                            {
+                                for edge_idx in edges {
+                                    let edge = osm.graph.edge(edge_idx);
+                                    for dp in edge.payload.geometry.coords().skip(1) {
+                                        full_path_geometry.push((dp.y, dp.x));
+                                    }
+                                }
+                            } else {
+                                // Fallback: Straight line
+                                let p_v = &osm.graph.node(v).payload.point;
+                                full_path_geometry.push((p_v.y(), p_v.x()));
+                            }
+                        }
                     }
                     break;
                 } else if start_idx > end_idx {
                     // Backward match (relation defined in reverse? Or trip is return?)
                     // If relation is just a sequence, we can traverse reverse.
                     relation_found = true;
-                    for i in (end_idx..=start_idx).rev() {
-                        let node_idx = rel.nodes[i];
-                        let pl = &osm.graph.node(node_idx).payload;
-                        full_path_geometry.push((pl.point.y(), pl.point.x()));
+                    // For reverse, we can iterate start_idx down to end_idx,
+                    // BUT pathfinding is directed. We need to find path u->v where u is current, v is next in TRAJECTORY (so prev in relation).
+
+                    let first_node = rel.nodes[start_idx];
+                    let p = &osm.graph.node(first_node).payload.point;
+                    full_path_geometry.push((p.y(), p.x()));
+
+                    // We are going from start_idx DOWN to end_idx
+                    // i goes from start_idx down to end_idx + 1
+                    for i in (end_idx + 1..=start_idx).rev() {
+                        let u = rel.nodes[i];
+                        let v = rel.nodes[i - 1]; // next node in trajectory
+
+                        let mut connected = false;
+                        for &e_idx in &osm.graph.node(u).edges {
+                            let edge = osm.graph.edge(e_idx);
+                            if edge.to == v && (edge.payload.allowed_modes & allowed_modes) != 0 {
+                                for dp in edge.payload.geometry.coords().skip(1) {
+                                    full_path_geometry.push((dp.y, dp.x));
+                                }
+                                connected = true;
+                                break;
+                            }
+                        }
+
+                        if !connected {
+                            if let Some(edges) =
+                                pathfinding::pathfind(&osm.graph, u, v, allowed_modes)
+                            {
+                                for edge_idx in edges {
+                                    let edge = osm.graph.edge(edge_idx);
+                                    for dp in edge.payload.geometry.coords().skip(1) {
+                                        full_path_geometry.push((dp.y, dp.x));
+                                    }
+                                }
+                            } else {
+                                let p_v = &osm.graph.node(v).payload.point;
+                                full_path_geometry.push((p_v.y(), p_v.x()));
+                            }
+                        }
                     }
                     break;
                 }
@@ -153,13 +237,6 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> HashMap<StopPattern, Sh
                 if start == end {
                     continue;
                 }
-
-                let allowed_modes = match pattern.route_type {
-                    Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
-                    Some(RouteType::Subway) => MODE_SUBWAY,
-                    Some(RouteType::Rail) => MODE_RAIL,
-                    _ => MODE_BUS,
-                };
 
                 if let Some(edges) = pathfinding::pathfind(&osm.graph, start, end, allowed_modes) {
                     for edge_idx in edges {
