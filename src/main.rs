@@ -24,7 +24,7 @@ struct Args {
     osm_file: PathBuf,
 
     /// Output directory for shapes.txt (defaults to gtfs_dir)
-    #[arg(short, long)]
+    #[arg(long)]
     out_dir: Option<PathBuf>,
 
     /// Wipe existing shapes.txt
@@ -38,6 +38,10 @@ struct Args {
     /// Write colours to routes.txt
     #[arg(long, visible_alias = "write-colors", default_value_t = false)]
     write_colours: bool,
+
+    /// Run with low priority (nice 10)
+    #[arg(long, default_value_t = false)]
+    low_priority: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -51,6 +55,14 @@ struct ShapeRecord {
 fn main() -> Result<()> {
     let args = Args::parse();
     println!("Running pfaedle-rs with args: {:?}", args);
+
+    if args.low_priority {
+        if let Err(e) = rustix::process::nice(10) {
+            eprintln!("Failed to set priority: {}", e);
+        } else {
+            println!("Process priority set to low (nice +10).");
+        }
+    }
 
     let out_dir = args.out_dir.as_ref().unwrap_or(&args.gtfs_dir);
     let shapes_path = out_dir.join("shapes.txt");

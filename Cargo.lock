@@ -1442,6 +1442,7 @@ dependencies = [
  "osmpbfreader",
  "rayon",
  "rstar",
+ "rustix 1.1.2",
  "serde",
 ]
 
