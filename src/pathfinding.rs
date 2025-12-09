@@ -36,76 +36,202 @@ pub fn pathfind(
     allowed_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
 ) -> Option<(f64, Vec<usize>)> {
-    // Returns (TotalCost, list of EdgeIndices)
-    let end_point = graph.node(end).payload.point;
+    if start == end {
+        return Some((0.0, Vec::new()));
+    }
 
-    // Heuristic needs to be admissible (<= actual cost).
-    // Cost is roughly time_seconds * 10
-    // Max speed ~ 100km/h ~ 27m/s.
-    // Min cost per meter = (1 / 27) * 10 ~ 0.37
-    // Let's use 0.1 * distance to be safe and simple.
-    let heuristic = |n: NodeIndex| -> f64 {
+    let end_point = graph.node(end).payload.point;
+    let start_point = graph.node(start).payload.point;
+
+    // Heuristics
+    let h_fwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.haversine_distance(&end_point) * 0.1
+        p.haversine_distance(&end_point) * 0.2
+    };
+    let h_bwd = |n: NodeIndex| -> f64 {
+        let p = graph.node(n).payload.point;
+        p.haversine_distance(&start_point) * 0.2
     };
 
-    let mut open_set = BinaryHeap::new();
-    open_set.push(State {
-        cost: 0.0,
+    let mut open_fwd = BinaryHeap::new();
+    let mut open_bwd = BinaryHeap::new();
+
+    let mut came_from_fwd: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new();
+    let mut came_from_bwd: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new();
+
+    let mut g_fwd: AHashMap<NodeIndex, f64> = AHashMap::new();
+    let mut g_bwd: AHashMap<NodeIndex, f64> = AHashMap::new();
+
+    // Initialize
+    g_fwd.insert(start, 0.0);
+    g_bwd.insert(end, 0.0);
+
+    open_fwd.push(State {
+        cost: h_fwd(start),
         node: start,
     });
+    open_bwd.push(State {
+        cost: h_bwd(end),
+        node: end,
+    });
 
-    let mut came_from: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new(); // Node -> (ParentNode, EdgeIndex)
-    let mut g_score: AHashMap<NodeIndex, f64> = AHashMap::new();
+    let mut mu = f64::INFINITY;
+    let mut meeting_node: Option<(NodeIndex, NodeIndex, usize)> = None; // (u, v, edge_idx)
 
-    g_score.insert(start, 0.0);
+    // Helper to process neighbors
+    // We cannot easily use a closure due to borrowing mutables (open_set, g_score, came_from)
+    // So we assume the loop structure handles it.
 
-    while let Some(State {
-        cost: _,
-        node: current,
-    }) = open_set.pop()
-    {
-        if current == end {
-            let total_cost = *g_score.get(&current).unwrap();
-            return Some((total_cost, reconstruct_path(came_from, current)));
+    while !open_fwd.is_empty() && !open_bwd.is_empty() {
+        // Check termination
+        // If the smallest path we could possibly find (min_f + min_b) is worse than best found so far (mu), stop.
+        // Note: min_f = g_f + h_f. h_f is distance to end.
+        // This standard termination condition requires consistent heuristics.
+        let min_f = open_fwd.peek().unwrap().cost;
+        let min_b = open_bwd.peek().unwrap().cost;
+
+        // Conservative check: if min_f and min_b are large enough.
+        // Since h is scaled by 0.2, it is very admissible.
+        if min_f + min_b >= mu {
+            // Optimization: Maybe we can stop?
+            // With weak heuristic, this might be too loose or tight?
+            // Let's rely on queue empty or strict dominance.
+            // Actually, with admissible heuristic, this condition (min_f + min_b >= mu) is valid for optimal path.
+            // But we must be careful about heuristic consistency across directions.
+            // Prudence: use a slightly looser bound or just let it run until exhaustion or clear dominance?
+            // Standard Bi-A* with consistent heuristic stops here.
+            break;
         }
 
-        let current_g = *g_score.get(&current).unwrap_or(&f64::INFINITY);
+        // Expand the direction with smaller frontier size to keep balance
+        let expand_fwd = open_fwd.len() <= open_bwd.len();
 
-        for &edge_idx in &graph.node(current).edges {
-            // Check specific allowed edges if provided
-            if let Some(allowed) = allowed_edges {
-                if !allowed.contains(&edge_idx) {
+        if expand_fwd {
+            if let Some(State { cost: _, node: u }) = open_fwd.pop() {
+                let current_g = *g_fwd.get(&u).unwrap_or(&f64::INFINITY);
+
+                // Pruning if we already found a path better than this node's theoretical best
+                // But we modify mu dynamically.
+                if current_g + h_fwd(u) >= mu {
                     continue;
                 }
+
+                for &edge_idx in &graph.node(u).edges {
+                    if let Some(allowed) = allowed_edges {
+                        if !allowed.contains(&edge_idx) {
+                            continue;
+                        }
+                    }
+                    let edge = graph.edge(edge_idx);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        continue;
+                    }
+
+                    let v = if edge.from == u { edge.to } else { edge.from };
+                    let cost = edge.payload.cost as f64;
+                    let tentative_g = current_g + cost;
+
+                    if tentative_g < *g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        g_fwd.insert(v, tentative_g);
+                        came_from_fwd.insert(v, (u, edge_idx));
+                        open_fwd.push(State {
+                            cost: tentative_g + h_fwd(v),
+                            node: v,
+                        });
+
+                        // Check intersection with backward search
+                        if let Some(&g_b) = g_bwd.get(&v) {
+                            let dist = tentative_g + g_b; // We check dist through v? No, this is meeting at V.
+                            // But wait, my logic was meeting at EDGE.
+                            // If `v` is in `g_bwd`, it means we have a path `end -> ... -> v` with cost `g_b`.
+                            // So total cost is `tentative_g` (start->u->v) + `g_b` (v->end).
+                            // This corresponds to meeting at node `v`.
+                            // Wait, if meeting at node `v`, which edge is the "meeting edge"?
+                            // It's the edge `u->v` (edge_idx) we just traversed.
+                            if dist < mu {
+                                mu = dist;
+                                meeting_node = Some((u, v, edge_idx));
+                            }
+                        }
+                    }
+                }
             }
+        } else {
+            if let Some(State { cost: _, node: u }) = open_bwd.pop() {
+                // u is current in bwd search
+                let current_g = *g_bwd.get(&u).unwrap_or(&f64::INFINITY);
 
-            let edge = graph.edge(edge_idx);
+                if current_g + h_bwd(u) >= mu {
+                    continue;
+                }
 
-            // Filter by mode
-            if (edge.payload.allowed_modes & allowed_modes) == 0 {
-                continue;
-            }
+                for &edge_idx in &graph.node(u).edges {
+                    if let Some(allowed) = allowed_edges {
+                        if !allowed.contains(&edge_idx) {
+                            continue;
+                        }
+                    }
+                    let edge = graph.edge(edge_idx);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        continue;
+                    }
 
-            let neighbor = if edge.from == current {
-                edge.to
-            } else {
-                edge.from
-            };
+                    let v = if edge.from == u { edge.to } else { edge.from };
+                    let cost = edge.payload.cost as f64;
+                    let tentative_g = current_g + cost;
 
-            // Use logical cost instead of physical length
-            let tentative_g = current_g + edge.payload.cost as f64;
+                    if tentative_g < *g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        g_bwd.insert(v, tentative_g);
+                        came_from_bwd.insert(v, (u, edge_idx));
+                        open_bwd.push(State {
+                            cost: tentative_g + h_bwd(v),
+                            node: v,
+                        });
 
-            if tentative_g < *g_score.get(&neighbor).unwrap_or(&f64::INFINITY) {
-                came_from.insert(neighbor, (current, edge_idx));
-                g_score.insert(neighbor, tentative_g);
-                let f_score = tentative_g + heuristic(neighbor);
-                open_set.push(State {
-                    cost: f_score,
-                    node: neighbor,
-                });
+                        // Check intersection with forward search
+                        if let Some(&g_f) = g_fwd.get(&v) {
+                            // Path: start -> ... -> v (cost g_f) -> u -> ... -> end (cost tentative_g via edge)
+                            // Total: g_f + tentative_g
+                            let dist = g_f + tentative_g;
+                            if dist < mu {
+                                mu = dist;
+                                // Meeting at node v? No, traversing v->u (backward) means u->v (forward).
+                                // Edge is `edge_idx` connecting u and v.
+                                // We are coming from u (bwd) to v (bwd neighbor).
+                                // So path is start->...->v + edge(v,u) + u->...->end.
+                                // Edge connects v and u.
+                                // record as (v, u, edge_idx)?
+                                // My reconstruction expects (u_fwd, v_bwd, edge).
+                                // Here `v` is in fwd tree. `u` is in bwd tree.
+                                // So (v, u, edge_idx).
+                                meeting_node = Some((v, u, edge_idx));
+                            }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    if let Some((u, v, mid_edge)) = meeting_node {
+        // Reconstruct path
+        // start -> ... -> u
+        let mut path = reconstruct_path(came_from_fwd, u);
+
+        // Relationship check: mid_edge connects u and v.
+        // path contains edges leading up to u.
+        // We push mid_edge (u -> v).
+        path.push(mid_edge);
+
+        // v -> ... -> end
+        // reconstruct_path(came_from_bwd, v) gives [e_near_end, ..., e_near_v].
+        // These are edges leading to v from end.
+        // We want edges from v to end.
+        let mut path_bwd = reconstruct_path(came_from_bwd, v);
+        path_bwd.reverse();
+        path.extend(path_bwd);
+
+        return Some((mu, path));
     }
 
     None

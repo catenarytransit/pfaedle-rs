@@ -330,9 +330,15 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
 
             if !relation_found {
                 // 4. Fallback to Backtracking Pathfinding to handle dead ends
+                // Limit search space for performance: take only top 5 candidates per stop
+                let limited_candidates: Vec<Vec<usize>> = stop_candidates
+                    .iter()
+                    .map(|c| c.iter().take(5).cloned().collect())
+                    .collect();
+
                 // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
                 if let Some(geometry) =
-                    match_sequence_globally_optimal(&stop_candidates, osm, allowed_modes)
+                    match_sequence_globally_optimal(&limited_candidates, osm, allowed_modes)
                 {
                     // println!("  Fallback successful!");
                     full_path_geometry = geometry;
