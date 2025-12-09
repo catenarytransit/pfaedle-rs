@@ -95,6 +95,7 @@ pub struct EdgePL {
     pub is_reverse: bool,
     pub allowed_modes: u8,
     pub osmid: i64,
+    pub preferred_direction: u8,
 }
 
 impl Default for EdgePL {
@@ -109,6 +110,7 @@ impl Default for EdgePL {
             is_reverse: false,
             allowed_modes: 0,
             osmid: 0,
+            preferred_direction: 0,
         }
     }
 }
@@ -160,6 +162,10 @@ impl EdgePL {
         );
         obj.insert("allowed_modes".to_string(), self.allowed_modes.to_string());
         obj.insert("osmid".to_string(), self.osmid.to_string());
+        obj.insert(
+            "preferred_direction".to_string(),
+            self.preferred_direction.to_string(),
+        );
 
         let lines_str = self
             .lines
@@ -191,6 +197,7 @@ mod tests {
         assert!(!e.restriction);
         assert_eq!(e.cost, 0);
         assert_eq!(e.allowed_modes, 0);
+        assert_eq!(e.preferred_direction, 0);
     }
 
     #[test]

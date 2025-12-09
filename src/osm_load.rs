@@ -342,6 +342,7 @@ impl OsmBuilder {
                             edge_pl.lines = transit_lines.clone();
                             edge_pl.level = Self::parse_level(&w.tags);
                             edge_pl.oneway = Self::parse_oneway(&w.tags);
+                            edge_pl.preferred_direction = Self::parse_preferred_direction(&w.tags);
 
                             let mut modes = 0;
                             if is_rail {
@@ -561,13 +562,45 @@ impl OsmBuilder {
             graph.edges.iter().map(|e| (e.from, e.to)).collect();
 
         let mut edges_to_add = Vec::new();
-        for edge in &graph.edges {
+        for edge in &mut graph.edges {
+            // Apply preferred direction penalties to the forward edge
+            // 0: Neutral, 1: Forward (benefit), 2: Backward (penalty)
+            if edge.payload.preferred_direction == 1 {
+                // Forward is preferred: slight benefit (0.9x)
+                edge.payload.cost = (edge.payload.cost as f64 * 0.9).round() as u32;
+            } else if edge.payload.preferred_direction == 2 {
+                // Backward is preferred: slight penalty (1.2x) for forward traversal
+                edge.payload.cost = (edge.payload.cost as f64 * 1.2).round() as u32;
+            }
+
             let u = edge.from;
             let v = edge.to;
             if !existing_edges.contains(&(v, u)) {
                 let mut rev_pl = edge.payload.rev_copy();
-                // Penalize going backwards a bit (10% penalty)
-                rev_pl.cost = (rev_pl.cost as f64 * 1.1) as u32;
+
+                // Logic for reverse edge cost based on preferred direction
+                // Original edge had preferred_direction:
+                // 1 (Forward): Reverse edge is AGAINST preference -> Penalty (1.2x)
+                // 2 (Backward): Reverse edge is WITH preference -> Benefit (0.9x)
+
+                let mut base_cost = edge.payload.cost as f64;
+                if edge.payload.preferred_direction == 1 {
+                    base_cost /= 0.9;
+                } else if edge.payload.preferred_direction == 2 {
+                    base_cost /= 1.2;
+                }
+
+                if edge.payload.preferred_direction == 1 {
+                    // Reverse is against preference
+                    rev_pl.cost = (base_cost * 1.2).round() as u32;
+                } else if edge.payload.preferred_direction == 2 {
+                    // Reverse is with preference
+                    rev_pl.cost = (base_cost * 0.9).round() as u32;
+                } else {
+                    // No preference, apply standard 10% penalty for reverse
+                    rev_pl.cost = (base_cost * 1.1).round() as u32;
+                }
+
                 edges_to_add.push((v, u, rev_pl));
             }
         }
@@ -660,6 +693,18 @@ impl OsmBuilder {
             }
         }
         0
+    }
+
+    fn parse_preferred_direction(tags: &Tags) -> u8 {
+        if let Some(pd) = tags.get("railway:preferred_direction") {
+            match pd.as_str() {
+                "forward" => 1,
+                "backward" => 2,
+                _ => 0,
+            }
+        } else {
+            0
+        }
     }
 
     fn get_speed(tags: &Tags) -> f64 {
@@ -861,6 +906,80 @@ mod tests {
 
         let cost = OsmBuilder::calculate_cost(&tags, 100.0);
         assert_eq!(cost, u32::MAX);
+    }
+    #[test]
+    fn test_preferred_direction_costs() {
+        let mut graph = Graph::new();
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n2 = graph.add_node(NodePL {
+            point: Point::new(0.1, 0.0),
+        });
+
+        // Add an edge with preferred_direction: forward (1)
+        let mut edge_pl = EdgePL::new();
+        edge_pl.geometry = LineString::new(vec![
+            graph.nodes[n1].payload.point.into(),
+            graph.nodes[n2].payload.point.into(),
+        ]);
+        edge_pl.cost = 100;
+        edge_pl.preferred_direction = 1; // Forward
+        edge_pl.oneway = 0; // Bidirectional
+
+        graph.add_edge(n1, n2, edge_pl);
+
+        // Run post_process to apply costs and generate reverse edges
+        OsmBuilder::post_process(&mut graph);
+
+        // Check forward edge (index 0)
+        let fwd_edge = &graph.edges[0];
+        // Expected: 100 * 0.9 = 90
+        assert_eq!(fwd_edge.payload.cost, 90);
+
+        // Check reverse edge (index 1)
+        // Expected: 100 * 1.2 = 120
+        let rev_edge = &graph.edges[1];
+        assert_eq!(rev_edge.payload.cost, 120);
+    }
+
+    #[test]
+    fn test_preferred_direction_backward() {
+        let mut graph = Graph::new();
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n2 = graph.add_node(NodePL {
+            point: Point::new(0.1, 0.0),
+        });
+
+        // Add an edge with preferred_direction: backward (2)
+        let mut edge_pl = EdgePL::new();
+        edge_pl.geometry = LineString::new(vec![
+            graph.nodes[n1].payload.point.into(),
+            graph.nodes[n2].payload.point.into(),
+        ]);
+        edge_pl.cost = 100;
+        edge_pl.preferred_direction = 2; // Backward
+        edge_pl.oneway = 0;
+
+        graph.add_edge(n1, n2, edge_pl);
+
+        OsmBuilder::post_process(&mut graph);
+
+        // Check forward edge (index 0)
+        // Expected: 100 * 1.2 = 120
+        let fwd_edge = &graph.edges[0];
+        assert_eq!(fwd_edge.payload.cost, 120);
+
+        // Check reverse edge (index 1)
+        // Logic:
+        // if pref == 2: base_cost /= 1.2;
+        // rev_pl.cost = (base_cost * 0.9) as u32;
+        // base_cost = 120 / 1.2 = 100
+        // rev_cost = 100 * 0.9 = 90
+        let rev_edge = &graph.edges[1];
+        assert_eq!(rev_edge.payload.cost, 90);
     }
 }
 
