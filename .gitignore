@@ -11,3 +11,7 @@ JR-East-Train-GTFS.zip
 Toei-Train*
 toei*
 Toei*
+polregio.zip
+*:Zone.Identifier
+polregio/
+test_gtfs/
