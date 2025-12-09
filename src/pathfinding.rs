@@ -35,8 +35,8 @@ pub fn pathfind(
     end: NodeIndex,
     allowed_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
-) -> Option<Vec<usize>> {
-    // Returns list of EdgeIndices
+) -> Option<(f64, Vec<usize>)> {
+    // Returns (TotalCost, list of EdgeIndices)
     let end_point = graph.node(end).payload.point;
 
     // Heuristic needs to be admissible (<= actual cost).
@@ -66,7 +66,8 @@ pub fn pathfind(
     }) = open_set.pop()
     {
         if current == end {
-            return Some(reconstruct_path(came_from, current));
+            let total_cost = *g_score.get(&current).unwrap();
+            return Some((total_cost, reconstruct_path(came_from, current)));
         }
 
         let current_g = *g_score.get(&current).unwrap_or(&f64::INFINITY);
@@ -154,14 +155,14 @@ mod tests {
         // Test Rail
         let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, None);
         assert!(path_rail.is_some());
-        let edges = path_rail.unwrap();
+        let (_, edges) = path_rail.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_RAIL);
 
         // Test Bus
         let path_bus = pathfind(&graph, n0, n1, MODE_BUS, None);
         assert!(path_bus.is_some());
-        let edges = path_bus.unwrap();
+        let (_, edges) = path_bus.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_BUS);
 
@@ -204,7 +205,8 @@ mod tests {
         let idx_norm2 = graph.add_edge(n2, n1, e_normal2);
 
         // Pathfind
-        let path = pathfind(&graph, n0, n1, MODE_RAIL, None).expect("Should find path");
+        let result = pathfind(&graph, n0, n1, MODE_RAIL, None).expect("Should find path");
+        let (_, path) = result;
 
         // Should choose the detour (2 edges) because total cost 2000 < 1,000,000
         assert_eq!(path.len(), 2);

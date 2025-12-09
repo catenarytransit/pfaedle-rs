@@ -1,5 +1,6 @@
 use ahash::{AHashMap, AHashSet};
-use geo::Point;
+use geo::algorithm::HaversineDistance;
+use geo::{LineString, Point};
 use gtfs_structures::RouteType;
 
 use crate::graph::{MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
@@ -71,19 +72,49 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
             // How many candidates to consider per stop?
             // We fetch more initially, then filter down to a smaller set of diverse candidates.
+
             const SEARCH_RADIUS_NODES: usize = 100;
             const TARGET_CANDIDATES: usize = 20;
+            // For rail, we might need a much larger search radius if the track is far from the stop coordinate
+            const SEARCH_RADIUS_NODES_RAIL: usize = 400; // Look further for rail
 
             for point in &stop_coords {
+                let search_limit = if pattern.route_type == Some(RouteType::Rail) {
+                    SEARCH_RADIUS_NODES_RAIL
+                } else {
+                    SEARCH_RADIUS_NODES
+                };
+
+                // For rail, we also want to filter by distance.
+                // The index gives us nearest neighbors, but valid tracks might be a bit further away (up to 200m)
+                // We'll iterate until we find enough valid ones OR we exceed max distance.
+
                 let neighbors = index
                     .nearest_neighbor_iter(&[point.x(), point.y()])
-                    .take(SEARCH_RADIUS_NODES);
+                    .take(search_limit);
 
                 let mut candidates: Vec<usize> = Vec::new();
                 let mut seen_ways: AHashSet<i64> = AHashSet::new();
                 let mut fallback_candidates: Vec<usize> = Vec::new();
 
                 for sn in neighbors {
+                    // Check distance for Rail
+                    if pattern.route_type == Some(RouteType::Rail) {
+                        // sn.distance_2 is squared euclidean distance in approx coords.
+                        // Ideally we check real distance, but let's assume the projection is roughly meters if using local,
+                        // but here we are using lon/lat.
+                        // RTree distance is squared euclidean on coords.
+                        // We should compute actual distance.
+                        let node_pl = &osm.graph.node(sn.index).payload;
+                        let dist = node_pl
+                            .point
+                            .haversine_distance(&Point::new(point.x(), point.y()));
+                        if dist > 300.0 {
+                            // Too far, stop searching
+                            break;
+                        }
+                    }
+
                     let node_idx = sn.index;
                     let node = osm.graph.node(node_idx);
 
@@ -105,7 +136,10 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                             seen_ways.insert(w);
                         }
                     } else {
-                        fallback_candidates.push(node_idx);
+                        // Also keep some fallbacks just in case
+                        if fallback_candidates.len() < 20 {
+                            fallback_candidates.push(node_idx);
+                        }
                     }
 
                     if candidates.len() >= TARGET_CANDIDATES {
@@ -257,7 +291,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                             continue;
                         }
 
-                        if let Some(edges) = pathfinding::pathfind(
+                        if let Some((_cost, edges)) = pathfinding::pathfind(
                             &osm.graph,
                             current_node,
                             next_node,
@@ -298,7 +332,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 // 4. Fallback to Backtracking Pathfinding to handle dead ends
                 // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
                 if let Some(geometry) =
-                    match_sequence_with_backtracking(&stop_candidates, osm, allowed_modes)
+                    match_sequence_globally_optimal(&stop_candidates, osm, allowed_modes)
                 {
                     // println!("  Fallback successful!");
                     full_path_geometry = geometry;
@@ -336,134 +370,170 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
     results
 }
 
-fn match_sequence_with_backtracking(
+fn match_sequence_globally_optimal(
     stop_candidates: &[Vec<usize>],
     osm: &OsmData,
     allowed_modes: u8,
 ) -> Option<Vec<(f64, f64)>> {
-    // visited: (stop_idx, candidate_node_idx) -> bool (dead end)
-    let mut visited: AHashSet<(usize, usize)> = AHashSet::new();
-
-    // Recursive helper
-    // Returns Option<Vec<(f64, f64)>>: The geometry of the rest of the path including connection from current
-    fn backtrack(
-        current_stop_idx: usize,
-        current_node_idx: usize,
-        stop_candidates: &[Vec<usize>],
-        osm: &OsmData,
-        allowed_modes: u8,
-        visited: &mut AHashSet<(usize, usize)>,
-    ) -> Option<Vec<(f64, f64)>> {
-        // Base case: If we are at the last stop, we are done
-        if current_stop_idx == stop_candidates.len() - 1 {
-            // Just return the point of the last node
-            let pl = &osm.graph.node(current_node_idx).payload;
-            return Some(vec![(pl.point.y(), pl.point.x())]);
-        }
-
-        // Check memoization
-        if visited.contains(&(current_stop_idx, current_node_idx)) {
-            return None;
-        }
-
-        let next_stop_idx = current_stop_idx + 1;
-        let next_candidates = &stop_candidates[next_stop_idx];
-
-        // Try to reach ANY candidate of the next stop
-        for &next_node_idx in next_candidates {
-            if current_node_idx == next_node_idx {
-                if let Some(rest_geometry) = backtrack(
-                    next_stop_idx,
-                    next_node_idx,
-                    stop_candidates,
-                    osm,
-                    allowed_modes,
-                    visited,
-                ) {
-                    // No new geometry to add between identical nodes, just partial path
-                    return Some(rest_geometry);
-                }
-            } else {
-                // Try to pathfind
-                // We don't use relation edges here, just generic pathfinding on graph
-                if let Some(edges) = pathfinding::pathfind(
-                    &osm.graph,
-                    current_node_idx,
-                    next_node_idx,
-                    allowed_modes,
-                    None,
-                ) {
-                    // Path found! Now see if we can continue from next_node
-                    if let Some(rest_geometry) = backtrack(
-                        next_stop_idx,
-                        next_node_idx,
-                        stop_candidates,
-                        osm,
-                        allowed_modes,
-                        visited,
-                    ) {
-                        // Success! Reconstruct full geometry
-                        let mut geometry = Vec::new();
-                        // Add edges geometry
-                        for edge_idx in edges {
-                            let edge = osm.graph.edge(edge_idx);
-                            // Skip first point of edge to avoid duplication if we are chaining
-                            // But here we are prepending.
-                            // Logic: Current node point is implicit?
-                            // Usually path geometry includes start/end of edges.
-                            for coord in edge.payload.geometry.coords().skip(1) {
-                                // Skip start to avoid double point?
-                                // Wait, if we use skip(1), we miss the start of the first edge?
-                                // Usually the start of first edge IS current_node.
-                                // So we collect points excluding the FIRST one of each edge?
-                                // Standard practice depends on how graph is built.
-                                // Let's assume edge geometry starts with `from` and ends with `to`.
-                                geometry.push((coord.y, coord.x));
-                            }
-                        }
-                        // Add the rest
-                        geometry.extend(rest_geometry);
-
-                        // Note: The very first point of the entire path (start of first edge) might be missing?
-                        // The recursion returns geometry *starting after* current_node?
-                        // Base case returns just last node point.
-                        // Recursive step adds path *to* next node + rest.
-                        // So we are missing the current_node point at the very beginning of the top-level call.
-                        // But `geometry` above collects points *between* current and next.
-                        // If we assume `skip(1)` works, we likely already have `current_node` from previous step?
-                        // Wait, for the top-most call, we need to handle the start.
-                        return Some(geometry);
-                    }
-                }
-            }
-        }
-
-        // If we get here, no path to ANY next candidate worked.
-        visited.insert((current_stop_idx, current_node_idx));
-        None
-    }
-
-    // Top-level loop
     if stop_candidates.is_empty() {
         return None;
     }
 
-    let start_candidates = &stop_candidates[0];
-    for &start_node in start_candidates {
-        if let Some(path) = backtrack(
-            0,
-            start_node,
-            stop_candidates,
-            osm,
-            allowed_modes,
-            &mut visited,
-        ) {
-            // Prepend the start node itself
-            let pl = &osm.graph.node(start_node).payload;
-            let mut full = vec![(pl.point.y(), pl.point.x())];
-            full.extend(path);
-            return Some(full);
+    // Dynamic Programming / Viterbi
+    // State: (stop_idx, candidate_idx)
+    // We want to minimize total path cost.
+
+    let num_stops = stop_candidates.len();
+
+    // MinCost[i][k] = minimum cost to reach candidate k at stop i from start
+    // Parent[i][k] = index of candidate at i-1 that leads to MinCost
+    // We store this as Vec<Vec<Option<(Cost, ParentIdx)>>>
+    // where inner vec size is stop_candidates[i].len()
+
+    let mut min_costs: Vec<Vec<Option<(f64, usize)>>> = Vec::with_capacity(num_stops);
+
+    // Initialize first stop
+    let first_candidates_len = stop_candidates[0].len();
+    let mut first_costs = Vec::with_capacity(first_candidates_len);
+    for _ in 0..first_candidates_len {
+        first_costs.push(Some((0.0, 0))); // Cost 0 to start here. Parent 0 (dummy)
+    }
+    min_costs.push(first_costs);
+
+    // Iterate stops
+    for i in 1..num_stops {
+        let prev_candidates = &stop_candidates[i - 1];
+        let curr_candidates = &stop_candidates[i];
+        let mut curr_costs = vec![None; curr_candidates.len()];
+
+        let mut any_reachable = false;
+
+        // For each candidate in previous step
+        for (prev_k, prev_cost_opt) in min_costs[i - 1].iter().enumerate() {
+            if let Some((prev_total_cost, _)) = prev_cost_opt {
+                let prev_node = prev_candidates[prev_k];
+
+                // Try to reach each candidate in current step
+                for (curr_k, &curr_node) in curr_candidates.iter().enumerate() {
+                    let cost_inc: f64;
+
+                    if prev_node == curr_node {
+                        cost_inc = 0.0;
+                    } else {
+                        // Pathfind
+                        // Note: This can be slow if we have many candidates (20*20 = 400 pathfinds per stop).
+                        // But usually path between stops is short.
+                        if let Some((c, _)) = pathfinding::pathfind(
+                            &osm.graph,
+                            prev_node,
+                            curr_node,
+                            allowed_modes,
+                            None,
+                        ) {
+                            cost_inc = c;
+                        } else {
+                            continue; // Unreachable
+                        }
+                    }
+
+                    let new_total_cost = prev_total_cost + cost_inc;
+
+                    // Update if better
+                    if let Some((existing_cost, _)) = curr_costs[curr_k] {
+                        if new_total_cost < existing_cost {
+                            curr_costs[curr_k] = Some((new_total_cost, prev_k));
+                        }
+                    } else {
+                        curr_costs[curr_k] = Some((new_total_cost, prev_k));
+                    }
+                    any_reachable = true;
+                }
+            }
         }
+
+        min_costs.push(curr_costs);
+
+        if !any_reachable {
+            // Cannot reach any candidate at this stop. Path is broken.
+            // println!("Broken path at stop index {}", i);
+            return None;
+        }
+    }
+
+    // Backtrack from best candidate at last stop
+    let last_stop_idx = num_stops - 1;
+    // let last_candidates = &stop_candidates[last_stop_idx]; // Unused
+
+    // Find best end candidate
+    let mut best_end_k = None;
+    let mut best_end_cost = f64::INFINITY;
+
+    for (k, cost_opt) in min_costs[last_stop_idx].iter().enumerate() {
+        if let Some((cost, _)) = cost_opt {
+            if *cost < best_end_cost {
+                best_end_cost = *cost;
+                best_end_k = Some(k);
+            }
+        }
+    }
+
+    if let Some(mut curr_k) = best_end_k {
+        // Reconstruct path
+        // We need to re-run pathfind to get geometry, or we could have stored it?
+        // Storing geometry for all 400 pairs is heavy memory?
+        // Storing edge indices is okay.
+        // But here we just re-run pathfind during backtracking. It is only N pathfinds now.
+
+        let mut full_geometry: Vec<(f64, f64)> = Vec::new();
+
+        // We build geometry backwards: last segment, then second to last...
+        // Then we reverse the whole list of points?
+        // Or we collect segments and reverse the order of segments?
+        // Let's collect segments from end to start.
+
+        let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+
+        for i in (1..num_stops).rev() {
+            let prev_k = min_costs[i][curr_k].unwrap().1;
+
+            let curr_node = stop_candidates[i][curr_k];
+            let prev_node = stop_candidates[i - 1][prev_k];
+
+            let mut segment_geom = Vec::new();
+
+            if curr_node == prev_node {
+                // No movement
+            } else {
+                if let Some((_, edges)) =
+                    pathfinding::pathfind(&osm.graph, prev_node, curr_node, allowed_modes, None)
+                {
+                    for edge_idx in edges {
+                        let edge = osm.graph.edge(edge_idx);
+                        for coord in edge.payload.geometry.coords().skip(1) {
+                            segment_geom.push((coord.y, coord.x));
+                        }
+                    }
+                } else {
+                    // Should not happen if logic is correct
+                    return None;
+                }
+            }
+            segments.push(segment_geom);
+            curr_k = prev_k;
+        }
+
+        // Add start node
+        let start_node = stop_candidates[0][curr_k];
+        let p = osm.graph.node(start_node).payload.point;
+        full_geometry.push((p.y(), p.x()));
+
+        // Segments are in reverse order (last segment first)
+        // We need to process segments in reverse (first segment first)
+        for seg in segments.iter().rev() {
+            full_geometry.extend(seg.iter().cloned());
+        }
+
+        return Some(full_geometry);
     }
 
     None
@@ -504,10 +574,27 @@ mod tests {
         let mut e = EdgePL::new();
         e.cost = 10;
         e.allowed_modes = 255;
+
+        // Populate geometry for A (0->1)
+        e.geometry = LineString::new(vec![
+            Point::new(0.0, 0.0).into(),
+            Point::new(1.0, 0.0).into(),
+        ]);
         graph.add_edge(n0, n1, e.clone());
 
         // Edges B
+        // 2->3
+        e.geometry = LineString::new(vec![
+            Point::new(0.0, 1.0).into(),
+            Point::new(1.0, 1.0).into(),
+        ]);
         graph.add_edge(n2, n3, e.clone());
+
+        // 3->4
+        e.geometry = LineString::new(vec![
+            Point::new(1.0, 1.0).into(),
+            Point::new(2.0, 1.0).into(),
+        ]);
         graph.add_edge(n3, n4, e.clone());
 
         let osm = OsmData {
@@ -526,7 +613,7 @@ mod tests {
         // Stop 3: [4]
         let stop_candidates = vec![vec![n0, n2], vec![n1, n3], vec![n4]];
 
-        let result = match_sequence_with_backtracking(&stop_candidates, &osm, 255);
+        let result = match_sequence_globally_optimal(&stop_candidates, &osm, 255);
 
         // Should succeed by picking 2 -> 3 -> 4
         assert!(result.is_some());
