@@ -46,11 +46,11 @@ pub fn pathfind(
     // Heuristics
     let h_fwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.haversine_distance(&end_point) * 0.2
+        p.haversine_distance(&end_point) * 0.1
     };
     let h_bwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.haversine_distance(&start_point) * 0.2
+        p.haversine_distance(&start_point) * 0.1
     };
 
     let mut open_fwd = BinaryHeap::new();
