@@ -37,8 +37,9 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
     // NOTE: gtfs_structures::Gtfs::new returns Result<Gtfs, Error>
     // Load raw GTFS data first
     let path_str = path.to_str().unwrap();
+    println!("Loading raw GTFS for pfaedle from {}", path_str);
     let mut raw = gtfs_structures::RawGtfs::from_path(path_str)
-        .map_err(|e| anyhow::anyhow!("Failed to load raw GTFS: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load raw GTFS for pfaedle: {:?}", e))?;
 
     // If shapes.txt is missing/invalid, ignore it and remove shape references from trips
     let shapes_missing = match &raw.shapes {
@@ -56,7 +57,8 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
         }
     }
 
-    let gtfs = Gtfs::try_from(raw).map_err(|e| anyhow::anyhow!("Failed to process GTFS: {}", e))?;
+    let gtfs = Gtfs::try_from(raw)
+        .map_err(|e| anyhow::anyhow!("Failed to process GTFS for pfaedle: {}", e))?;
 
     println!(
         "Loaded {} stops, {} trips",
