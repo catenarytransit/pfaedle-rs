@@ -81,7 +81,8 @@ fn main() -> Result<()> {
     println!("Allowed MOTS: {:?}", allowed_mots);
 
     // 1. Load GTFS
-    let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)?;
+    let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)
+        .context("Failed to load GTFS for Pfaedle")?;
 
     // 2. Load OSM
     // Calculate BBox from GTFS stops
@@ -145,6 +146,7 @@ fn main() -> Result<()> {
         }
     }
     wtr.flush()?;
+    drop(wtr);
 
     // 5. Update trips.txt
     // We need to associate trips with new shape_ids
@@ -223,6 +225,7 @@ fn main() -> Result<()> {
         wtr_trips.write_record(&new_record)?;
     }
     wtr_trips.flush()?;
+    drop(wtr_trips);
 
     // Replace original trips.txt
     std::fs::rename(trips_out_path, trips_path)?;
@@ -323,6 +326,7 @@ fn main() -> Result<()> {
             wtr.write_record(&new_record)?;
         }
         wtr.flush()?;
+        drop(wtr);
         std::fs::rename(routes_out_path, routes_path)?;
     }
 
