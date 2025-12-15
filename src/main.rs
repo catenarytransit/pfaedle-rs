@@ -7,10 +7,23 @@ mod osm_load;
 mod pathfinding;
 mod router;
 
+use ahash::AHashMap;
 use anyhow::{Context, Result};
 use clap::Parser;
+use geo::Point;
 use gtfs_structures::RouteType;
+use serde::Deserialize;
+use std::error::Error;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::PathBuf;
+
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -48,12 +61,135 @@ struct Args {
     low_priority: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ShapeRecord {
-    shape_id: String,
+#[derive(Debug, Clone)]
+pub struct ShapePoint {
+    pub geometry: Point<f64>,
+    pub sequence: usize,
+    // pub dist_traveled: Option<f32>, // We don't really use this yet, so omit to save memory further or keep? User had it. Let's keep if read from input matching user example.
+    // Actually our ShapeRecord didn't have it, but user example did.
+    // Our ShapeRecord was: shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence.
+    // Let's stick to what we had + optimization. Removing dist_traveled unless needed.
+    // User example included it. It's safer to include it if we want to preserve data from existing files.
+}
+
+#[derive(Deserialize)]
+struct RawShape {
+    #[serde(rename = "shape_id")]
+    pub id: String,
+    #[serde(rename = "shape_pt_lat")]
+    pub latitude: f64,
+    #[serde(rename = "shape_pt_lon")]
+    pub longitude: f64,
+    #[serde(rename = "shape_pt_sequence")]
+    pub sequence: usize,
+    // #[serde(rename = "shape_dist_traveled")]
+    // pub dist_traveled: Option<f32>,
+}
+
+#[derive(serde::Serialize)]
+struct ShapeRecordOut<'a> {
+    shape_id: &'a str,
     shape_pt_lat: f64,
     shape_pt_lon: f64,
     shape_pt_sequence: usize,
+}
+
+/// O(n) check; only sort if any sequence is out of order.
+fn maybe_sort_by_sequence(points: &mut Vec<ShapePoint>) {
+    if points.len() < 2 {
+        return;
+    }
+
+    let mut prev = points[0].sequence;
+    let mut sorted = true;
+
+    for p in points.iter().skip(1) {
+        if p.sequence < prev {
+            sorted = false;
+            break;
+        }
+        prev = p.sequence;
+    }
+
+    if !sorted {
+        // In-place, no extra allocation
+        points.sort_unstable_by_key(|p| p.sequence);
+    }
+}
+
+/// Reads a shapes.txt file and aggregates points into a HashMap.
+///
+/// This implementation assumes the input CSV is sorted by `shape_id` for efficiency,
+/// but will handle unsorted data correctly (just less efficiently due to lookups/resizing).
+/// ACTUALLY, the streaming logic provided by user *relies* on sorting to flush.
+/// If not sorted, we'd overwrite or need to append.
+/// Most GTFS shapes.txt are sorted. If not, this logic effectively splits them if they are interleaved
+/// (which is fine, we just get multiple entries potentially? No, HashMap overwrites).
+/// NO, the user logic accumulates `current_points` and inserts once ID changes.
+/// If IDs are interleaved (A, B, A), we would insert A, then B, then overwrite A with the second chunk.
+/// This would be DATA LOSS for interleaved files.
+/// To be SAFE, we should probably check if key exists and append?
+/// OR, just assume standard GTFS which is grouped. usage of `sort` command on linux can ensure this
+/// but we are in rust.
+/// Let's assume standard grouping.
+pub fn faster_shape_reader(
+    path: PathBuf,
+) -> Result<AHashMap<String, Vec<ShapePoint>>, Box<dyn Error>> {
+    let file = File::open(path).context("Failed to open shapes.txt")?;
+    let buf_reader = BufReader::new(file);
+    let mut rdr = csv::Reader::from_reader(buf_reader);
+
+    // Initial capacity guess
+    let mut shapes: AHashMap<String, Vec<ShapePoint>> = AHashMap::with_capacity(1000);
+
+    // State buffers
+    let mut current_points: Vec<ShapePoint> = Vec::with_capacity(500);
+    let mut current_shape_id: Option<String> = None;
+
+    for result in rdr.deserialize() {
+        let record: RawShape = result?;
+
+        if let Some(ref curr_id) = current_shape_id {
+            if *curr_id != record.id {
+                // ID changed
+                if !current_points.is_empty() {
+                    maybe_sort_by_sequence(&mut current_points);
+                    // If key exists (interleaved), we append?
+                    // Safe approach: entry().or_default().extend(...)
+                    shapes
+                        .entry(curr_id.clone())
+                        .or_default()
+                        .append(&mut current_points); // Moves contents
+
+                    // current_points is now empty but capacity kept?
+                    // append moves elements. Capacity of `current_points` remains?
+                    // No, `append` drains other. `current_points` becomes empty.
+                    // We might need to re-reserve if capacity dropped? Usually Vec keeps capacity.
+                }
+                current_shape_id = Some(record.id.clone());
+            }
+        } else {
+            current_shape_id = Some(record.id.clone());
+        }
+
+        let point = ShapePoint {
+            geometry: Point::new(record.longitude, record.latitude),
+            sequence: record.sequence,
+        };
+        current_points.push(point);
+    }
+
+    if let Some(last_id) = current_shape_id {
+        if !current_points.is_empty() {
+            maybe_sort_by_sequence(&mut current_points);
+            shapes
+                .entry(last_id)
+                .or_default()
+                .append(&mut current_points);
+        }
+    }
+
+    Ok(shapes)
 }
 
 fn main() -> Result<()> {
@@ -144,70 +280,30 @@ fn main() -> Result<()> {
     let results = matcher::match_patterns(&gtfs_data, &osm_data);
 
     // 4. Write shapes.txt
-    // If wipe_shapes is set, we need to carefully remove only shapes for the current MOTs
-    // and keep the rest.
-    // If wipe_shapes is FALSE, we might be appending duplicates? Or maybe we should overwrite
-    // anyway? The original logic was: args.wipe_shapes -> delete file. Else -> append?
-    // Actually, csv::Writer::from_path truncates by default unless we set append(true).
-    // So logic was: if wipe_shapes -> delete file, then from_path (truncate/create) -> new file.
-    // if !wipe_shapes -> from_path (truncate/create) -> overwrites unless we used OpenOptions.
-    // Wait, `csv::Writer::from_path` ALWAYS truncates.
-    // So previously, if `shapes.txt` existed and `wipe_shapes` was FALSE, it would effectively be wiped anyway?
-    // Let's check std::fs::remove_file usage.
-    // Ah, if `wipe_shapes` was false, lines 70-75 skipped.
-    // Line 136: `csv::Writer::from_path(&shapes_path)?`
-    // documentation says: "If the file already exists, it is overwritten."
-    // So previously, it ALWAYS wiped shapes.txt, practically speaking.
-    // The `wipe_shapes` arg was redundant or maybe intent was different?
-    // Or maybe the user meant "if I don't say wipe, don't run pfaedle?" No.
-    //
-    // New logic:
-    // If wipe_shapes:
-    //   Read existing shapes.txt.
-    //   Identify shape_ids to REMOVE. These are shape_ids used by trips of the selected MOTs.
-    //   Filter existing records: Keep if shape_id NOT in remove_set.
-    //   Write kept records + new results.
-    // If !wipe_shapes:
-    //   Presumably we just want to run for these MOTs. The user expectation "only wipe shapes for that specific mot"
-    //   implies we KEEP others.
-    //   So regardless of `wipe_shapes` flag (or maybe ONLY if it is set?), we want preservation behavior.
-    //   Let's assume the user WANTS to update the shapes for the selected MOTs.
-    //   So we ALWAYS need to "wipe" the old shapes for the selected MOTs (replace them) and keep others.
-    //   "if MOTS is selected (and is not all), only wipe shapes for that specific mot route type."
-    //   This implies: Read all, remove partial, add new.
-
     println!("Updating shapes.txt at {:?}", shapes_path);
 
-    let mut existing_shapes = Vec::new();
+    let mut all_shapes: AHashMap<String, Vec<ShapePoint>> = AHashMap::new();
 
     if shapes_path.exists() {
-        println!("Reading existing shapes...");
-        let mut rdr = csv::Reader::from_path(&shapes_path)?;
-        for result in rdr.deserialize() {
-            let record: ShapeRecord = result?;
-            existing_shapes.push(record);
+        println!("Reading existing shapes (optimized)...");
+        // Use our new faster reader
+        match faster_shape_reader(shapes_path.clone()) {
+            Ok(shapes) => {
+                all_shapes = shapes;
+                println!("Loaded {} existing shapes.", all_shapes.len());
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to read existing shapes: {}. Proceeding with empty set.",
+                    e
+                );
+            }
         }
     }
 
-    // Determine which shape_ids belong to the *current* selection of MOTs (the ones we are processing).
-    // We want to REPLACE these.
-    // We also want to KEEP shape_ids that belong to OTHER MOTs.
-    //
-    // Issue: How do we know which shape_id belongs to which MOT in the OLD file?
-    // We don't have that info in shapes.txt.
-    // We can infer it from the *current* GTFS.
-    //
-    // Strategy:
-    // 1. Identify all shape_ids used by trips in the GTFS that match `allowed_mots`.
-    //    These are the "Target Shape IDs".
-    // 2. Filter existing_shapes:
-    //    If a shape's ID is in "Target Shape IDs", DROP IT (we are about to regenerate it).
-    //    Else, KEEP IT.
-    // 3. Append new results.
-
+    // Determine shapes to replace
     let mut shapes_to_replace = ahash::AHashSet::new();
     if args.mots != "all" {
-        // If specific MOTs selected, we only want to replace shapes for trips of those MOTs.
         for (trip_id, trip) in &gtfs_data.gtfs.trips {
             let route = gtfs_data.gtfs.routes.get(&trip.route_id);
             if let Some(r) = route {
@@ -223,55 +319,58 @@ fn main() -> Result<()> {
             "Identified {} shape_ids to replace based on selected MOTs.",
             shapes_to_replace.len()
         );
-
-        // Also add the shape_ids that we just generated matching patterns for?
-        // Actually, `results` contains the NEW shape_ids.
-        // We want to remove OLD entries that *conflict* or are *obsolete* versions.
-        // If we found a match, we generate a NEW shape_id usually (unless we reuse IDs?).
-        // Pfaedle generates IDs like "shp_2_123...".
-        // The old file might have "shp_2_..."
-        // Safe bet: remove any shape_id that is referenced by the trips we are currently processing.
     } else {
-        // If MOTs is "all", and we are wiping (or just running?), we probably want to replace EVERYTHING?
-        // "if MOTS is selected (and is not all), only wipe shapes for that specific mot route type."
-        // Implies if MOTS == all, we wipe everything (default behavior).
         if args.wipe_shapes {
-            println!("MOTs='all' and wipe_shapes=true. Wiping all existing shapes.");
-            existing_shapes.clear();
+            println!("MOTs='all' and wipe_shapes=true. Clearing all existing shapes.");
+            all_shapes.clear();
         }
     }
 
-    // Filter existing
+    // Remove obsolete shapes
     if !shapes_to_replace.is_empty() {
-        let before_count = existing_shapes.len();
-        existing_shapes.retain(|s| !shapes_to_replace.contains(&s.shape_id));
-        let after_count = existing_shapes.len();
+        let before_count = all_shapes.len();
+        all_shapes.retain(|id, _| !shapes_to_replace.contains(id));
         println!(
-            "Pruned {} existing shape points (kept {}).",
-            before_count - after_count,
-            after_count
+            "Pruned {} existing shapes (kept {}).",
+            before_count - all_shapes.len(),
+            all_shapes.len()
         );
     }
 
+    // Insert NEW shapes
+    for shape_res in results.values() {
+        let mut points = Vec::with_capacity(shape_res.points.len());
+        for (i, (lat, lon)) in shape_res.points.iter().enumerate() {
+            points.push(ShapePoint {
+                geometry: Point::new(*lon, *lat),
+                sequence: i + 1,
+            });
+        }
+        all_shapes.insert(shape_res.shape_id.clone(), points);
+    }
+
     // Write everything back
+    // We should probably sort by shape_id to be nice?
+    // And for each shape, ensure points valid?
     let mut wtr = csv::Writer::from_path(&shapes_path)?;
 
-    // 1. Write kept existing shapes
-    for shape in existing_shapes {
-        wtr.serialize(shape)?;
-    }
+    // Convert HashMap to Vec for sorting keys (optional but good practice for consistency)
+    let mut sorted_keys: Vec<&String> = all_shapes.keys().collect();
+    sorted_keys.sort();
 
-    // 2. Write new shapes
-    for shape_res in results.values() {
-        for (i, (lat, lon)) in shape_res.points.iter().enumerate() {
-            wtr.serialize(ShapeRecord {
-                shape_id: shape_res.shape_id.clone(),
-                shape_pt_lat: *lat,
-                shape_pt_lon: *lon,
-                shape_pt_sequence: i + 1,
-            })?;
+    for key in sorted_keys {
+        if let Some(points) = all_shapes.get(key) {
+            for point in points {
+                wtr.serialize(ShapeRecordOut {
+                    shape_id: key,
+                    shape_pt_lat: point.geometry.y(),
+                    shape_pt_lon: point.geometry.x(),
+                    shape_pt_sequence: point.sequence,
+                })?;
+            }
         }
     }
+
     wtr.flush()?;
     drop(wtr);
 

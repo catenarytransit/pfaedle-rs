@@ -16,3 +16,5 @@ css-color = "0.2.8"
 rayon = "1.10"
 ahash = "0.8"
 rustix = { version = "1.1.2", features = ["process"] }
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
