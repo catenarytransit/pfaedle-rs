@@ -86,7 +86,15 @@ fn main() -> Result<()> {
 
     // 2. Load OSM
     // Calculate BBox from GTFS stops
-    let bbox = if gtfs_data.gtfs.stops.is_empty() {
+    // Collect all unique stop IDs from patterns
+    let mut relevant_stop_ids = ahash::AHashSet::new();
+    for pattern in gtfs_data.patterns.keys() {
+        for stop_id in &pattern.stop_ids {
+            relevant_stop_ids.insert(stop_id);
+        }
+    }
+
+    let bbox = if relevant_stop_ids.is_empty() {
         None
     } else {
         let mut min_lat = f64::MAX;
@@ -94,11 +102,13 @@ fn main() -> Result<()> {
         let mut min_lon = f64::MAX;
         let mut max_lon = f64::MIN;
 
-        for stop in gtfs_data.gtfs.stops.values() {
-            min_lat = min_lat.min(stop.latitude.expect("Stop missing latitude"));
-            max_lat = max_lat.max(stop.latitude.expect("Stop missing latitude"));
-            min_lon = min_lon.min(stop.longitude.expect("Stop missing longitude"));
-            max_lon = max_lon.max(stop.longitude.expect("Stop missing longitude"));
+        for stop_id in relevant_stop_ids {
+            if let Some(stop) = gtfs_data.gtfs.stops.get(stop_id) {
+                min_lat = min_lat.min(stop.latitude.expect("Stop missing latitude"));
+                max_lat = max_lat.max(stop.latitude.expect("Stop missing latitude"));
+                min_lon = min_lon.min(stop.longitude.expect("Stop missing longitude"));
+                max_lon = max_lon.max(stop.longitude.expect("Stop missing longitude"));
+            }
         }
 
         let has_rail = gtfs_data.used_route_types.contains(&RouteType::Rail);
