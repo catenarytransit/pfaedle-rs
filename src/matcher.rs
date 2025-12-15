@@ -1,12 +1,12 @@
 use ahash::{AHashMap, AHashSet};
+use geo::Point;
 use geo::algorithm::HaversineDistance;
-use geo::{LineString, Point};
 use gtfs_structures::RouteType;
 
 use crate::graph::{MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
 use crate::gtfs_load::{GtfsData, StopPattern};
 use crate::osm_load::OsmData;
-use crate::pathfinding;
+use crate::pathfinding::{self, TransitMatch};
 
 #[derive(Debug, Clone)]
 pub struct ShapeResult {
@@ -182,12 +182,38 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             let mut full_path_geometry = Vec::new();
             let mut relation_found = false;
 
+            // Get GTFS Route/Agency Info for Matching
+            let sample_trip_id = &gtfs.patterns.get(pattern).unwrap()[0];
+            let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
+            let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
+
+            // Find agency (Agencies are in a Vec in gtfs_structures usually)
+            // route.agency_id is Option<String>
+            let agency_name = if let Some(agency_id) = &route.agency_id {
+                gtfs.gtfs
+                    .agencies
+                    .iter()
+                    .find(|a| a.id.as_ref() == Some(agency_id))
+                    .map(|a| a.name.to_lowercase())
+            } else {
+                // If no agency_id in route, maybe try the first agency if only one?
+                // Or just None.
+                None
+            };
+
+            let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
+            let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
+
+            let preferred_match = TransitMatch {
+                short_name: route_short_name.clone(),
+                long_name: route_long_name.clone(),
+                operator: agency_name.clone(),
+            };
+
             // Relation Candidate logic
             // Vote for relations based on ALL candidates
             // Scoring: Calculate coverage ratio (stops covered / total stops)
-            // Map: Relation Index -> (Coverage Score, Average Distance to Candidates)
-            // Score = num_stops_covered / total_stops
-            // Prioritize: 1. Coverage Score (Desc), 2. Candidate Count (Desc, as heuristic for better fit)
+            // Map: Relation Index -> (Coverage Score, Candidate Count)
 
             let mut relation_scores: AHashMap<usize, (f64, usize)> = AHashMap::new();
 
@@ -215,9 +241,6 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 .filter(|(r_idx, (_covered_stops, _count))| {
                     let rel = &osm.relations[**r_idx];
 
-                    // Heuristic: Must contain at least one candidate for the first stop AND one for the last stop
-                    // UNLESS coverage is very high (e.g. > 90%), then maybe we accept it even if endpoints are fuzzy?
-                    // But generally, the start/end requirement is good for directional correctness.
                     if stop_candidates.is_empty() {
                         return false;
                     }
@@ -227,26 +250,79 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                     let has_start = start_candidates.iter().any(|&n| rel.nodes.contains(&n));
                     let has_end = end_candidates.iter().any(|&n| rel.nodes.contains(&n));
 
-                    // Relaxed condition: If coverage is > 80%, we accept even if start/end checks fail?
-                    // User said: "It needs to match the full line relation... If none is found, fall back to A*"
-                    // "Cuts short" implies we picked a partial relation.
-                    // If we enforce start && end, we avoid partial segments that don't span the whole route.
-                    // So keeping start && end is GOOD justification.
-
                     has_start && has_end
                 })
                 .map(|(k, _)| *k)
                 .collect();
 
-            // Sort candidates by coverage (Desc), then Candidate Count (Desc)
+            // Sort candidates by:
+            // 1. Coverage Score (Desc)
+            // 2. Name/Operator Match (Desc)
+            // 3. Candidate Count (Desc)
             candidates.sort_by(|&a, &b| {
                 let (score_a, count_a) = relation_scores[&a];
                 let (score_b, count_b) = relation_scores[&b];
+
+                // Calculate Match Score
+                let get_match_score = |r_idx: usize| -> u8 {
+                    let rel = &osm.relations[r_idx];
+                    let mut match_score = 0;
+
+                    // Name Match
+                    // Check 'ref', 'name', 'official_name', 'alt_name'
+                    let osm_names = [
+                        rel.tags.get("ref"),
+                        rel.tags.get("name"),
+                        rel.tags.get("official_name"),
+                        rel.tags.get("alt_name"),
+                    ];
+
+                    let mut name_matched = false;
+                    for osm_name_opt in osm_names {
+                        if let Some(osm_name) = osm_name_opt {
+                            let osm_val = osm_name.to_lowercase();
+                            // Check containment both ways
+                            if let Some(ref gtfs_short) = route_short_name {
+                                if osm_val.contains(gtfs_short) || gtfs_short.contains(&osm_val) {
+                                    name_matched = true;
+                                }
+                            }
+                            if let Some(ref gtfs_long) = route_long_name {
+                                if osm_val.contains(gtfs_long) || gtfs_long.contains(&osm_val) {
+                                    name_matched = true;
+                                }
+                            }
+                        }
+                        if name_matched {
+                            break;
+                        }
+                    }
+                    if name_matched {
+                        match_score += 2;
+                    }
+
+                    // Operator Match
+                    if let Some(target_op) = &agency_name {
+                        if let Some(osm_op) = rel.tags.get("operator") {
+                            if osm_op.to_lowercase().contains(target_op)
+                                || target_op.contains(&osm_op.to_lowercase())
+                            {
+                                match_score += 1;
+                            }
+                        }
+                    }
+
+                    match_score
+                };
+
+                let match_a = get_match_score(a);
+                let match_b = get_match_score(b);
 
                 // Compare scores (f64)
                 score_b
                     .partial_cmp(&score_a)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| match_b.cmp(&match_a))
                     .then_with(|| count_b.cmp(&count_a))
             });
 
@@ -297,6 +373,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                             next_node,
                             allowed_modes,
                             Some(&rel.edges),
+                            Some(&preferred_match),
                         ) {
                             for edge_idx in edges {
                                 let edge = osm.graph.edge(edge_idx);
@@ -337,9 +414,12 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                     .collect();
 
                 // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
-                if let Some(geometry) =
-                    match_sequence_globally_optimal(&limited_candidates, osm, allowed_modes)
-                {
+                if let Some(geometry) = match_sequence_globally_optimal(
+                    &limited_candidates,
+                    osm,
+                    allowed_modes,
+                    Some(&preferred_match),
+                ) {
                     // println!("  Fallback successful!");
                     full_path_geometry = geometry;
                 } else {
@@ -380,6 +460,7 @@ fn match_sequence_globally_optimal(
     stop_candidates: &[Vec<usize>],
     osm: &OsmData,
     allowed_modes: u8,
+    preferred_match: Option<&TransitMatch>,
 ) -> Option<Vec<(f64, f64)>> {
     if stop_candidates.is_empty() {
         return None;
@@ -435,6 +516,7 @@ fn match_sequence_globally_optimal(
                             curr_node,
                             allowed_modes,
                             None,
+                            preferred_match,
                         ) {
                             cost_inc = c;
                         } else {
@@ -510,9 +592,14 @@ fn match_sequence_globally_optimal(
             if curr_node == prev_node {
                 // No movement
             } else {
-                if let Some((_, edges)) =
-                    pathfinding::pathfind(&osm.graph, prev_node, curr_node, allowed_modes, None)
-                {
+                if let Some((_, edges)) = pathfinding::pathfind(
+                    &osm.graph,
+                    prev_node,
+                    curr_node,
+                    allowed_modes,
+                    None,
+                    preferred_match,
+                ) {
                     for edge_idx in edges {
                         let edge = osm.graph.edge(edge_idx);
                         for coord in edge.payload.geometry.coords().skip(1) {
@@ -548,6 +635,7 @@ fn match_sequence_globally_optimal(
 mod tests {
     use super::*;
     use crate::graph::{EdgePL, Graph, NodePL};
+    use geo::LineString;
 
     #[test]
     fn test_backtracking_dead_end() {
@@ -619,7 +707,7 @@ mod tests {
         // Stop 3: [4]
         let stop_candidates = vec![vec![n0, n2], vec![n1, n3], vec![n4]];
 
-        let result = match_sequence_globally_optimal(&stop_candidates, &osm, 255);
+        let result = match_sequence_globally_optimal(&stop_candidates, &osm, 255, None);
 
         // Should succeed by picking 2 -> 3 -> 4
         assert!(result.is_some());

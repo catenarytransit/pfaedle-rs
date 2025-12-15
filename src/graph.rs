@@ -82,6 +82,7 @@ pub struct TransitInfo {
     pub short_name: String,
     pub from_str: String,
     pub to_str: String,
+    pub operator: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +176,9 @@ impl EdgePL {
                 if !l.from_str.is_empty() || !l.to_str.is_empty() {
                     s.push_str(&format!("({}->{})", l.from_str, l.to_str));
                 }
+                if let Some(op) = &l.operator {
+                    s.push_str(&format!(" [{}]", op));
+                }
                 s
             })
             .collect::<Vec<_>>()
@@ -217,11 +221,13 @@ mod tests {
             short_name: "B".into(),
             from_str: "".into(),
             to_str: "".into(),
+            operator: None,
         };
         let t2 = TransitInfo {
             short_name: "A".into(),
             from_str: "".into(),
             to_str: "".into(),
+            operator: Some("OpA".into()),
         };
 
         e.add_line(t1.clone());

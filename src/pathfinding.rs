@@ -29,12 +29,19 @@ impl PartialOrd for State {
     }
 }
 
+pub struct TransitMatch {
+    pub short_name: Option<String>,
+    pub long_name: Option<String>,
+    pub operator: Option<String>,
+}
+
 pub fn pathfind(
     graph: &Graph<NodePL, EdgePL>,
     start: NodeIndex,
     end: NodeIndex,
     allowed_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
+    preferred_match: Option<&TransitMatch>,
 ) -> Option<(f64, Vec<usize>)> {
     if start == end {
         return Some((0.0, Vec::new()));
@@ -78,9 +85,40 @@ pub fn pathfind(
     let mut mu = f64::INFINITY;
     let mut meeting_node: Option<(NodeIndex, NodeIndex, usize)> = None; // (u, v, edge_idx)
 
-    // Helper to process neighbors
-    // We cannot easily use a closure due to borrowing mutables (open_set, g_score, came_from)
-    // So we assume the loop structure handles it.
+    // Helper cost calculator
+    let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
+        let mut cost = edge.payload.cost as f64;
+        if let Some(pm) = preferred_match {
+            for line in &edge.payload.lines {
+                let mut matches = false;
+                // Check short name
+                if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
+                    // Heuristic containment
+                    if target.contains(&line_name.to_lowercase())
+                        || line_name.to_lowercase().contains(target)
+                    {
+                        matches = true;
+                    }
+                }
+                // Check operator
+                if !matches {
+                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
+                        if target_op.contains(&line_op.to_lowercase())
+                            || line_op.to_lowercase().contains(target_op)
+                        {
+                            matches = true;
+                        }
+                    }
+                }
+
+                if matches {
+                    cost *= 0.2; // Discount for matching lines
+                    break;
+                }
+            }
+        }
+        cost
+    };
 
     while !open_fwd.is_empty() && !open_bwd.is_empty() {
         // Check termination
@@ -128,7 +166,7 @@ pub fn pathfind(
                     }
 
                     let v = if edge.from == u { edge.to } else { edge.from };
-                    let cost = edge.payload.cost as f64;
+                    let cost = get_edge_cost(edge);
                     let tentative_g = current_g + cost;
 
                     if tentative_g < *g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
@@ -177,7 +215,7 @@ pub fn pathfind(
                     }
 
                     let v = if edge.from == u { edge.to } else { edge.from };
-                    let cost = edge.payload.cost as f64;
+                    let cost = get_edge_cost(edge);
                     let tentative_g = current_g + cost;
 
                     if tentative_g < *g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
@@ -279,21 +317,21 @@ mod tests {
         graph.add_edge(n0, n1, e1);
 
         // Test Rail
-        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, None);
+        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, None, None);
         assert!(path_rail.is_some());
         let (_, edges) = path_rail.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_RAIL);
 
         // Test Bus
-        let path_bus = pathfind(&graph, n0, n1, MODE_BUS, None);
+        let path_bus = pathfind(&graph, n0, n1, MODE_BUS, None, None);
         assert!(path_bus.is_some());
         let (_, edges) = path_bus.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_BUS);
 
         // Test None
-        let path_none = pathfind(&graph, n0, n1, 0, None);
+        let path_none = pathfind(&graph, n0, n1, 0, None, None);
         assert!(path_none.is_none());
     }
 
@@ -331,7 +369,7 @@ mod tests {
         let idx_norm2 = graph.add_edge(n2, n1, e_normal2);
 
         // Pathfind
-        let result = pathfind(&graph, n0, n1, MODE_RAIL, None).expect("Should find path");
+        let result = pathfind(&graph, n0, n1, MODE_RAIL, None, None).expect("Should find path");
         let (_, path) = result;
 
         // Should choose the detour (2 edges) because total cost 2000 < 1,000,000
@@ -341,5 +379,78 @@ mod tests {
 
         // Ensure it didn't take the direct industrial route
         assert!(!path.contains(&idx_ind));
+    }
+
+    #[test]
+    fn test_pathfind_preference() {
+        let mut graph = Graph::new();
+        let n0 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.1),
+        });
+
+        use crate::graph::TransitInfo;
+
+        // Edge 0: Direct but wrong operator
+        // Cost = 12000 (approx 11km)
+        let mut e_wrong = EdgePL::new();
+        e_wrong.allowed_modes = MODE_RAIL;
+        e_wrong.cost = 12000;
+        e_wrong.add_line(TransitInfo {
+            short_name: "L1".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: Some("OtherOp".into()),
+        });
+        let idx_wrong = graph.add_edge(n0, n1, e_wrong);
+
+        // Edge 1: Detour but correct operator
+        // Cost = 7000 * 2 = 14000 (longer)
+        // With preference ("MyOp"), cost becomes 14000 * 0.2 = 2800.
+        let n2 = graph.add_node(NodePL {
+            point: Point::new(0.1, 0.05),
+        });
+
+        let mut e_right1 = EdgePL::new();
+        e_right1.allowed_modes = MODE_RAIL;
+        e_right1.cost = 7000;
+        e_right1.add_line(TransitInfo {
+            short_name: "L2".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: Some("MyOp".into()),
+        });
+        let idx_right1 = graph.add_edge(n0, n2, e_right1);
+
+        let mut e_right2 = EdgePL::new();
+        e_right2.allowed_modes = MODE_RAIL;
+        e_right2.cost = 7000;
+        e_right2.add_line(TransitInfo {
+            short_name: "L2".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: Some("MyOp".into()),
+        });
+        let idx_right2 = graph.add_edge(n2, n1, e_right2);
+
+        let match_pref = TransitMatch {
+            short_name: None,
+            long_name: None,
+            operator: Some("myop".to_string()), // Lowercase for matching
+        };
+
+        // Pathfind with preference
+        let result =
+            pathfind(&graph, n0, n1, MODE_RAIL, None, Some(&match_pref)).expect("Should find path");
+        let (_, path) = result;
+
+        // Should choose path via n2 because (55+55)*0.2 = 22 < 100
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0], idx_right1);
+        assert_eq!(path[1], idx_right2);
+
+        assert!(!path.contains(&idx_wrong));
     }
 }

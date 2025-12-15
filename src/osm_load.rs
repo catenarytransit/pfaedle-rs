@@ -242,12 +242,14 @@ impl OsmBuilder {
                 .map(|s| s.to_string())
                 .unwrap_or_default();
             let to_str = r.tags.get("to").map(|s| s.to_string()).unwrap_or_default();
+            let operator = r.tags.get("operator").map(|s| s.to_string());
 
             if !short_name.is_empty() || !from_str.is_empty() {
                 Some(TransitInfo {
                     short_name,
                     from_str,
                     to_str,
+                    operator,
                 })
             } else {
                 None
