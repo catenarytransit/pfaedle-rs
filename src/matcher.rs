@@ -102,7 +102,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             const TARGET_CANDIDATES: usize = 20;
             // For rail, we might need a much larger search radius if the track is far from the stop coordinate
             // We want to cover up to ~300m. In dense index, 400 nodes might be small. Let's bump to 2000 to be safe.
-            const SEARCH_RADIUS_NODES_RAIL: usize = 2000;
+            const SEARCH_RADIUS_NODES_RAIL: usize = 4000;
 
             for point in &stop_coords {
                 let search_limit = if pattern.route_type == Some(RouteType::Rail) {
@@ -120,6 +120,9 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                     .take(search_limit);
 
                 let mut candidates: Vec<usize> = Vec::new();
+                let mut matched_candidates: Vec<usize> = Vec::new();
+                let mut other_candidates: Vec<usize> = Vec::new();
+
                 let mut seen_ways: AHashSet<i64> = AHashSet::new();
                 let mut fallback_candidates: Vec<usize> = Vec::new();
 
@@ -135,7 +138,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                         let dist = node_pl
                             .point
                             .haversine_distance(&Point::new(point.x(), point.y()));
-                        if dist > 300.0 {
+                        if dist > 500.0 {
                             // Too far, stop searching
                             break;
                         }
@@ -249,14 +252,16 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
 
                     if node_matches {
                         // High priority!
-                        candidates.push(node_idx);
+                        matched_candidates.push(node_idx);
                         // Also prevent using ways again? Or allow multiples if matched?
                         // Let's mark ways as seen so we don't spam the same way.
                         for w in node_ways {
                             seen_ways.insert(w);
                         }
                     } else if is_new_way {
-                        candidates.push(node_idx);
+                        if other_candidates.len() < TARGET_CANDIDATES {
+                            other_candidates.push(node_idx);
+                        }
                         for w in node_ways {
                             seen_ways.insert(w);
                         }
@@ -267,9 +272,17 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                         }
                     }
 
-                    if candidates.len() >= TARGET_CANDIDATES {
+                    if matched_candidates.len() >= TARGET_CANDIDATES {
                         break;
                     }
+                }
+
+                // Decision: If we found ANY matches, we use ONLY matches.
+                // This prevents "Great Eastern Main Line" from polluting "Elizabeth Line" results if Elizabeth Line exists.
+                if !matched_candidates.is_empty() {
+                    candidates = matched_candidates;
+                } else {
+                    candidates = other_candidates;
                 }
 
                 // If we didn't find enough unique-way candidates, fill up with fallbacks
