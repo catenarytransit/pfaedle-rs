@@ -60,6 +60,7 @@ impl OsmBuilder {
         path: &Path,
         used_route_types: &AHashSet<RouteType>,
         bbox: Option<(f64, f64, f64, f64)>, // min_lon, min_lat, max_lon, max_lat
+        skip_small_roads: bool,
     ) -> Result<OsmData> {
         println!("Reading OSM file {:?} in multiple passes...", path);
 
@@ -137,6 +138,17 @@ impl OsmBuilder {
                     let is_platform = Self::is_platform(&w);
                     // Pass 2: We only care about relation members if they are valid geometry (not platforms)
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
+
+                    if skip_small_roads && is_infra && !is_rel_member {
+                        let highway = w.tags.get("highway").map(|s| s.as_str());
+                        let service = w.tags.get("service").map(|s| s.as_str());
+                        if highway == Some("residential")
+                            || highway == Some("service")
+                            || service == Some("driveway")
+                        {
+                            continue;
+                        }
+                    }
 
                     if is_infra || is_rel_member {
                         if !Self::is_valid_way(&w) {
@@ -989,6 +1001,7 @@ pub fn load_osm(
     path: &Path,
     used_route_types: &AHashSet<RouteType>,
     bbox: Option<(f64, f64, f64, f64)>,
+    skip_small_roads: bool,
 ) -> Result<OsmData> {
-    OsmBuilder::read(path, used_route_types, bbox)
+    OsmBuilder::read(path, used_route_types, bbox, skip_small_roads)
 }

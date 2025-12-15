@@ -31,6 +31,10 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     wipe_shapes: bool,
 
+    /// Skip importing residential/service roads if they are not part of a route relation
+    #[arg(long, default_value_t = false)]
+    skip_small_roads: bool,
+
     /// MOTs to calculate shapes for, comma sep.
     #[arg(short, long, default_value = "all")]
     mots: String,
@@ -129,7 +133,12 @@ fn main() -> Result<()> {
         Some(final_bbox)
     };
 
-    let osm_data = osm_load::load_osm(&args.osm_file, &gtfs_data.used_route_types, bbox)?;
+    let osm_data = osm_load::load_osm(
+        &args.osm_file,
+        &gtfs_data.used_route_types,
+        bbox,
+        args.skip_small_roads,
+    )?;
 
     // 3. Match
     let results = matcher::match_patterns(&gtfs_data, &osm_data);
