@@ -33,6 +33,31 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 println!("Processed {}/{}", current_processed, total_patterns);
             }
 
+            // 0. Extract Route/Agency Info for Matching
+            let sample_trip_id = &gtfs.patterns.get(pattern).unwrap()[0];
+            let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
+            let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
+
+            // Find agency
+            let agency_name = if let Some(agency_id) = &route.agency_id {
+                gtfs.gtfs
+                    .agencies
+                    .iter()
+                    .find(|a| a.id.as_ref() == Some(agency_id))
+                    .map(|a| a.name.to_lowercase())
+            } else {
+                None
+            };
+
+            let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
+            let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
+
+            let preferred_match = TransitMatch {
+                short_name: route_short_name.clone(),
+                long_name: route_long_name.clone(),
+                operator: agency_name.clone(),
+            };
+
             // 1. Get Stop Coordinates
             let mut stop_coords = Vec::new();
             for stop_id in &pattern.stop_ids {
@@ -76,7 +101,8 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             const SEARCH_RADIUS_NODES: usize = 100;
             const TARGET_CANDIDATES: usize = 20;
             // For rail, we might need a much larger search radius if the track is far from the stop coordinate
-            const SEARCH_RADIUS_NODES_RAIL: usize = 400; // Look further for rail
+            // We want to cover up to ~300m. In dense index, 400 nodes might be small. Let's bump to 2000 to be safe.
+            const SEARCH_RADIUS_NODES_RAIL: usize = 2000;
 
             for point in &stop_coords {
                 let search_limit = if pattern.route_type == Some(RouteType::Rail) {
@@ -118,6 +144,97 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                     let node_idx = sn.index;
                     let node = osm.graph.node(node_idx);
 
+                    // Check if this node matches our route!
+                    // Check Edges
+                    let mut node_matches = false;
+                    for &edge_idx in &node.edges {
+                        let edge = osm.graph.edge(edge_idx);
+                        // Check lines
+                        for line in &edge.payload.lines {
+                            let mut line_matches = false;
+                            // Check short name
+                            if let (Some(target), Some(line_name)) =
+                                (&preferred_match.short_name, Some(&line.short_name))
+                            {
+                                if target.contains(&line_name.to_lowercase())
+                                    || line_name.to_lowercase().contains(target)
+                                {
+                                    line_matches = true;
+                                }
+                            }
+
+                            // Check operator
+                            if !line_matches {
+                                if let (Some(target_op), Some(line_op)) =
+                                    (&preferred_match.operator, &line.operator)
+                                {
+                                    if target_op.contains(&line_op.to_lowercase())
+                                        || line_op.to_lowercase().contains(target_op)
+                                    {
+                                        line_matches = true;
+                                    }
+                                }
+                            }
+                            if line_matches {
+                                node_matches = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Check Relations
+                    if !node_matches {
+                        if let Some(rels) = osm.node_to_relations.get(&node_idx) {
+                            for &r_idx in rels {
+                                let rel = &osm.relations[r_idx];
+                                let osm_names = [
+                                    rel.tags.get("ref"),
+                                    rel.tags.get("name"),
+                                    rel.tags.get("official_name"),
+                                    rel.tags.get("alt_name"),
+                                ];
+                                let mut name_matched = false;
+                                for osm_name_opt in osm_names {
+                                    if let Some(osm_name) = osm_name_opt {
+                                        let osm_val = osm_name.to_lowercase();
+                                        if let Some(ref gtfs_short) = preferred_match.short_name {
+                                            if osm_val.contains(gtfs_short)
+                                                || gtfs_short.contains(&osm_val)
+                                            {
+                                                name_matched = true;
+                                            }
+                                        }
+                                        if let Some(ref gtfs_long) = preferred_match.long_name {
+                                            if osm_val.contains(gtfs_long)
+                                                || gtfs_long.contains(&osm_val)
+                                            {
+                                                name_matched = true;
+                                            }
+                                        }
+                                    }
+                                    if name_matched {
+                                        break;
+                                    }
+                                }
+                                if name_matched {
+                                    node_matches = true;
+                                    break;
+                                }
+                                // Operator check
+                                if let (Some(target_op), Some(osm_op)) =
+                                    (&preferred_match.operator, rel.tags.get("operator"))
+                                {
+                                    if target_op.contains(&osm_op.to_lowercase())
+                                        || osm_op.to_lowercase().contains(target_op)
+                                    {
+                                        node_matches = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Identify ways this node belongs to
                     let mut node_ways = Vec::new();
                     for &edge_idx in &node.edges {
@@ -130,7 +247,15 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                     // Check if this node introduces a new way
                     let is_new_way = node_ways.iter().any(|w| !seen_ways.contains(w));
 
-                    if is_new_way {
+                    if node_matches {
+                        // High priority!
+                        candidates.push(node_idx);
+                        // Also prevent using ways again? Or allow multiples if matched?
+                        // Let's mark ways as seen so we don't spam the same way.
+                        for w in node_ways {
+                            seen_ways.insert(w);
+                        }
+                    } else if is_new_way {
                         candidates.push(node_idx);
                         for w in node_ways {
                             seen_ways.insert(w);
@@ -182,33 +307,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             let mut full_path_geometry = Vec::new();
             let mut relation_found = false;
 
-            // Get GTFS Route/Agency Info for Matching
-            let sample_trip_id = &gtfs.patterns.get(pattern).unwrap()[0];
-            let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
-            let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
-
-            // Find agency (Agencies are in a Vec in gtfs_structures usually)
-            // route.agency_id is Option<String>
-            let agency_name = if let Some(agency_id) = &route.agency_id {
-                gtfs.gtfs
-                    .agencies
-                    .iter()
-                    .find(|a| a.id.as_ref() == Some(agency_id))
-                    .map(|a| a.name.to_lowercase())
-            } else {
-                // If no agency_id in route, maybe try the first agency if only one?
-                // Or just None.
-                None
-            };
-
-            let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
-            let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
-
-            let preferred_match = TransitMatch {
-                short_name: route_short_name.clone(),
-                long_name: route_long_name.clone(),
-                operator: agency_name.clone(),
-            };
+            // GTFS Info hoisted above
 
             // Relation Candidate logic
             // Vote for relations based on ALL candidates
