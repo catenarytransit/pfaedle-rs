@@ -44,7 +44,7 @@ struct Args {
     low_priority: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ShapeRecord {
     shape_id: String,
     shape_pt_lat: f64,
@@ -66,13 +66,6 @@ fn main() -> Result<()> {
 
     let out_dir = args.out_dir.as_ref().unwrap_or(&args.gtfs_dir);
     let shapes_path = out_dir.join("shapes.txt");
-
-    if args.wipe_shapes {
-        if shapes_path.exists() {
-            println!("Wiping existing shapes.txt at {:?}", shapes_path);
-            std::fs::remove_file(&shapes_path)?;
-        }
-    }
 
     // 0. Parse MOTS
     let allowed_mots = mots::get_categories_from_string(&args.mots)
@@ -142,9 +135,124 @@ fn main() -> Result<()> {
     let results = matcher::match_patterns(&gtfs_data, &osm_data);
 
     // 4. Write shapes.txt
-    println!("Writing shapes.txt to {:?}", shapes_path);
+    // If wipe_shapes is set, we need to carefully remove only shapes for the current MOTs
+    // and keep the rest.
+    // If wipe_shapes is FALSE, we might be appending duplicates? Or maybe we should overwrite
+    // anyway? The original logic was: args.wipe_shapes -> delete file. Else -> append?
+    // Actually, csv::Writer::from_path truncates by default unless we set append(true).
+    // So logic was: if wipe_shapes -> delete file, then from_path (truncate/create) -> new file.
+    // if !wipe_shapes -> from_path (truncate/create) -> overwrites unless we used OpenOptions.
+    // Wait, `csv::Writer::from_path` ALWAYS truncates.
+    // So previously, if `shapes.txt` existed and `wipe_shapes` was FALSE, it would effectively be wiped anyway?
+    // Let's check std::fs::remove_file usage.
+    // Ah, if `wipe_shapes` was false, lines 70-75 skipped.
+    // Line 136: `csv::Writer::from_path(&shapes_path)?`
+    // documentation says: "If the file already exists, it is overwritten."
+    // So previously, it ALWAYS wiped shapes.txt, practically speaking.
+    // The `wipe_shapes` arg was redundant or maybe intent was different?
+    // Or maybe the user meant "if I don't say wipe, don't run pfaedle?" No.
+    //
+    // New logic:
+    // If wipe_shapes:
+    //   Read existing shapes.txt.
+    //   Identify shape_ids to REMOVE. These are shape_ids used by trips of the selected MOTs.
+    //   Filter existing records: Keep if shape_id NOT in remove_set.
+    //   Write kept records + new results.
+    // If !wipe_shapes:
+    //   Presumably we just want to run for these MOTs. The user expectation "only wipe shapes for that specific mot"
+    //   implies we KEEP others.
+    //   So regardless of `wipe_shapes` flag (or maybe ONLY if it is set?), we want preservation behavior.
+    //   Let's assume the user WANTS to update the shapes for the selected MOTs.
+    //   So we ALWAYS need to "wipe" the old shapes for the selected MOTs (replace them) and keep others.
+    //   "if MOTS is selected (and is not all), only wipe shapes for that specific mot route type."
+    //   This implies: Read all, remove partial, add new.
+
+    println!("Updating shapes.txt at {:?}", shapes_path);
+
+    let mut existing_shapes = Vec::new();
+
+    if shapes_path.exists() {
+        println!("Reading existing shapes...");
+        let mut rdr = csv::Reader::from_path(&shapes_path)?;
+        for result in rdr.deserialize() {
+            let record: ShapeRecord = result?;
+            existing_shapes.push(record);
+        }
+    }
+
+    // Determine which shape_ids belong to the *current* selection of MOTs (the ones we are processing).
+    // We want to REPLACE these.
+    // We also want to KEEP shape_ids that belong to OTHER MOTs.
+    //
+    // Issue: How do we know which shape_id belongs to which MOT in the OLD file?
+    // We don't have that info in shapes.txt.
+    // We can infer it from the *current* GTFS.
+    //
+    // Strategy:
+    // 1. Identify all shape_ids used by trips in the GTFS that match `allowed_mots`.
+    //    These are the "Target Shape IDs".
+    // 2. Filter existing_shapes:
+    //    If a shape's ID is in "Target Shape IDs", DROP IT (we are about to regenerate it).
+    //    Else, KEEP IT.
+    // 3. Append new results.
+
+    let mut shapes_to_replace = ahash::AHashSet::new();
+    if args.mots != "all" {
+        // If specific MOTs selected, we only want to replace shapes for trips of those MOTs.
+        for (trip_id, trip) in &gtfs_data.gtfs.trips {
+            let route = gtfs_data.gtfs.routes.get(&trip.route_id);
+            if let Some(r) = route {
+                let cat = mots::map_route_type_to_category(r.route_type);
+                if allowed_mots.contains(&cat) {
+                    if let Some(sid) = &trip.shape_id {
+                        shapes_to_replace.insert(sid.clone());
+                    }
+                }
+            }
+        }
+        println!(
+            "Identified {} shape_ids to replace based on selected MOTs.",
+            shapes_to_replace.len()
+        );
+
+        // Also add the shape_ids that we just generated matching patterns for?
+        // Actually, `results` contains the NEW shape_ids.
+        // We want to remove OLD entries that *conflict* or are *obsolete* versions.
+        // If we found a match, we generate a NEW shape_id usually (unless we reuse IDs?).
+        // Pfaedle generates IDs like "shp_2_123...".
+        // The old file might have "shp_2_..."
+        // Safe bet: remove any shape_id that is referenced by the trips we are currently processing.
+    } else {
+        // If MOTs is "all", and we are wiping (or just running?), we probably want to replace EVERYTHING?
+        // "if MOTS is selected (and is not all), only wipe shapes for that specific mot route type."
+        // Implies if MOTS == all, we wipe everything (default behavior).
+        if args.wipe_shapes {
+            println!("MOTs='all' and wipe_shapes=true. Wiping all existing shapes.");
+            existing_shapes.clear();
+        }
+    }
+
+    // Filter existing
+    if !shapes_to_replace.is_empty() {
+        let before_count = existing_shapes.len();
+        existing_shapes.retain(|s| !shapes_to_replace.contains(&s.shape_id));
+        let after_count = existing_shapes.len();
+        println!(
+            "Pruned {} existing shape points (kept {}).",
+            before_count - after_count,
+            after_count
+        );
+    }
+
+    // Write everything back
     let mut wtr = csv::Writer::from_path(&shapes_path)?;
 
+    // 1. Write kept existing shapes
+    for shape in existing_shapes {
+        wtr.serialize(shape)?;
+    }
+
+    // 2. Write new shapes
     for shape_res in results.values() {
         for (i, (lat, lon)) in shape_res.points.iter().enumerate() {
             wtr.serialize(ShapeRecord {
