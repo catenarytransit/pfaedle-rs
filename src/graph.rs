@@ -9,6 +9,7 @@ pub const MODE_TRAM: u8 = 2;
 pub const MODE_SUBWAY: u8 = 4;
 pub const MODE_BUS: u8 = 8;
 pub const MODE_FERRY: u8 = 16;
+pub const MODE_GONDOLA: u8 = 32;
 
 #[derive(Debug, Clone)]
 pub struct Node<N> {

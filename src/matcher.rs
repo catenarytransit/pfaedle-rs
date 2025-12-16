@@ -3,7 +3,7 @@ use geo::Point;
 use geo::algorithm::HaversineDistance;
 use gtfs_structures::RouteType;
 
-use crate::graph::{MODE_BUS, MODE_FERRY, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
+use crate::graph::{MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
 use crate::gtfs_load::{GtfsData, StopPattern};
 use crate::osm_load::OsmData;
 use crate::pathfinding::{self, TransitMatch};
@@ -77,7 +77,10 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
                 Some(RouteType::Subway) => MODE_SUBWAY,
                 Some(RouteType::Rail) => MODE_RAIL,
-                Some(RouteType::Ferry) | Some(RouteType::Gondola) => MODE_FERRY,
+                Some(RouteType::Ferry) => MODE_FERRY,
+                Some(RouteType::Gondola)
+                | Some(RouteType::Funicular)
+                | Some(RouteType::CableCar) => MODE_GONDOLA,
                 _ => MODE_BUS,
             };
 
@@ -87,7 +90,10 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 Some(RouteType::Tramway) => osm.tram_tree.as_ref().or(osm.bus_tree.as_ref()),
                 Some(RouteType::Subway) => osm.metro_tree.as_ref(),
                 Some(RouteType::Rail) => osm.rail_tree.as_ref(),
-                Some(RouteType::Ferry) | Some(RouteType::Gondola) => osm.ferry_tree.as_ref(),
+                Some(RouteType::Ferry) => osm.ferry_tree.as_ref(),
+                Some(RouteType::Gondola)
+                | Some(RouteType::Funicular)
+                | Some(RouteType::CableCar) => osm.gondola_tree.as_ref(),
                 _ => osm.bus_tree.as_ref(), // Bus, Ferry, etc uses road network
             };
 
@@ -812,6 +818,7 @@ mod tests {
             metro_tree: None,
             bus_tree: None,
             ferry_tree: None,
+            gondola_tree: None,
             relations: Vec::new(),
             node_to_relations: AHashMap::new(),
         };
