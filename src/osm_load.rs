@@ -7,8 +7,8 @@ use rstar::RTree;
 use std::path::Path;
 
 use crate::graph::{
-    EdgeIndex, EdgePL, Graph, MODE_BUS, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodeIndex, NodePL,
-    TransitInfo,
+    EdgeIndex, EdgePL, Graph, MODE_BUS, MODE_FERRY, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodeIndex,
+    NodePL, TransitInfo,
 };
 use gtfs_structures::RouteType;
 
@@ -49,6 +49,7 @@ pub struct OsmData {
     pub tram_tree: Option<RTree<SpatialNode>>,
     pub metro_tree: Option<RTree<SpatialNode>>,
     pub bus_tree: Option<RTree<SpatialNode>>,
+    pub ferry_tree: Option<RTree<SpatialNode>>,
     pub relations: Vec<OsmRelation>,
     pub node_to_relations: AHashMap<NodeIndex, Vec<usize>>,
 }
@@ -76,6 +77,8 @@ impl OsmBuilder {
 
         // Set of Way IDs that are members of any interesting relation.
         let mut ways_in_relations: AHashSet<i64> = AHashSet::new();
+        // Set of Way IDs that are strictly members of ferry relations.
+        let mut ways_in_ferry_relations: AHashSet<i64> = AHashSet::new();
 
         // Set of Node IDs that are required for the graph.
         let mut needed_nodes: AHashSet<i64> = AHashSet::new();
@@ -98,6 +101,10 @@ impl OsmBuilder {
                         for member in &r.refs {
                             if let OsmId::Way(wid) = member.member {
                                 ways_in_relations.insert(wid.0);
+                                // Check if this is a ferry relation
+                                if r.tags.get("route").map_or(false, |s| s == "ferry") {
+                                    ways_in_ferry_relations.insert(wid.0);
+                                }
                             } else if let OsmId::Node(nid) = member.member {
                                 needed_nodes.insert(nid.0); // Direct node members
                             } else if let OsmId::Relation(_rid) = member.member {
@@ -134,7 +141,8 @@ impl OsmBuilder {
                 let obj = obj.context("Error reading PBF object in Pass 2")?;
                 if let OsmObj::Way(w) = obj {
                     let wid = w.id.0;
-                    let is_infra = Self::is_infrastructure(&w);
+                    let is_infra =
+                        Self::is_infrastructure(&w) || ways_in_ferry_relations.contains(&wid);
                     let is_platform = Self::is_platform(&w);
                     // Pass 2: We only care about relation members if they are valid geometry (not platforms)
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
@@ -181,6 +189,7 @@ impl OsmBuilder {
         let mut tram_node_indices: AHashSet<NodeIndex> = AHashSet::new();
         let mut metro_node_indices: AHashSet<NodeIndex> = AHashSet::new();
         let mut bus_node_indices: AHashSet<NodeIndex> = AHashSet::new();
+        let mut ferry_node_indices: AHashSet<NodeIndex> = AHashSet::new();
         let mut stop_node_indices: AHashSet<NodeIndex> = AHashSet::new();
 
         {
@@ -294,7 +303,8 @@ impl OsmBuilder {
                     let is_platform = Self::is_platform(&w);
                     // Filter platforms from relations here too
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
-                    let is_infra = Self::is_infrastructure(&w);
+                    let is_infra =
+                        Self::is_infrastructure(&w) || ways_in_ferry_relations.contains(&wid);
 
                     if !is_infra && !is_rel_member {
                         continue;
@@ -312,7 +322,8 @@ impl OsmBuilder {
                     }
 
                     // Helper to track node types
-                    let (is_rail, is_tram, is_metro, is_bus) = Self::classify_way(&w);
+                    let (is_rail, is_tram, is_metro, is_bus, is_ferry) =
+                        Self::classify_way(&w, &ways_in_ferry_relations);
 
                     if !way_indices.is_empty() {
                         // categorize nodes for indices
@@ -328,6 +339,9 @@ impl OsmBuilder {
                             }
                             if is_bus {
                                 bus_node_indices.insert(idx);
+                            }
+                            if is_ferry {
+                                ferry_node_indices.insert(idx);
                             }
                         }
                     }
@@ -370,6 +384,9 @@ impl OsmBuilder {
                             }
                             if is_bus {
                                 modes |= MODE_BUS;
+                            }
+                            if is_ferry {
+                                modes |= MODE_FERRY;
                             }
                             edge_pl.allowed_modes = modes;
                             edge_pl.osmid = wid;
@@ -523,8 +540,14 @@ impl OsmBuilder {
         let needs_metro = used_route_types.contains(&RouteType::Subway);
         let needs_bus = used_route_types.iter().any(|r| {
             *r == RouteType::Bus
-                || (*r != RouteType::Rail && *r != RouteType::Tramway && *r != RouteType::Subway)
+                || (*r != RouteType::Rail
+                    && *r != RouteType::Tramway
+                    && *r != RouteType::Subway
+                    && *r != RouteType::Ferry
+                    && *r != RouteType::Gondola) // Gondola mapped to Ferry often, or just ignore? User said Ferry=6
         });
+        let needs_ferry = used_route_types.contains(&RouteType::Ferry)
+            || used_route_types.contains(&RouteType::Gondola); // Map 6 to Ferry per user hint
 
         let rail_tree = if needs_rail {
             build_tree(rail_node_indices, "Rail")
@@ -546,6 +569,11 @@ impl OsmBuilder {
         } else {
             None
         };
+        let ferry_tree = if needs_ferry {
+            build_tree(ferry_node_indices, "Ferry")
+        } else {
+            None
+        };
 
         println!(
             "Graph built: {} nodes, {} edges. Relations: {}",
@@ -560,6 +588,7 @@ impl OsmBuilder {
             tram_tree,
             metro_tree,
             bus_tree,
+            ferry_tree,
             relations: relations_list,
             node_to_relations: final_node_to_rels,
         })
@@ -665,9 +694,13 @@ impl OsmBuilder {
         false
     }
 
-    fn classify_way(w: &osmpbfreader::Way) -> (bool, bool, bool, bool) {
+    fn classify_way(
+        w: &osmpbfreader::Way,
+        ferry_ways: &AHashSet<i64>,
+    ) -> (bool, bool, bool, bool, bool) {
         let railway = w.tags.get("railway").map(|s| s.as_str());
         let highway = w.tags.get("highway").map(|s| s.as_str());
+        let route = w.tags.get("route").map(|s| s.as_str());
 
         let is_rail = railway.map_or(false, |r| {
             r == "rail" || r == "light_rail" || r == "narrow_gauge"
@@ -675,7 +708,12 @@ impl OsmBuilder {
         let is_tram = railway.map_or(false, |r| r == "tram");
         let is_metro = railway.map_or(false, |r| r == "subway");
 
-        let is_bus = if let Some(h) = highway {
+        // Ferry detection
+        let is_ferry = route == Some("ferry") || ferry_ways.contains(&w.id.0);
+
+        let is_bus = if is_ferry {
+            false
+        } else if let Some(h) = highway {
             match h {
                 "pedestrian" | "footway" | "steps" | "corridor" | "cycleway" | "path" | "track" => {
                     false
@@ -686,7 +724,7 @@ impl OsmBuilder {
             false
         };
 
-        (is_rail, is_tram, is_metro, is_bus)
+        (is_rail, is_tram, is_metro, is_bus, is_ferry)
     }
 
     fn parse_level(tags: &Tags) -> i32 {
@@ -746,6 +784,8 @@ impl OsmBuilder {
                 "subway" => 80.0 / 3.6,
                 _ => 50.0 / 3.6,
             }
+        } else if let Some(r) = tags.get("route") {
+            if r == "ferry" { 15.0 / 3.6 } else { 10.0 }
         } else {
             10.0 // Slow
         }
