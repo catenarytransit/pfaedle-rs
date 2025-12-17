@@ -39,8 +39,8 @@ impl rstar::RTreeObject for SpatialNode {
 pub struct OsmRelation {
     pub id: i64,
     pub tags: Tags,
-    pub nodes: Vec<NodeIndex>,      // All nodes in the relation
-    pub edges: AHashSet<EdgeIndex>, // All edges in the relation
+    pub nodes: Vec<NodeIndex>,
+    pub edges: AHashSet<EdgeIndex>,
 }
 
 pub struct OsmData {
@@ -57,6 +57,12 @@ pub struct OsmData {
 
 pub struct OsmBuilder;
 
+struct PreRelation {
+    id: i64,
+    tags: Tags,
+    members: Vec<osmpbfreader::Ref>,
+}
+
 impl OsmBuilder {
     pub fn read(
         path: &Path,
@@ -66,27 +72,14 @@ impl OsmBuilder {
     ) -> Result<OsmData> {
         println!("Reading OSM file {:?} in multiple passes...", path);
 
-        // --- Data Structures to persist across passes ---
-
-        // Relation metadata found in Pass 1
-        struct PreRelation {
-            id: i64,
-            tags: Tags,
-            members: Vec<osmpbfreader::Ref>,
-        }
         let mut pre_relations: Vec<PreRelation> = Vec::new();
-
-        // Set of Way IDs that are members of any interesting relation.
         let mut ways_in_relations: AHashSet<i64> = AHashSet::new();
-        // Set of Way IDs that are strictly members of ferry relations.
         let mut ways_in_ferry_relations: AHashSet<i64> = AHashSet::new();
-
-        // Set of Node IDs that are required for the graph.
         let mut needed_nodes: AHashSet<i64> = AHashSet::new();
 
         // ------------------------------------------------
         // PASS 1: Relations
-        // Goal: Identify interesting relations (Routes), store them, and identify which Ways they need.
+        // Identify interesting relations (Routes) and track which Ways they utilize.
         // ------------------------------------------------
         println!("Pass 1/4: Scanning relations...");
         {
@@ -94,25 +87,25 @@ impl OsmBuilder {
             for obj in pbf.iter() {
                 let obj = obj.context("Error reading PBF object in Pass 1")?;
                 if let OsmObj::Relation(r) = obj {
-                    // Check if relation is interesting
                     let is_route =
                         r.tags.contains_key("route") || r.tags.contains_key("public_transport");
+
                     if is_route {
-                        // Store relevant info
                         for member in &r.refs {
-                            if let OsmId::Way(wid) = member.member {
-                                ways_in_relations.insert(wid.0);
-                                // Check if this is a ferry relation
-                                if r.tags.get("route").map_or(false, |s| s == "ferry") {
-                                    ways_in_ferry_relations.insert(wid.0);
+                            match member.member {
+                                OsmId::Way(wid) => {
+                                    ways_in_relations.insert(wid.0);
+                                    if r.tags.get("route").map_or(false, |s| s == "ferry") {
+                                        ways_in_ferry_relations.insert(wid.0);
+                                    }
                                 }
-                            } else if let OsmId::Node(nid) = member.member {
-                                needed_nodes.insert(nid.0); // Direct node members
-                            } else if let OsmId::Relation(_rid) = member.member {
-                                // Relation member - we will handle flattening later,
-                                // but we don't need to add ID to 'needed' sets here,
-                                // because we already iterate ALL relations.
-                                // However, we must ensure we KEEP this member in the PreRelation.
+                                OsmId::Node(nid) => {
+                                    needed_nodes.insert(nid.0);
+                                }
+                                OsmId::Relation(_rid) => {
+                                    // Relation members are flattened later, but we must
+                                    // ensure this member is preserved in the PreRelation.
+                                }
                             }
                         }
 
@@ -133,7 +126,7 @@ impl OsmBuilder {
 
         // ------------------------------------------------
         // PASS 2: Ways (Discovery)
-        // Goal: For every 'infrastructure' way OR 'relation-member' way, mark its nodes as needed.
+        // Mark nodes as 'needed' if they belong to infrastructure ways or relation-member ways.
         // ------------------------------------------------
         println!("Pass 2/4: Scanning ways to identify needed nodes...");
         {
@@ -145,7 +138,8 @@ impl OsmBuilder {
                     let is_infra =
                         Self::is_infrastructure(&w) || ways_in_ferry_relations.contains(&wid);
                     let is_platform = Self::is_platform(&w);
-                    // Pass 2: We only care about relation members if they are valid geometry (not platforms)
+
+                    // We only care about relation members if they represent valid geometry, not platforms.
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
 
                     if skip_small_roads && is_infra && !is_rel_member {
@@ -164,7 +158,6 @@ impl OsmBuilder {
                             continue;
                         }
 
-                        // Mark all nodes as needed
                         for nid in &w.nodes {
                             needed_nodes.insert(nid.0);
                         }
@@ -179,13 +172,13 @@ impl OsmBuilder {
 
         // ------------------------------------------------
         // PASS 3: Nodes
-        // Goal: Load only the 'needed_nodes' into the Graph and build the ID map.
+        // Load only the 'needed_nodes' into the Graph.
         // ------------------------------------------------
         println!("Pass 3/4: Loading nodes...");
         let mut graph = Graph::new();
-        // Map from OSM Node ID -> Graph NodeIndex
         let mut osm_node_to_graph_idx: AHashMap<i64, NodeIndex> = AHashMap::new();
 
+        // Sets for RTree generation
         let mut rail_node_indices: AHashSet<NodeIndex> = AHashSet::new();
         let mut tram_node_indices: AHashSet<NodeIndex> = AHashSet::new();
         let mut metro_node_indices: AHashSet<NodeIndex> = AHashSet::new();
@@ -204,7 +197,6 @@ impl OsmBuilder {
                         let lat = n.lat();
                         let lon = n.lon();
 
-                        // Filter by Bounding Box if present
                         if let Some((min_lon, min_lat, max_lon, max_lat)) = bbox {
                             if lon < min_lon || lon > max_lon || lat < min_lat || lat > max_lat {
                                 continue;
@@ -232,7 +224,6 @@ impl OsmBuilder {
                 }
             }
         }
-        // clear needed_nodes to free memory
         needed_nodes.clear();
         needed_nodes.shrink_to_fit();
 
@@ -240,18 +231,15 @@ impl OsmBuilder {
 
         // ------------------------------------------------
         // PASS 4: Edges & Finalizing
-        // Goal: Re-scan Ways. Build edges for infrastructure ways.
-        //       Cache node-lists for relation ways to rebuild relation geometries.
+        // Re-scan Ways to build edges and cache node-lists for relation reconstruction.
         // ------------------------------------------------
         println!("Pass 4/4: Building edges and relations...");
 
-        // Cache for ways used in relations: WayID -> Vec<GraphNodeIndex>
         let mut way_id_to_node_indices: AHashMap<i64, Vec<NodeIndex>> = AHashMap::new();
         let mut way_to_edge_indices: AHashMap<i64, Vec<EdgeIndex>> = AHashMap::new();
-
-        // 4a. Build Way -> TransitInfo lookup
         let mut way_transit_info: AHashMap<i64, Vec<TransitInfo>> = AHashMap::new();
 
+        // 4a. Build Way -> TransitInfo lookup
         let get_transit_info = |r: &PreRelation| -> Option<TransitInfo> {
             let short_name = r
                 .tags
@@ -303,7 +291,6 @@ impl OsmBuilder {
                 if let OsmObj::Way(w) = obj {
                     let wid = w.id.0;
                     let is_platform = Self::is_platform(&w);
-                    // Filter platforms from relations here too
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
                     let is_infra =
                         Self::is_infrastructure(&w) || ways_in_ferry_relations.contains(&wid);
@@ -315,7 +302,6 @@ impl OsmBuilder {
                         continue;
                     }
 
-                    // Resolve Nodes
                     let mut way_indices = Vec::with_capacity(w.nodes.len());
                     for nid in &w.nodes {
                         if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
@@ -323,12 +309,10 @@ impl OsmBuilder {
                         }
                     }
 
-                    // Helper to track node types
                     let (is_rail, is_tram, is_metro, is_bus, is_ferry, is_gondola) =
                         Self::classify_way(&w, &ways_in_ferry_relations);
 
                     if !way_indices.is_empty() {
-                        // categorize nodes for indices
                         for &idx in &way_indices {
                             if is_rail {
                                 rail_node_indices.insert(idx);
@@ -351,15 +335,14 @@ impl OsmBuilder {
                         }
                     }
 
-                    // Store for Relation Reconstruction if needed
                     if is_rel_member && !way_indices.is_empty() {
                         way_id_to_node_indices.insert(wid, way_indices.clone());
                     }
 
-                    // Build Edges
-                    // Only if infrastructure
+                    // Build Edges only for infrastructure
                     if is_infra && way_indices.len() > 1 {
-                        let transit_lines = way_transit_info.get(&wid).cloned().unwrap_or_default();
+                        let transit_lines =
+                            way_transit_info.get(&wid).cloned().unwrap_or_default();
                         let mut created_edges = Vec::new();
 
                         for i in 0..way_indices.len() - 1 {
@@ -424,83 +407,12 @@ impl OsmBuilder {
                 continue;
             }
 
-            // 5. Recursive Flattening of Relations
-            // Map created outside loop.
-
-            // Helper for recursion with cycle detection
-            fn flatten_relation(
-                r_id: i64,
-                pre_rel_map: &AHashMap<i64, &PreRelation>,
-                osm_node_to_graph_idx: &AHashMap<i64, NodeIndex>,
-                way_id_to_node_indices: &AHashMap<i64, Vec<NodeIndex>>,
-                way_to_edge_indices: &AHashMap<i64, Vec<EdgeIndex>>,
-                stop_node_indices: &AHashSet<NodeIndex>,
-                visited: &mut AHashSet<i64>,
-                out_nodes: &mut Vec<NodeIndex>,
-                out_edges: &mut AHashSet<EdgeIndex>,
-                out_final_node_to_rels: &mut AHashMap<NodeIndex, Vec<usize>>,
-                current_rel_idx: usize,
-            ) {
-                if !visited.insert(r_id) {
-                    return; // Cycle detected or already processed
-                }
-
-                if let Some(r_pre) = pre_rel_map.get(&r_id) {
-                    for member in &r_pre.members {
-                        match member.member {
-                            OsmId::Node(nid) => {
-                                if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
-                                    if !stop_node_indices.contains(&idx) {
-                                        out_nodes.push(idx);
-                                        out_final_node_to_rels
-                                            .entry(idx)
-                                            .or_default()
-                                            .push(current_rel_idx);
-                                    }
-                                }
-                            }
-                            OsmId::Way(wid) => {
-                                if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
-                                    for &idx in nodes {
-                                        out_nodes.push(idx);
-                                        out_final_node_to_rels
-                                            .entry(idx)
-                                            .or_default()
-                                            .push(current_rel_idx);
-                                    }
-                                }
-                                if let Some(edges) = way_to_edge_indices.get(&wid.0) {
-                                    for &e in edges {
-                                        out_edges.insert(e);
-                                    }
-                                }
-                            }
-                            OsmId::Relation(sub_rid) => {
-                                flatten_relation(
-                                    sub_rid.0,
-                                    pre_rel_map,
-                                    osm_node_to_graph_idx,
-                                    way_id_to_node_indices,
-                                    way_to_edge_indices,
-                                    stop_node_indices,
-                                    visited,
-                                    out_nodes,
-                                    out_edges,
-                                    out_final_node_to_rels,
-                                    current_rel_idx,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
             let rel_idx = relations_list.len();
             let mut rel_nodes = Vec::new();
             let mut rel_edges = AHashSet::new();
             let mut visited_rels = AHashSet::new();
 
-            flatten_relation(
+            Self::flatten_relation(
                 r_pre.id,
                 &pre_rel_map,
                 &osm_node_to_graph_idx,
@@ -522,26 +434,28 @@ impl OsmBuilder {
             });
         }
 
-        let build_tree = |indices: AHashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
-            // Filter out stop nodes
-            let indices: Vec<NodeIndex> = indices.difference(&stop_node_indices).cloned().collect();
+        let build_tree =
+            |indices: AHashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
+                // Filter out stop nodes so the RTree primarily snaps to the line geometry
+                let indices: Vec<NodeIndex> =
+                    indices.difference(&stop_node_indices).cloned().collect();
 
-            if indices.is_empty() {
-                return None;
-            }
-            println!("Building {} index with {} nodes...", name, indices.len());
-            let nodes: Vec<SpatialNode> = indices
-                .into_iter()
-                .map(|idx| {
-                    let p = graph.nodes[idx].payload.point;
-                    SpatialNode {
-                        index: idx,
-                        point: [p.x(), p.y()],
-                    }
-                })
-                .collect();
-            Some(RTree::bulk_load(nodes))
-        };
+                if indices.is_empty() {
+                    return None;
+                }
+                println!("Building {} index with {} nodes...", name, indices.len());
+                let nodes: Vec<SpatialNode> = indices
+                    .into_iter()
+                    .map(|idx| {
+                        let p = graph.nodes[idx].payload.point;
+                        SpatialNode {
+                            index: idx,
+                            point: [p.x(), p.y()],
+                        }
+                    })
+                    .collect();
+                Some(RTree::bulk_load(nodes))
+            };
 
         let needs_rail = used_route_types.contains(&RouteType::Rail);
         let needs_tram = used_route_types.contains(&RouteType::Tramway);
@@ -608,6 +522,73 @@ impl OsmBuilder {
         })
     }
 
+    fn flatten_relation(
+        r_id: i64,
+        pre_rel_map: &AHashMap<i64, &PreRelation>,
+        osm_node_to_graph_idx: &AHashMap<i64, NodeIndex>,
+        way_id_to_node_indices: &AHashMap<i64, Vec<NodeIndex>>,
+        way_to_edge_indices: &AHashMap<i64, Vec<EdgeIndex>>,
+        stop_node_indices: &AHashSet<NodeIndex>,
+        visited: &mut AHashSet<i64>,
+        out_nodes: &mut Vec<NodeIndex>,
+        out_edges: &mut AHashSet<EdgeIndex>,
+        out_final_node_to_rels: &mut AHashMap<NodeIndex, Vec<usize>>,
+        current_rel_idx: usize,
+    ) {
+        if !visited.insert(r_id) {
+            return; // Cycle detected or already processed
+        }
+
+        if let Some(r_pre) = pre_rel_map.get(&r_id) {
+            for member in &r_pre.members {
+                match member.member {
+                    OsmId::Node(nid) => {
+                        if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
+                            if !stop_node_indices.contains(&idx) {
+                                out_nodes.push(idx);
+                                out_final_node_to_rels
+                                    .entry(idx)
+                                    .or_default()
+                                    .push(current_rel_idx);
+                            }
+                        }
+                    }
+                    OsmId::Way(wid) => {
+                        if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
+                            for &idx in nodes {
+                                out_nodes.push(idx);
+                                out_final_node_to_rels
+                                    .entry(idx)
+                                    .or_default()
+                                    .push(current_rel_idx);
+                            }
+                        }
+                        if let Some(edges) = way_to_edge_indices.get(&wid.0) {
+                            for &e in edges {
+                                out_edges.insert(e);
+                            }
+                        }
+                    }
+                    OsmId::Relation(sub_rid) => {
+                        Self::flatten_relation(
+                            sub_rid.0,
+                            pre_rel_map,
+                            osm_node_to_graph_idx,
+                            way_id_to_node_indices,
+                            way_to_edge_indices,
+                            stop_node_indices,
+                            visited,
+                            out_nodes,
+                            out_edges,
+                            out_final_node_to_rels,
+                            current_rel_idx,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn open_pbf(path: &Path) -> Result<OsmPbfReader<std::fs::File>> {
         let f = std::fs::File::open(path).with_context(|| format!("Failed to open {:?}", path))?;
         Ok(OsmPbfReader::new(f))
@@ -620,7 +601,7 @@ impl OsmBuilder {
 
         let mut edges_to_add = Vec::new();
         for edge in &mut graph.edges {
-            // Apply preferred direction penalties to the forward edge
+            // Apply preferred direction penalties
             // 0: Neutral, 1: Forward (benefit), 2: Backward (penalty)
             if edge.payload.preferred_direction == 1 {
                 // Forward is preferred: slight benefit (0.9x)
@@ -641,6 +622,7 @@ impl OsmBuilder {
                 // 2 (Backward): Reverse edge is WITH preference -> Benefit (0.9x)
 
                 let mut base_cost = edge.payload.cost as f64;
+                // Revert modifier applied to forward edge to get true base cost
                 if edge.payload.preferred_direction == 1 {
                     base_cost /= 0.9;
                 } else if edge.payload.preferred_direction == 2 {
@@ -666,7 +648,7 @@ impl OsmBuilder {
             graph.add_edge(from, to, pl);
         }
 
-        // writeOneWayPens: Penalize forbidden directions
+        // Penalize forbidden directions
         for edge in &mut graph.edges {
             if edge.payload.oneway == 2 {
                 // Severe penalty for wrong direction of one-way
@@ -687,16 +669,15 @@ impl OsmBuilder {
         if Self::is_platform(w) {
             return false;
         }
-        // Filter out industrial usage
         if w.tags.get("usage").map_or(false, |u| u == "industrial") {
             return false;
         }
 
-        // Critical Fix: Explicitly include route=ferry ways even if they lack highway tags
+        // Explicitly include route=ferry ways even if they lack highway tags
         if w.tags.get("route").map_or(false, |r| r == "ferry") {
             return true;
         }
-        // Critical Fix: Explicitly include aerialway ways for gondolas
+        // Explicitly include aerialway ways for gondolas
         if w.tags.contains_key("aerialway") {
             return true;
         }
@@ -732,11 +713,7 @@ impl OsmBuilder {
         });
         let is_tram = railway.map_or(false, |r| r == "tram");
         let is_metro = railway.map_or(false, |r| r == "subway");
-
-        // Ferry detection
         let is_ferry = route == Some("ferry") || ferry_ways.contains(&w.id.0);
-
-        // Gondola detection
         let is_gondola = aerialway.is_some();
 
         let is_bus = if is_ferry || is_gondola {
@@ -815,7 +792,7 @@ impl OsmBuilder {
         } else if let Some(r) = tags.get("route") {
             if r == "ferry" { 15.0 / 3.6 } else { 10.0 }
         } else if tags.contains_key("aerialway") {
-            15.0 / 3.6 // Gondola speed approx
+            15.0 / 3.6
         } else {
             10.0 // Slow
         }
@@ -977,17 +954,6 @@ mod tests {
         tags.insert("railway".into(), "rail".into());
         tags.insert("usage".into(), "industrial".into());
 
-        // Normal cost ~36
-        // Penalized once: ~36 * 100,000 = 3,600,000
-        // Extreme penalty adds another 10x factor on top of the base penalty logic?
-        // Actually looking at the code:
-        // if is_rail && is_industrial { cost *= 10.0 * penalty_factor; } -> cost *= 1,000,000
-        // Then later: if usage=industrial { penalized=true } -> cost *= penalty_factor (100,000)
-        // Total multiplier = 1,000,000 * 100,000 = 10^11.
-        // Base cost ~36. Total ~3.6 * 10^12.
-        // Capped at u32::MAX (~4 * 10^9).
-        // So we expect u32::MAX.
-
         let cost = OsmBuilder::calculate_cost(&tags, 100.0);
         assert_eq!(cost, u32::MAX);
     }
@@ -1057,11 +1023,6 @@ mod tests {
         assert_eq!(fwd_edge.payload.cost, 120);
 
         // Check reverse edge (index 1)
-        // Logic:
-        // if pref == 2: base_cost /= 1.2;
-        // rev_pl.cost = (base_cost * 0.9) as u32;
-        // base_cost = 120 / 1.2 = 100
-        // rev_cost = 100 * 0.9 = 90
         let rev_edge = &graph.edges[1];
         assert_eq!(rev_edge.payload.cost, 90);
     }
