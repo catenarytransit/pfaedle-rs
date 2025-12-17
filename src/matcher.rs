@@ -137,11 +137,6 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 for sn in neighbors {
                     // Check distance for Rail
                     if pattern.route_type == Some(RouteType::Rail) {
-                        // sn.distance_2 is squared euclidean distance in approx coords.
-                        // Ideally we check real distance, but let's assume the projection is roughly meters if using local,
-                        // but here we are using lon/lat.
-                        // RTree distance is squared euclidean on coords.
-                        // We should compute actual distance.
                         let node_pl = &osm.graph.node(sn.index).payload;
                         let dist = node_pl
                             .point
@@ -839,21 +834,11 @@ mod tests {
         // Path: 2 -> 3 -> 4
         // Points: Node(2), Node(3) (via edge 2->3), Node(4) (via edge 3->4)
         // Coords: (1.0, 0.0) -> (1.0, 1.0) -> (1.0, 2.0) (Lat, Lon) -> (y, x)
-        // Wait, Point::new(x, y).
+        // Point::new(x, y).
         // n2: (0, 1) -> y=1, x=0
         // n3: (1, 1) -> y=1, x=1
         // n4: (2, 1) -> y=1, x=2
         // Matcher returns (lat, lon) which is (y, x)
-
-        // Expected Length: 3 points?
-        // match_sequence_with_backtracking returns:
-        // Start Node Point + (Edge 1 points excluding first) + (Edge 2 points excluding first)
-        // Edge geometry defaults to straight line (from, to) if not specified in payload?
-        // Graph edge default has empty geometry usually.
-        // If geometry is empty, my loop `edge.payload.geometry.coords().skip(1)` does nothing?
-        // Wait, `edge.payload.geometry` in `OsmData` usually has points.
-        // In this test, `EdgePL::new()` has default geometry?
-        // Let's check `EdgePL`.
 
         // For test purposes, we rely on the fact that `pathfind` returns edges
         // and we just need to verify it returns *some* path.
