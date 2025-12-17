@@ -65,11 +65,6 @@ struct Args {
 pub struct ShapePoint {
     pub geometry: Point<f64>,
     pub sequence: usize,
-    // pub dist_traveled: Option<f32>, // We don't really use this yet, so omit to save memory further or keep? User had it. Let's keep if read from input matching user example.
-    // Actually our ShapeRecord didn't have it, but user example did.
-    // Our ShapeRecord was: shape_id, shape_pt_lat, shape_pt_lon, shape_pt_sequence.
-    // Let's stick to what we had + optimization. Removing dist_traveled unless needed.
-    // User example included it. It's safer to include it if we want to preserve data from existing files.
 }
 
 #[derive(Deserialize)]
