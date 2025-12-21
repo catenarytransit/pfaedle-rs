@@ -285,19 +285,26 @@ fn main() -> Result<()> {
     let mut all_shapes: AHashMap<String, Vec<ShapePoint>> = AHashMap::new();
 
     if shapes_path.exists() {
-        println!("Reading existing shapes (optimized)...");
-        // Use our new faster reader
-        match faster_shape_reader(shapes_path.clone()) {
-            Ok(shapes) => {
-                all_shapes = shapes;
-                println!("Loaded {} existing shapes.", all_shapes.len());
+        // Optimization: If we are going to wipe all shapes anyway, don't read them!
+        let will_wipe_all = args.mots == "all" && args.wipe_shapes;
+
+        if !will_wipe_all {
+            println!("Reading existing shapes (optimized)...");
+            // Use our new faster reader
+            match faster_shape_reader(shapes_path.clone()) {
+                Ok(shapes) => {
+                    all_shapes = shapes;
+                    println!("Loaded {} existing shapes.", all_shapes.len());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Failed to read existing shapes: {}. Proceeding with empty set.",
+                        e
+                    );
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to read existing shapes: {}. Proceeding with empty set.",
-                    e
-                );
-            }
+        } else {
+            println!("Skipping read of existing shapes because wipe_shapes is set and MOTs=all.");
         }
     }
 

@@ -2,6 +2,7 @@ use ahash::{AHashMap, AHashSet};
 use anyhow::{Context, Result};
 use geo::{LineString, Point};
 use osmpbfreader::{OsmId, OsmObj, OsmPbfReader, Tags};
+use rayon::prelude::*; // Make sure rayon is available for parallel sort
 use rstar::RTree;
 
 use std::path::Path;
@@ -17,6 +18,7 @@ use gtfs_structures::RouteType;
 pub struct SpatialNode {
     pub index: NodeIndex,
     pub point: [f64; 2], // [x, y] = [lon, lat]
+    pub modes: u8,       // Bitmask of allowed modes
 }
 
 impl rstar::PointDistance for SpatialNode {
@@ -45,12 +47,7 @@ pub struct OsmRelation {
 
 pub struct OsmData {
     pub graph: Graph<NodePL, EdgePL>,
-    pub rail_tree: Option<RTree<SpatialNode>>,
-    pub tram_tree: Option<RTree<SpatialNode>>,
-    pub metro_tree: Option<RTree<SpatialNode>>,
-    pub bus_tree: Option<RTree<SpatialNode>>,
-    pub ferry_tree: Option<RTree<SpatialNode>>,
-    pub gondola_tree: Option<RTree<SpatialNode>>,
+    pub spatial_tree: Option<RTree<SpatialNode>>,
     pub relations: Vec<OsmRelation>,
     pub node_to_relations: AHashMap<NodeIndex, Vec<usize>>,
 }
@@ -82,7 +79,8 @@ impl OsmBuilder {
         let mut ways_in_ferry_relations: AHashSet<i64> = AHashSet::new();
 
         // Set of Node IDs that are required for the graph.
-        let mut needed_nodes: AHashSet<i64> = AHashSet::new();
+        // Optimization: Use Vec and sort/dedup instead of HashSet to save memory
+        let mut needed_nodes: Vec<i64> = Vec::new();
 
         // ------------------------------------------------
         // PASS 1: Relations
@@ -107,7 +105,7 @@ impl OsmBuilder {
                                     ways_in_ferry_relations.insert(wid.0);
                                 }
                             } else if let OsmId::Node(nid) = member.member {
-                                needed_nodes.insert(nid.0); // Direct node members
+                                needed_nodes.push(nid.0); // Direct node members
                             } else if let OsmId::Relation(_rid) = member.member {
                                 // Relation member - we will handle flattening later,
                                 // but we don't need to add ID to 'needed' sets here,
@@ -166,12 +164,16 @@ impl OsmBuilder {
 
                         // Mark all nodes as needed
                         for nid in &w.nodes {
-                            needed_nodes.insert(nid.0);
+                            needed_nodes.push(nid.0);
                         }
                     }
                 }
             }
         }
+        // Sort and deduplicate needed_nodes
+        println!("  Sorting {} needed nodes...", needed_nodes.len());
+        needed_nodes.par_sort_unstable(); // Use parallel sort if available or unstable
+        needed_nodes.dedup();
         println!(
             "  Identified {} unique nodes needed for the graph.",
             needed_nodes.len()
@@ -200,7 +202,7 @@ impl OsmBuilder {
                 let obj = obj.context("Error reading PBF object in Pass 3")?;
                 if let OsmObj::Node(n) = obj {
                     let nid = n.id.0;
-                    if needed_nodes.contains(&nid) {
+                    if needed_nodes.binary_search(&nid).is_ok() {
                         let lat = n.lat();
                         let lon = n.lon();
 
@@ -522,26 +524,9 @@ impl OsmBuilder {
             });
         }
 
-        let build_tree = |indices: AHashSet<NodeIndex>, name: &str| -> Option<RTree<SpatialNode>> {
-            // Filter out stop nodes
-            let indices: Vec<NodeIndex> = indices.difference(&stop_node_indices).cloned().collect();
-
-            if indices.is_empty() {
-                return None;
-            }
-            println!("Building {} index with {} nodes...", name, indices.len());
-            let nodes: Vec<SpatialNode> = indices
-                .into_iter()
-                .map(|idx| {
-                    let p = graph.nodes[idx].payload.point;
-                    SpatialNode {
-                        index: idx,
-                        point: [p.x(), p.y()],
-                    }
-                })
-                .collect();
-            Some(RTree::bulk_load(nodes))
-        };
+        // Consolidate all nodes into one Spatial Tree with mode masks
+        println!("Building unified spatial index...");
+        let mut node_modes: AHashMap<NodeIndex, u8> = AHashMap::new();
 
         let needs_rail = used_route_types.contains(&RouteType::Rail);
         let needs_tram = used_route_types.contains(&RouteType::Tramway);
@@ -557,52 +542,67 @@ impl OsmBuilder {
         let needs_ferry = used_route_types.contains(&RouteType::Ferry);
         let needs_gondola = used_route_types.contains(&RouteType::Gondola);
 
-        let rail_tree = if needs_rail {
-            build_tree(rail_node_indices, "Rail")
-        } else {
-            None
+        let mut add_modes = |indices: &AHashSet<NodeIndex>, mode_flag: u8| {
+            for &idx in indices {
+                if !stop_node_indices.contains(&idx) {
+                    *node_modes.entry(idx).or_default() |= mode_flag;
+                }
+            }
         };
-        let tram_tree = if needs_tram {
-            build_tree(tram_node_indices, "Tram")
-        } else {
-            None
-        };
-        let metro_tree = if needs_metro {
-            build_tree(metro_node_indices, "Metro")
-        } else {
-            None
-        };
-        let bus_tree = if needs_bus {
-            build_tree(bus_node_indices, "Bus")
-        } else {
-            None
-        };
-        let ferry_tree = if needs_ferry {
-            build_tree(ferry_node_indices, "Ferry")
-        } else {
-            None
-        };
-        let gondola_tree = if needs_gondola {
-            build_tree(gondola_node_indices, "Gondola")
+
+        if needs_rail {
+            add_modes(&rail_node_indices, MODE_RAIL);
+        }
+        if needs_tram {
+            add_modes(&tram_node_indices, MODE_TRAM);
+        }
+        if needs_metro {
+            add_modes(&metro_node_indices, MODE_SUBWAY);
+        }
+        if needs_bus {
+            add_modes(&bus_node_indices, MODE_BUS);
+        }
+        if needs_ferry {
+            add_modes(&ferry_node_indices, MODE_FERRY);
+        }
+        if needs_gondola {
+            add_modes(&gondola_node_indices, MODE_GONDOLA);
+        }
+
+        // Also ensure we include nodes that might be used for generic road access (Bus covers most)
+        // But the sets above only include nodes from classifying ways.
+
+        let mut spatial_nodes: Vec<SpatialNode> = Vec::with_capacity(node_modes.len());
+        for (idx, modes) in node_modes {
+            let p = graph.nodes[idx].payload.point;
+            spatial_nodes.push(SpatialNode {
+                index: idx,
+                point: [p.x(), p.y()],
+                modes,
+            });
+        }
+
+        let spatial_tree = if !spatial_nodes.is_empty() {
+            Some(RTree::bulk_load(spatial_nodes))
         } else {
             None
         };
 
         println!(
-            "Graph built: {} nodes, {} edges. Relations: {}",
+            "Graph built: {} nodes, {} edges. Relations: {}. Spatial Index size: {}",
             graph.nodes.len(),
             graph.edges.len(),
-            relations_list.len()
+            relations_list.len(),
+            if let Some(t) = &spatial_tree {
+                t.size()
+            } else {
+                0
+            }
         );
 
         Ok(OsmData {
             graph,
-            rail_tree,
-            tram_tree,
-            metro_tree,
-            bus_tree,
-            ferry_tree,
-            gondola_tree,
+            spatial_tree,
             relations: relations_list,
             node_to_relations: final_node_to_rels,
         })

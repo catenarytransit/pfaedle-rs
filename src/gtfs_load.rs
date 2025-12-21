@@ -57,6 +57,10 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
         }
     }
 
+    // Optimization: We don't use the original shapes for matching, and we handle shapes.txt I/O manually in main.rs
+    // So we can drop the shapes from memory here to save significant RAM.
+    raw.shapes = None;
+
     let gtfs = Gtfs::try_from(raw)
         .map_err(|e| anyhow::anyhow!("Failed to process GTFS for pfaedle: {}", e))?;
 
@@ -82,9 +86,9 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
             continue;
         }
 
-        // Sort stop_times by sequence just in case
-        let mut stop_times = trip.stop_times.clone();
-        stop_times.sort_by_key(|st| st.stop_sequence);
+        // Create vector of references to sort
+        let mut stop_times: Vec<_> = trip.stop_times.iter().collect();
+        stop_times.sort_unstable_by_key(|st| st.stop_sequence);
 
         let stop_ids: Vec<String> = stop_times.iter().map(|st| st.stop.id.clone()).collect();
 

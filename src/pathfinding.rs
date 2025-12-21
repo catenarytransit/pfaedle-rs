@@ -1,6 +1,7 @@
 use crate::graph::{EdgePL, Graph, NodeIndex, NodePL};
 use ahash::{AHashMap, AHashSet};
-use geo::algorithm::HaversineDistance;
+use geo::Point;
+
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
@@ -35,7 +36,104 @@ pub struct TransitMatch {
     pub operator: Option<String>,
 }
 
+fn heuristic_m(p: Point<f64>, end_lat: f64, end_lon: f64, cos_end_lat: f64) -> f64 {
+    // Point: x=lon, y=lat
+    let dy = (p.y() - end_lat) * 111_320.0;
+    let dx = (p.x() - end_lon) * 111_320.0 * cos_end_lat;
+    (dx * dx + dy * dy).sqrt()
+}
+
+#[derive(Clone)]
+pub struct PathfinderContext {
+    open_fwd: BinaryHeap<State>,
+    open_bwd: BinaryHeap<State>,
+    came_from_fwd: AHashMap<NodeIndex, (NodeIndex, usize)>,
+    came_from_bwd: AHashMap<NodeIndex, (NodeIndex, usize)>,
+    g_fwd: AHashMap<NodeIndex, f64>,
+    g_bwd: AHashMap<NodeIndex, f64>,
+}
+
+impl PathfinderContext {
+    pub fn new() -> Self {
+        Self {
+            open_fwd: BinaryHeap::new(),
+            open_bwd: BinaryHeap::new(),
+            came_from_fwd: AHashMap::new(),
+            came_from_bwd: AHashMap::new(),
+            g_fwd: AHashMap::new(),
+            g_bwd: AHashMap::new(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.open_fwd.clear();
+        self.open_bwd.clear();
+        self.came_from_fwd.clear();
+        self.came_from_bwd.clear();
+        self.g_fwd.clear();
+        self.g_bwd.clear();
+    }
+}
+
 pub fn pathfind(
+    graph: &Graph<NodePL, EdgePL>,
+    start: NodeIndex,
+    end: NodeIndex,
+    allowed_modes: u8,
+    allowed_edges: Option<&AHashSet<usize>>,
+    preferred_match: Option<&TransitMatch>,
+) -> Option<(f64, Vec<usize>)> {
+    let mut ctx = PathfinderContext::new();
+    pathfind_with_context(
+        &mut ctx,
+        graph,
+        start,
+        end,
+        allowed_modes,
+        allowed_edges,
+        preferred_match,
+    )
+}
+
+fn contains_ignore_case(corpus: &str, target_lower: &str) -> bool {
+    // Check if `corpus` (mixed case) contains `target_lower` (lowercase)
+    // without allocating a new lowercase string for `corpus`.
+    if target_lower.is_empty() {
+        return true;
+    }
+    if corpus.len() < target_lower.len() {
+        return false;
+    }
+
+    let target_bytes = target_lower.as_bytes();
+    let corpus_bytes = corpus.as_bytes();
+
+    // Naive search is O(N*M), but strings are short (transit lines).
+    // Boyer-Moore or similar is overkill here.
+    // We iterate through valid start positions
+    for i in 0..=(corpus.len() - target_lower.len()) {
+        let mut match_found = true;
+        for j in 0..target_lower.len() {
+            let c = corpus_bytes[i + j];
+            let shift = if c >= b'A' && c <= b'Z' {
+                c + 32 // to lower
+            } else {
+                c
+            };
+            if shift != target_bytes[j] {
+                match_found = false;
+                break;
+            }
+        }
+        if match_found {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn pathfind_with_context(
+    ctx: &mut PathfinderContext,
     graph: &Graph<NodePL, EdgePL>,
     start: NodeIndex,
     end: NodeIndex,
@@ -43,6 +141,8 @@ pub fn pathfind(
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
     preferred_match: Option<&TransitMatch>,
 ) -> Option<(f64, Vec<usize>)> {
+    ctx.reset();
+
     if start == end {
         return Some((0.0, Vec::new()));
     }
@@ -51,33 +151,33 @@ pub fn pathfind(
     let start_point = graph.node(start).payload.point;
 
     // Heuristics
+    let end_lat = end_point.y();
+    let end_lon = end_point.x();
+    let end_cos = end_lat.to_radians().cos();
+
+    let start_lat = start_point.y();
+    let start_lon = start_point.x();
+    let start_cos = start_lat.to_radians().cos();
+
+    // Heuristics
     let h_fwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.haversine_distance(&end_point) * 0.1
+        heuristic_m(p, end_lat, end_lon, end_cos) * 0.1
     };
     let h_bwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        p.haversine_distance(&start_point) * 0.1
+        heuristic_m(p, start_lat, start_lon, start_cos) * 0.1
     };
 
-    let mut open_fwd = BinaryHeap::new();
-    let mut open_bwd = BinaryHeap::new();
-
-    let mut came_from_fwd: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new();
-    let mut came_from_bwd: AHashMap<NodeIndex, (NodeIndex, usize)> = AHashMap::new();
-
-    let mut g_fwd: AHashMap<NodeIndex, f64> = AHashMap::new();
-    let mut g_bwd: AHashMap<NodeIndex, f64> = AHashMap::new();
-
     // Initialize
-    g_fwd.insert(start, 0.0);
-    g_bwd.insert(end, 0.0);
+    ctx.g_fwd.insert(start, 0.0);
+    ctx.g_bwd.insert(end, 0.0);
 
-    open_fwd.push(State {
+    ctx.open_fwd.push(State {
         cost: h_fwd(start),
         node: start,
     });
-    open_bwd.push(State {
+    ctx.open_bwd.push(State {
         cost: h_bwd(end),
         node: end,
     });
@@ -93,9 +193,11 @@ pub fn pathfind(
                 let mut matches = false;
                 // Check short name
                 if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
-                    // Heuristic containment
-                    if target.contains(&line_name.to_lowercase())
-                        || line_name.to_lowercase().contains(target)
+                    // Optimized containment check
+                    // We assume `target` is already lowercase (from matcher.rs)
+                    if contains_ignore_case(line_name, target)
+                        || target.contains(&line_name.to_lowercase())
+                    // Keeping reverse check (if target is "Bus 100" and line is "100")
                     {
                         matches = true;
                     }
@@ -103,8 +205,8 @@ pub fn pathfind(
                 // Check operator
                 if !matches {
                     if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
-                        if target_op.contains(&line_op.to_lowercase())
-                            || line_op.to_lowercase().contains(target_op)
+                        if contains_ignore_case(line_op, target_op)
+                            || target_op.contains(&line_op.to_lowercase())
                         {
                             matches = true;
                         }
@@ -120,36 +222,22 @@ pub fn pathfind(
         cost
     };
 
-    while !open_fwd.is_empty() && !open_bwd.is_empty() {
+    while !ctx.open_fwd.is_empty() && !ctx.open_bwd.is_empty() {
         // Check termination
-        // If the smallest path we could possibly find (min_f + min_b) is worse than best found so far (mu), stop.
-        // Note: min_f = g_f + h_f. h_f is distance to end.
-        // This standard termination condition requires consistent heuristics.
-        let min_f = open_fwd.peek().unwrap().cost;
-        let min_b = open_bwd.peek().unwrap().cost;
+        let min_f = ctx.open_fwd.peek().unwrap().cost;
+        let min_b = ctx.open_bwd.peek().unwrap().cost;
 
-        // Conservative check: if min_f and min_b are large enough.
-        // Since h is scaled by 0.2, it is very admissible.
         if min_f + min_b >= mu {
-            // Optimization: Maybe we can stop?
-            // With weak heuristic, this might be too loose or tight?
-            // Let's rely on queue empty or strict dominance.
-            // Actually, with admissible heuristic, this condition (min_f + min_b >= mu) is valid for optimal path.
-            // But we must be careful about heuristic consistency across directions.
-            // Prudence: use a slightly looser bound or just let it run until exhaustion or clear dominance?
-            // Standard Bi-A* with consistent heuristic stops here.
             break;
         }
 
         // Expand the direction with smaller frontier size to keep balance
-        let expand_fwd = open_fwd.len() <= open_bwd.len();
+        let expand_fwd = ctx.open_fwd.len() <= ctx.open_bwd.len();
 
         if expand_fwd {
-            if let Some(State { cost: _, node: u }) = open_fwd.pop() {
-                let current_g = *g_fwd.get(&u).unwrap_or(&f64::INFINITY);
+            if let Some(State { cost: _, node: u }) = ctx.open_fwd.pop() {
+                let current_g = *ctx.g_fwd.get(&u).unwrap_or(&f64::INFINITY);
 
-                // Pruning if we already found a path better than this node's theoretical best
-                // But we modify mu dynamically.
                 if current_g + h_fwd(u) >= mu {
                     continue;
                 }
@@ -169,23 +257,17 @@ pub fn pathfind(
                     let cost = get_edge_cost(edge);
                     let tentative_g = current_g + cost;
 
-                    if tentative_g < *g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
-                        g_fwd.insert(v, tentative_g);
-                        came_from_fwd.insert(v, (u, edge_idx));
-                        open_fwd.push(State {
+                    if tentative_g < *ctx.g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        ctx.g_fwd.insert(v, tentative_g);
+                        ctx.came_from_fwd.insert(v, (u, edge_idx));
+                        ctx.open_fwd.push(State {
                             cost: tentative_g + h_fwd(v),
                             node: v,
                         });
 
                         // Check intersection with backward search
-                        if let Some(&g_b) = g_bwd.get(&v) {
-                            let dist = tentative_g + g_b; // We check dist through v? No, this is meeting at V.
-                            // But wait, my logic was meeting at EDGE.
-                            // If `v` is in `g_bwd`, it means we have a path `end -> ... -> v` with cost `g_b`.
-                            // So total cost is `tentative_g` (start->u->v) + `g_b` (v->end).
-                            // This corresponds to meeting at node `v`.
-                            // Wait, if meeting at node `v`, which edge is the "meeting edge"?
-                            // It's the edge `u->v` (edge_idx) we just traversed.
+                        if let Some(&g_b) = ctx.g_bwd.get(&v) {
+                            let dist = tentative_g + g_b;
                             if dist < mu {
                                 mu = dist;
                                 meeting_node = Some((u, v, edge_idx));
@@ -195,9 +277,8 @@ pub fn pathfind(
                 }
             }
         } else {
-            if let Some(State { cost: _, node: u }) = open_bwd.pop() {
-                // u is current in bwd search
-                let current_g = *g_bwd.get(&u).unwrap_or(&f64::INFINITY);
+            if let Some(State { cost: _, node: u }) = ctx.open_bwd.pop() {
+                let current_g = *ctx.g_bwd.get(&u).unwrap_or(&f64::INFINITY);
 
                 if current_g + h_bwd(u) >= mu {
                     continue;
@@ -218,30 +299,19 @@ pub fn pathfind(
                     let cost = get_edge_cost(edge);
                     let tentative_g = current_g + cost;
 
-                    if tentative_g < *g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
-                        g_bwd.insert(v, tentative_g);
-                        came_from_bwd.insert(v, (u, edge_idx));
-                        open_bwd.push(State {
+                    if tentative_g < *ctx.g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        ctx.g_bwd.insert(v, tentative_g);
+                        ctx.came_from_bwd.insert(v, (u, edge_idx));
+                        ctx.open_bwd.push(State {
                             cost: tentative_g + h_bwd(v),
                             node: v,
                         });
 
                         // Check intersection with forward search
-                        if let Some(&g_f) = g_fwd.get(&v) {
-                            // Path: start -> ... -> v (cost g_f) -> u -> ... -> end (cost tentative_g via edge)
-                            // Total: g_f + tentative_g
+                        if let Some(&g_f) = ctx.g_fwd.get(&v) {
                             let dist = g_f + tentative_g;
                             if dist < mu {
                                 mu = dist;
-                                // Meeting at node v? No, traversing v->u (backward) means u->v (forward).
-                                // Edge is `edge_idx` connecting u and v.
-                                // We are coming from u (bwd) to v (bwd neighbor).
-                                // So path is start->...->v + edge(v,u) + u->...->end.
-                                // Edge connects v and u.
-                                // record as (v, u, edge_idx)?
-                                // My reconstruction expects (u_fwd, v_bwd, edge).
-                                // Here `v` is in fwd tree. `u` is in bwd tree.
-                                // So (v, u, edge_idx).
                                 meeting_node = Some((v, u, edge_idx));
                             }
                         }
@@ -252,20 +322,9 @@ pub fn pathfind(
     }
 
     if let Some((u, v, mid_edge)) = meeting_node {
-        // Reconstruct path
-        // start -> ... -> u
-        let mut path = reconstruct_path(came_from_fwd, u);
-
-        // Relationship check: mid_edge connects u and v.
-        // path contains edges leading up to u.
-        // We push mid_edge (u -> v).
+        let mut path = reconstruct_path(&ctx.came_from_fwd, u);
         path.push(mid_edge);
-
-        // v -> ... -> end
-        // reconstruct_path(came_from_bwd, v) gives [e_near_end, ..., e_near_v].
-        // These are edges leading to v from end.
-        // We want edges from v to end.
-        let mut path_bwd = reconstruct_path(came_from_bwd, v);
+        let mut path_bwd = reconstruct_path(&ctx.came_from_bwd, v);
         path_bwd.reverse();
         path.extend(path_bwd);
 
@@ -276,7 +335,7 @@ pub fn pathfind(
 }
 
 fn reconstruct_path(
-    came_from: AHashMap<NodeIndex, (NodeIndex, usize)>,
+    came_from: &AHashMap<NodeIndex, (NodeIndex, usize)>,
     mut current: NodeIndex,
 ) -> Vec<usize> {
     let mut path = Vec::new();
