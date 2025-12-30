@@ -16,7 +16,7 @@ use serde::Deserialize;
 use std::error::Error;
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(not(target_env = "msvc"))]
 use tikv_jemallocator::Jemalloc;
@@ -24,6 +24,38 @@ use tikv_jemallocator::Jemalloc;
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
+
+fn normalize_csv(path: &Path) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    println!("Normalizing CSV at {:?}", path);
+
+    // Read with flexible whitespace trimming
+    let mut rdr = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .flexible(true)
+        .from_path(path)?;
+
+    // We collect all records first to avoid reading/writing same file issues
+    // (though creating a temp file is safer)
+    let headers = rdr.headers()?.clone();
+    let mut records = Vec::new();
+    for result in rdr.records() {
+        records.push(result?);
+    }
+    drop(rdr);
+
+    // Write back
+    let mut wtr = csv::Writer::from_path(path)?;
+    wtr.write_record(&headers)?;
+    for record in records {
+        wtr.write_record(&record)?;
+    }
+    wtr.flush()?;
+
+    Ok(())
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -207,6 +239,10 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid MOTs string: {}", e))?;
 
     println!("Allowed MOTS: {:?}", allowed_mots);
+
+    // Normalise trips.txt and routes.txt to handle spaces
+    normalize_csv(&args.gtfs_dir.join("trips.txt"))?;
+    normalize_csv(&args.gtfs_dir.join("routes.txt"))?;
 
     // 1. Load GTFS
     let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)
