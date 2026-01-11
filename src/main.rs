@@ -286,10 +286,10 @@ fn main() -> Result<()> {
         }
     }
 
-    // Determine shapes to replace
+    // Determine shapes to wipe/replace based on selected MOTs
     let mut shapes_to_replace = ahash::AHashSet::new();
     if args.mots != "all" {
-        for (trip_id, trip) in &gtfs_data.gtfs.trips {
+        for (_trip_id, trip) in &gtfs_data.gtfs.trips {
             let route = gtfs_data.gtfs.routes.get(&trip.route_id);
             if let Some(r) = route {
                 let cat = mots::map_route_type_to_category(r.route_type);
@@ -304,9 +304,20 @@ fn main() -> Result<()> {
             }
         }
         println!(
-            "Identified {} shape_ids to replace based on selected MOTs.",
+            "Identified {} shape_ids for selected MOTs.",
             shapes_to_replace.len()
         );
+
+        // When wipe_shapes is set, remove these shapes (even before computing new ones)
+        if args.wipe_shapes && !shapes_to_replace.is_empty() {
+            let before_count = all_shapes.len();
+            all_shapes.retain(|id, _| !shapes_to_replace.contains(id));
+            println!(
+                "Wiped {} shapes for selected MOTs (kept {} other shapes).",
+                before_count - all_shapes.len(),
+                all_shapes.len()
+            );
+        }
     } else {
         if args.wipe_shapes {
             println!("MOTs='all' and wipe_shapes=true. Clearing all existing shapes.");
@@ -314,8 +325,8 @@ fn main() -> Result<()> {
         }
     }
 
-    // Remove obsolete shapes
-    if !shapes_to_replace.is_empty() {
+    // Remove obsolete shapes (only if not already wiped above)
+    if !args.wipe_shapes && !shapes_to_replace.is_empty() {
         let before_count = all_shapes.len();
         all_shapes.retain(|id, _| !shapes_to_replace.contains(id));
         println!(
