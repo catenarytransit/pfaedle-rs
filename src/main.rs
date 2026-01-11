@@ -350,8 +350,11 @@ fn main() -> Result<()> {
             if let Some(r) = route {
                 let cat = mots::map_route_type_to_category(r.route_type);
                 if allowed_mots.contains(&cat) {
+                    // Treat empty shape_id as null/missing
                     if let Some(sid) = &trip.shape_id {
-                        shapes_to_replace.insert(sid.clone());
+                        if !sid.is_empty() {
+                            shapes_to_replace.insert(sid.clone());
+                        }
                     }
                 }
             }

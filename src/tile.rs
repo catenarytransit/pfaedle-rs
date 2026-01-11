@@ -179,9 +179,11 @@ pub struct MergedTileData {
     pub spatial_tree: RTree<SpatialNode>,
 }
 
+use std::sync::Arc;
+
 /// LRU cache for tiles with optional disk persistence.
 pub struct TileCache {
-    cache: LruCache<TileCoord, TileData>,
+    cache: LruCache<TileCoord, Arc<TileData>>,
     osm_path: std::path::PathBuf,
     disk_cache_dir: Option<std::path::PathBuf>,
 }
@@ -242,7 +244,7 @@ impl TileCache {
     }
 
     /// Build or retrieve a tile (with disk caching if enabled).
-    pub fn get(&mut self, coord: TileCoord) -> Result<&TileData> {
+    pub fn get(&mut self, coord: TileCoord) -> Result<Arc<TileData>> {
         if !self.cache.contains(&coord) {
             // Try loading from disk first
             let tile = if self.tile_exists_on_disk(coord) {
@@ -253,9 +255,9 @@ impl TileCache {
                 self.save_tile_to_disk(coord, &tile)?;
                 tile
             };
-            self.cache.put(coord, tile);
+            self.cache.put(coord, Arc::new(tile));
         }
-        Ok(self.cache.get(&coord).unwrap())
+        Ok(self.cache.get(&coord).unwrap().clone())
     }
 
     /// Build tile data for a specific coordinate from OSM.

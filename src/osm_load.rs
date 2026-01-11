@@ -45,9 +45,12 @@ pub struct OsmRelation {
     pub edges: AHashSet<EdgeIndex>, // All edges in the relation
 }
 
+#[derive(Clone)]
 pub struct OsmData {
     pub graph: Graph<NodePL, EdgePL>,
+    pub timestamp: String,
     pub spatial_tree: Option<RTree<SpatialNode>>,
+    pub osm_filepath: std::path::PathBuf,
     pub relations: Vec<OsmRelation>,
     pub node_to_relations: AHashMap<NodeIndex, Vec<usize>>,
 }
@@ -602,7 +605,9 @@ impl OsmBuilder {
 
         Ok(OsmData {
             graph,
+            timestamp: "unknown".to_string(),
             spatial_tree,
+            osm_filepath: path.to_path_buf(),
             relations: relations_list,
             node_to_relations: final_node_to_rels,
         })
