@@ -66,9 +66,44 @@ pub fn match_patterns(
             }
         }
 
-        // TODO: Pass specific BBox? For now we assume rail is global/large.
-        // We reuse the load_osm from osm_load but we need to call it here.
-        let osm_data = load_osm(osm_path, &types, None, false)?; // skip_small_roads=false for rail usually?
+        // Calculate bounding box from pattern stops (critical for memory efficiency)
+        let bbox = {
+            let mut min_lat = f64::MAX;
+            let mut max_lat = f64::MIN;
+            let mut min_lon = f64::MAX;
+            let mut max_lon = f64::MIN;
+            let mut found_any = false;
+
+            for (pattern, _) in &other_patterns {
+                for stop_id in &pattern.stop_ids {
+                    if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
+                        if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
+                            min_lat = min_lat.min(lat);
+                            max_lat = max_lat.max(lat);
+                            min_lon = min_lon.min(lon);
+                            max_lon = max_lon.max(lon);
+                            found_any = true;
+                        }
+                    }
+                }
+            }
+
+            if found_any {
+                // Add padding (0.5 degrees ~= 55km) to ensure we capture nearby infrastructure
+                let padding = 0.5;
+                Some((
+                    min_lon - padding,
+                    min_lat - padding,
+                    max_lon + padding,
+                    max_lat + padding,
+                ))
+            } else {
+                None
+            }
+        };
+
+        println!("  Calculated bbox for {} patterns: {:?}", other_count, bbox);
+        let osm_data = load_osm(osm_path, &types, bbox, false)?;
 
         match_patterns_full_graph(&gtfs, &osm_data, other_patterns)
     } else {
