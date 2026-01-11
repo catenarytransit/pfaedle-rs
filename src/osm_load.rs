@@ -55,6 +55,101 @@ pub struct OsmData {
     pub node_to_relations: AHashMap<NodeIndex, Vec<usize>>,
 }
 
+/// Lightweight relation data for color matching without full graph.
+#[derive(Debug, Clone)]
+pub struct LightRelation {
+    pub id: i64,
+    pub ref_tag: Option<String>,
+    pub name: Option<String>,
+    pub operator: Option<String>,
+    pub colour: Option<String>,
+    pub route_type: Option<String>,
+    pub way_ids: Vec<i64>,
+}
+
+/// Lightweight OSM data containing only relations (for color matching).
+/// This is used for bus processing to avoid loading the full graph.
+#[derive(Debug, Clone)]
+pub struct LightOsmData {
+    pub relations: Vec<LightRelation>,
+    /// Map from way_id -> indices into `relations` vec
+    pub way_to_relations: AHashMap<i64, Vec<usize>>,
+}
+
+impl LightOsmData {
+    pub fn new() -> Self {
+        Self {
+            relations: Vec::new(),
+            way_to_relations: AHashMap::new(),
+        }
+    }
+
+    /// Find relations that contain a given way
+    pub fn relations_for_way(&self, way_id: i64) -> impl Iterator<Item = &LightRelation> {
+        self.way_to_relations
+            .get(&way_id)
+            .into_iter()
+            .flat_map(|indices| indices.iter().map(|&i| &self.relations[i]))
+    }
+
+    /// Find color for a route matching the given criteria
+    pub fn find_color(
+        &self,
+        route_short_name: Option<&str>,
+        route_long_name: Option<&str>,
+        operator: Option<&str>,
+    ) -> Option<String> {
+        let mut best_match: Option<(&LightRelation, u8)> = None;
+
+        for rel in &self.relations {
+            if rel.colour.is_none() {
+                continue;
+            }
+
+            let mut score: u8 = 0;
+
+            // Check ref/name match
+            if let Some(osm_ref) = &rel.ref_tag {
+                let osm_lower = osm_ref.to_lowercase();
+                if let Some(short) = route_short_name {
+                    if osm_lower.contains(short) || short.contains(&osm_lower) {
+                        score += 3;
+                    }
+                }
+            }
+            if let Some(osm_name) = &rel.name {
+                let osm_lower = osm_name.to_lowercase();
+                if let Some(short) = route_short_name {
+                    if osm_lower.contains(short) || short.contains(&osm_lower) {
+                        score += 2;
+                    }
+                }
+                if let Some(long) = route_long_name {
+                    if osm_lower.contains(long) || long.contains(&osm_lower) {
+                        score += 2;
+                    }
+                }
+            }
+
+            // Check operator match
+            if let (Some(osm_op), Some(gtfs_op)) = (&rel.operator, operator) {
+                let osm_lower = osm_op.to_lowercase();
+                if osm_lower.contains(gtfs_op) || gtfs_op.contains(&osm_lower) {
+                    score += 1;
+                }
+            }
+
+            if score > 0 {
+                if best_match.is_none() || score > best_match.as_ref().unwrap().1 {
+                    best_match = Some((rel, score));
+                }
+            }
+        }
+
+        best_match.and_then(|(rel, _)| rel.colour.clone())
+    }
+}
+
 pub struct OsmBuilder;
 
 impl OsmBuilder {
@@ -862,6 +957,58 @@ impl OsmBuilder {
         }
 
         cost_float.min(u32::MAX as f64).ceil() as u32
+    }
+    pub fn read_relations_only(path: &Path) -> Result<LightOsmData> {
+        println!("Reading OSM relations only (light pass) from {:?}...", path);
+        let mut pbf = Self::open_pbf(path)?;
+
+        let mut relations = Vec::new();
+        let mut way_to_relations: AHashMap<i64, Vec<usize>> = AHashMap::new();
+
+        for obj in pbf.iter() {
+            let obj = obj.context("Error reading PBF object")?;
+            if let OsmObj::Relation(r) = obj {
+                let is_route =
+                    r.tags.contains_key("route") || r.tags.contains_key("public_transport");
+                if is_route {
+                    let id = r.id.0;
+                    let ref_tag = r.tags.get("ref").map(|s| s.to_string());
+                    let name = r.tags.get("name").map(|s| s.to_string());
+                    let operator = r.tags.get("operator").map(|s| s.to_string());
+                    let colour = r.tags.get("colour").map(|s| s.to_string());
+                    let route_type = r.tags.get("route").map(|s| s.to_string());
+
+                    let mut way_ids = Vec::new();
+                    for member in &r.refs {
+                        if let OsmId::Way(wid) = member.member {
+                            way_ids.push(wid.0);
+                        }
+                    }
+
+                    let rel_idx = relations.len();
+                    for &wid in &way_ids {
+                        way_to_relations.entry(wid).or_default().push(rel_idx);
+                    }
+
+                    relations.push(LightRelation {
+                        id,
+                        ref_tag,
+                        name,
+                        operator,
+                        colour,
+                        route_type,
+                        way_ids,
+                    });
+                }
+            }
+        }
+
+        println!("Loaded {} relations for light matching.", relations.len());
+
+        Ok(LightOsmData {
+            relations,
+            way_to_relations,
+        })
     }
 }
 

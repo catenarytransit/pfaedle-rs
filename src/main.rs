@@ -8,6 +8,7 @@ mod osm_load;
 mod pathfinding;
 mod router;
 mod segment_matcher;
+mod streaming_matcher;
 mod tile;
 
 use ahash::AHashMap;
@@ -251,67 +252,9 @@ fn main() -> Result<()> {
     let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)
         .context("Failed to load GTFS for Pfaedle")?;
 
-    // 2. Load OSM
-    // Calculate BBox from GTFS stops
-    // Collect all unique stop IDs from patterns
-    let mut relevant_stop_ids = ahash::AHashSet::new();
-    for pattern in gtfs_data.patterns.keys() {
-        for stop_id in &pattern.stop_ids {
-            relevant_stop_ids.insert(stop_id);
-        }
-    }
-
-    let bbox = if relevant_stop_ids.is_empty() {
-        None
-    } else {
-        let mut min_lat = f64::MAX;
-        let mut max_lat = f64::MIN;
-        let mut min_lon = f64::MAX;
-        let mut max_lon = f64::MIN;
-
-        for stop_id in relevant_stop_ids {
-            if let Some(stop) = gtfs_data.gtfs.stops.get(stop_id) {
-                min_lat = min_lat.min(stop.latitude.expect("Stop missing latitude"));
-                max_lat = max_lat.max(stop.latitude.expect("Stop missing latitude"));
-                min_lon = min_lon.min(stop.longitude.expect("Stop missing longitude"));
-                max_lon = max_lon.max(stop.longitude.expect("Stop missing longitude"));
-            }
-        }
-
-        let has_rail = gtfs_data.used_route_types.contains(&RouteType::Rail);
-        let padding_km = if has_rail { 200.0 } else { 100.0 };
-        println!(
-            "Stops BBox: lat [{:.4}, {:.4}], lon [{:.4}, {:.4}]. Padding: {} km",
-            min_lat, max_lat, min_lon, max_lon, padding_km
-        );
-
-        let lat_padding = padding_km / 111.132;
-        let center_lat = (min_lat + max_lat) / 2.0;
-        let cos_lat = center_lat.to_radians().cos().abs().max(0.1);
-        let lon_padding = padding_km / (111.132 * cos_lat);
-
-        let final_bbox = (
-            min_lon - lon_padding,
-            min_lat - lat_padding,
-            max_lon + lon_padding,
-            max_lat + lat_padding,
-        );
-        println!(
-            "Cropping OSM usage to BBox: lat [{:.4}, {:.4}], lon [{:.4}, {:.4}]",
-            final_bbox.1, final_bbox.3, final_bbox.0, final_bbox.2
-        );
-        Some(final_bbox)
-    };
-
-    let osm_data = osm_load::load_osm(
-        &args.osm_file,
-        &gtfs_data.used_route_types,
-        bbox,
-        args.skip_small_roads,
-    )?;
-
-    // 3. Match
-    let results = matcher::match_patterns(&gtfs_data, &osm_data);
+    // 2. Match Patterns (loads OSM on demand)
+    // We strictly skip processing small roads for performance unless configured otherwise
+    let results = matcher::match_patterns(&gtfs_data, &args.osm_file, args.skip_small_roads)?;
 
     // 4. Write shapes.txt
     println!("Updating shapes.txt at {:?}", shapes_path);
@@ -526,6 +469,11 @@ fn main() -> Result<()> {
 
         // If we haven't matched all routes, try to match colors from OSM relations
         // for any routes that don't have colors yet (handles case where shapes are already in place)
+        // If we haven't matched all routes, try to match colors from OSM relations
+        // for any routes that don't have colors yet (handles case where shapes are already in place)
+        // NOTE: This fallback is currently disabled because we don't load full OSM data in main anymore.
+        // If needed, we could use LightOsmData here, but we'd need to load it or get it from matcher.
+        /*
         let routes_needing_colors: ahash::AHashSet<_> = gtfs_data
             .gtfs
             .routes
@@ -540,29 +488,9 @@ fn main() -> Result<()> {
                 routes_needing_colors.len()
             );
 
-            for (pattern, trip_ids) in &gtfs_data.patterns {
-                if let Some(first_trip_id) = trip_ids.first() {
-                    if let Some(trip) = gtfs_data.gtfs.trips.get(first_trip_id) {
-                        let route_id = &trip.route_id;
-                        if !routes_needing_colors.contains(route_id) {
-                            continue;
-                        }
-                        if route_colors.contains_key(route_id) {
-                            continue;
-                        }
-
-                        // Try to find matching OSM relation for this pattern
-                        if let Some(color) =
-                            matcher::find_route_color_from_osm(&gtfs_data, &osm_data, pattern)
-                        {
-                            if let Some((bg, fg)) = color::parse_color(&color) {
-                                route_colors.insert(route_id.clone(), (bg, fg));
-                            }
-                        }
-                    }
-                }
-            }
+            // This requires osm_data which we don't have here anymore
         }
+        */
 
         println!("  Found colors for {} routes.", route_colors.len());
 

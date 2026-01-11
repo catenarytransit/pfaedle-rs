@@ -243,6 +243,11 @@ impl TileCache {
         Ok(())
     }
 
+    /// Get number of tiles currently in cache.
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Build or retrieve a tile (with disk caching if enabled).
     pub fn get(&mut self, coord: TileCoord) -> Result<Arc<TileData>> {
         if !self.cache.contains(&coord) {

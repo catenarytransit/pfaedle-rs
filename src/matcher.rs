@@ -18,13 +18,23 @@ pub struct ShapeResult {
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, ShapeResult> {
+pub fn match_patterns(
+    gtfs: &GtfsData,
+    osm_path: &std::path::Path,
+    skip_small_roads: bool,
+) -> Result<AHashMap<StopPattern, ShapeResult>, anyhow::Error> {
     use crate::mots::is_bus_like_route_type;
-    use crate::segment_matcher::SegmentMatcher;
-    use crate::tile::TileCache;
-    use std::path::Path;
+    use crate::osm_load::OsmBuilder;
+    use crate::osm_load::load_osm;
+    use crate::streaming_matcher::StreamingMatcher;
+    use anyhow::Context;
 
-    // Partition patterns: bus-like -> tiled, others -> full-graph
+    // 1. Light OSM pass for relations/colors
+    println!("Performing light OSM pass...");
+    let light_osm =
+        OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?;
+
+    // 2. Partition patterns: bus-like -> tiled, others -> full-graph
     let (bus_patterns, other_patterns): (Vec<_>, Vec<_>) = gtfs
         .patterns
         .iter()
@@ -34,62 +44,53 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
     let other_count = other_patterns.len();
 
     println!(
-        "Partitioned patterns: {} bus-like (tiled), {} other (full-graph)",
+        "Partitioned patterns: {} bus-like (streaming), {} other (full-graph)",
         bus_count, other_count
     );
 
-    // Process non-bus patterns with existing full-graph approach
+    // 3. Process non-bus patterns with existing full-graph approach
     let other_results = if other_count > 0 {
-        match_patterns_full_graph(&gtfs, osm, other_patterns)
+        println!("Loading FULL OSM graph for rail/ferry/subway matching...");
+
+        // We only load full graph if we have non-bus patterns
+        // We need to calculate BBox for these specific patterns if possible,
+        // effectively optimizing the "other" load too.
+        // For now, let's use the full bbox logic from main.rs but filtered to other_patterns.
+        // Or just load everything for "other" modes?
+        // Safety: use existing logic but restricted.
+
+        let mut types = ahash::AHashSet::new();
+        for (pattern, _) in &other_patterns {
+            if let Some(rt) = pattern.route_type {
+                types.insert(rt);
+            }
+        }
+
+        // TODO: Pass specific BBox? For now we assume rail is global/large.
+        // We reuse the load_osm from osm_load but we need to call it here.
+        let osm_data = load_osm(osm_path, &types, None, false)?; // skip_small_roads=false for rail usually?
+
+        match_patterns_full_graph(&gtfs, &osm_data, other_patterns)
     } else {
+        println!("No non-bus patterns found. Skipping full graph load.");
         AHashMap::new()
     };
 
-    // Process bus-like patterns with tiled approach
-    // NOTE: Since we already have the full graph loaded (for rail/tram), we use it directly.
-    // The "tiled" benefit would only apply if we loaded ONLY bus data from a bbox,
-    // but for mixed feeds we already have everything in memory.
-    // TODO: Future optimization - if bus-only, could use actual tiled loading.
+    // 4. Process bus-like patterns with streaming approach
     let bus_results = if bus_count > 0 {
-        use crate::hilbert::route_hilbert_index;
-
-        // Sort by Hilbert curve for cache locality in pathfinding
-        let mut bus_patterns_vec: Vec<_> = bus_patterns.into_iter().collect();
-        println!(
-            "Sorting {} bus patterns by Hilbert curve for cache locality...",
-            bus_count
-        );
-        bus_patterns_vec.sort_by_cached_key(|(pattern, _)| {
-            let coords: Vec<_> = pattern
-                .stop_ids
-                .iter()
-                .filter_map(|sid| gtfs.gtfs.stops.get(sid))
-                .filter_map(|s| {
-                    if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
-                        Some((lon, lat))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            route_hilbert_index(&coords)
-        });
-
-        println!(
-            "Processing {} bus patterns (using pre-loaded graph)...",
-            bus_count
-        );
-
-        // Use the same full-graph approach but with Hilbert-sorted order
-        match_patterns_full_graph(gtfs, osm, bus_patterns_vec)
+        // Cache size: 100 tiles * ~50MB/tile = ~5GB peak?
+        // Tiles are much smaller if stripped of buildings/etc.
+        // 100 tiles is generous. 0.5 deg tile = 50x50km.
+        let mut matcher = StreamingMatcher::new(osm_path, 100, light_osm)?;
+        matcher.match_all(gtfs, bus_patterns)
     } else {
         AHashMap::new()
     };
 
-    // Merge results
+    // 5. Merge results
     let mut results = other_results;
     results.extend(bus_results);
-    results
+    Ok(results)
 }
 
 /// Full-graph matching (original implementation for non-bus modes)
