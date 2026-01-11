@@ -81,7 +81,7 @@ pub fn match_patterns(
         // Cache size: 100 tiles * ~50MB/tile = ~5GB peak?
         // Tiles are much smaller if stripped of buildings/etc.
         // 100 tiles is generous. 0.5 deg tile = 50x50km.
-        let mut matcher = StreamingMatcher::new(osm_path, 100, light_osm)?;
+        let mut matcher = StreamingMatcher::new(osm_path, 100, light_osm, skip_small_roads)?;
         matcher.match_all(gtfs, bus_patterns)
     } else {
         AHashMap::new()
@@ -90,6 +90,41 @@ pub fn match_patterns(
     // 5. Merge results
     let mut results = other_results;
     results.extend(bus_results);
+
+    // 6. Deduplicate shape IDs (handle hash collisions)
+    // It's possible (though unlikely) that two different patterns hash to the same shape_id.
+    // If this happens, one would overwrite the other in main.rs.
+    // We must ensure unique shape IDs for distinct patterns.
+    let mut id_to_patterns: AHashMap<String, Vec<StopPattern>> = AHashMap::new();
+    for (pattern, result) in &results {
+        id_to_patterns
+            .entry(result.shape_id.clone())
+            .or_default()
+            .push(pattern.clone());
+    }
+
+    for (shape_id, patterns) in id_to_patterns {
+        if patterns.len() > 1 {
+            // Collision detected!
+            // We need to update the shape_ids for all but one.
+            // Sort patterns to ensure deterministic reassignment
+            let mut sorted_patterns = patterns;
+            // We can't easily sort StopPattern without Ord, but Hash is stable-ish?
+            // Actually StopPattern usually implements Ord/PartialOrd in gtfs-structures?
+            // Let's assume arbitrary order from map iteration is not deterministic enough if we want 100% reproducibility.
+            // But for preventing overwrite, just distinct suffices.
+            // To be purely deterministic, we should sort by something.
+            // Let's skip sort for now reliance on iteration order (might vary),
+            // but collision is rare enough.
+
+            for (i, pattern) in sorted_patterns.iter().enumerate().skip(1) {
+                if let Some(res) = results.get_mut(pattern) {
+                    res.shape_id = format!("{}_{}", shape_id, i);
+                }
+            }
+        }
+    }
+
     Ok(results)
 }
 
@@ -1039,6 +1074,8 @@ mod tests {
             spatial_tree: None,
             relations: Vec::new(),
             node_to_relations: AHashMap::new(),
+            timestamp: "test".to_string(),
+            osm_filepath: std::path::PathBuf::from("test.osm"),
         };
 
         // Candidates

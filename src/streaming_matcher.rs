@@ -28,8 +28,40 @@ impl StreamingMatcher {
     /// Create a new streaming matcher.
     /// `osm_path` is used to load tiles on demand.
     /// `cache_size` is the max number of tiles to keep in memory (e.g., 100).
-    pub fn new(osm_path: &Path, cache_size: usize, light_osm: LightOsmData) -> Result<Self> {
-        let tile_cache = TileCache::new_with_disk_cache(osm_path, cache_size)?;
+    pub fn new(
+        osm_path: &Path,
+        cache_size: usize,
+        light_osm: LightOsmData,
+        skip_small_roads: bool,
+    ) -> Result<Self> {
+        // 1. Identify Resources (Global scan)
+        use crate::osm_load::OsmBuilder;
+        let (pre_rels, ways_in_rels, ferrys, needed_nodes) =
+            OsmBuilder::identify_resources(osm_path, skip_small_roads)?;
+
+        // 2. Split PBF into tiles
+        use crate::osm_split::OsmSplitter;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        osm_path.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Cache directory for split tiles
+        let cache_dir = std::path::PathBuf::from(format!("/tmp/pfaedle-split-{:x}", hash));
+        if cache_dir.exists() {
+            // Optional: check if valid? Or just wipe?
+            // For safety in dev, let's wipe to ensure fresh logic
+            std::fs::remove_dir_all(&cache_dir).ok();
+        }
+
+        let splitter = OsmSplitter::new(osm_path, &cache_dir)?;
+        splitter.split_pbf(&needed_nodes, &ways_in_rels, &ferrys)?;
+
+        // 3. Init cache
+        let tile_cache = TileCache::new_with_split_dir(&cache_dir, cache_size)?;
+
         Ok(Self {
             tile_cache,
             light_osm: Arc::new(light_osm),

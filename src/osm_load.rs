@@ -152,63 +152,41 @@ impl LightOsmData {
 
 pub struct OsmBuilder;
 
+// Relation metadata found in Pass 1
+#[derive(Debug, Clone)]
+pub struct PreRelation {
+    pub id: i64,
+    pub tags: Tags,
+    pub members: Vec<osmpbfreader::Ref>,
+}
+
 impl OsmBuilder {
-    pub fn read(
+    pub fn identify_resources(
         path: &Path,
-        used_route_types: &AHashSet<RouteType>,
-        bbox: Option<(f64, f64, f64, f64)>, // min_lon, min_lat, max_lon, max_lat
         skip_small_roads: bool,
-    ) -> Result<OsmData> {
-        println!("Reading OSM file {:?} in multiple passes...", path);
-
-        // --- Data Structures to persist across passes ---
-
-        // Relation metadata found in Pass 1
-        struct PreRelation {
-            id: i64,
-            tags: Tags,
-            members: Vec<osmpbfreader::Ref>,
-        }
+    ) -> Result<(Vec<PreRelation>, AHashSet<i64>, AHashSet<i64>, Vec<i64>)> {
         let mut pre_relations: Vec<PreRelation> = Vec::new();
-
-        // Set of Way IDs that are members of any interesting relation.
         let mut ways_in_relations: AHashSet<i64> = AHashSet::new();
-        // Set of Way IDs that are strictly members of ferry relations.
         let mut ways_in_ferry_relations: AHashSet<i64> = AHashSet::new();
-
-        // Set of Node IDs that are required for the graph.
-        // Optimization: Use Vec and sort/dedup instead of HashSet to save memory
         let mut needed_nodes: Vec<i64> = Vec::new();
 
-        // ------------------------------------------------
-        // PASS 1: Relations
-        // Goal: Identify interesting relations (Routes), store them, and identify which Ways they need.
-        // ------------------------------------------------
         println!("Pass 1/4: Scanning relations...");
         {
             let mut pbf = Self::open_pbf(path)?;
             for obj in pbf.iter() {
                 let obj = obj.context("Error reading PBF object in Pass 1")?;
                 if let OsmObj::Relation(r) = obj {
-                    // Check if relation is interesting
                     let is_route =
                         r.tags.contains_key("route") || r.tags.contains_key("public_transport");
                     if is_route {
-                        // Store relevant info
                         for member in &r.refs {
                             if let OsmId::Way(wid) = member.member {
                                 ways_in_relations.insert(wid.0);
-                                // Check if this is a ferry relation
                                 if r.tags.get("route").map_or(false, |s| s == "ferry") {
                                     ways_in_ferry_relations.insert(wid.0);
                                 }
                             } else if let OsmId::Node(nid) = member.member {
-                                needed_nodes.push(nid.0); // Direct node members
-                            } else if let OsmId::Relation(_rid) = member.member {
-                                // Relation member - we will handle flattening later,
-                                // but we don't need to add ID to 'needed' sets here,
-                                // because we already iterate ALL relations.
-                                // However, we must ensure we KEEP this member in the PreRelation.
+                                needed_nodes.push(nid.0);
                             }
                         }
 
@@ -227,10 +205,6 @@ impl OsmBuilder {
             ways_in_relations.len()
         );
 
-        // ------------------------------------------------
-        // PASS 2: Ways (Discovery)
-        // Goal: For every 'infrastructure' way OR 'relation-member' way, mark its nodes as needed.
-        // ------------------------------------------------
         println!("Pass 2/4: Scanning ways to identify needed nodes...");
         {
             let mut pbf = Self::open_pbf(path)?;
@@ -241,7 +215,6 @@ impl OsmBuilder {
                     let is_infra =
                         Self::is_infrastructure(&w) || ways_in_ferry_relations.contains(&wid);
                     let is_platform = Self::is_platform(&w);
-                    // Pass 2: We only care about relation members if they are valid geometry (not platforms)
                     let is_rel_member = ways_in_relations.contains(&wid) && !is_platform;
 
                     if skip_small_roads && is_infra && !is_rel_member {
@@ -259,8 +232,6 @@ impl OsmBuilder {
                         if !Self::is_valid_way(&w) {
                             continue;
                         }
-
-                        // Mark all nodes as needed
                         for nid in &w.nodes {
                             needed_nodes.push(nid.0);
                         }
@@ -268,14 +239,33 @@ impl OsmBuilder {
                 }
             }
         }
-        // Sort and deduplicate needed_nodes
+
         println!("  Sorting {} needed nodes...", needed_nodes.len());
-        needed_nodes.par_sort_unstable(); // Use parallel sort if available or unstable
+        needed_nodes.par_sort_unstable();
         needed_nodes.dedup();
         println!(
             "  Identified {} unique nodes needed for the graph.",
             needed_nodes.len()
         );
+
+        Ok((
+            pre_relations,
+            ways_in_relations,
+            ways_in_ferry_relations,
+            needed_nodes,
+        ))
+    }
+
+    pub fn read(
+        path: &Path,
+        used_route_types: &AHashSet<RouteType>,
+        bbox: Option<(f64, f64, f64, f64)>, // min_lon, min_lat, max_lon, max_lat
+        skip_small_roads: bool,
+    ) -> Result<OsmData> {
+        println!("Reading OSM file {:?} in multiple passes...", path);
+
+        let (pre_relations, ways_in_relations, ways_in_ferry_relations, mut needed_nodes) =
+            Self::identify_resources(path, skip_small_roads)?;
 
         // ------------------------------------------------
         // PASS 3: Nodes
@@ -779,11 +769,11 @@ impl OsmBuilder {
         tags.get(key).map(|s| s.as_str()) == Some(val)
     }
 
-    fn is_valid_way(w: &osmpbfreader::Way) -> bool {
+    pub fn is_valid_way(w: &osmpbfreader::Way) -> bool {
         w.nodes.len() > 1
     }
 
-    fn is_infrastructure(w: &osmpbfreader::Way) -> bool {
+    pub fn is_infrastructure(w: &osmpbfreader::Way) -> bool {
         if Self::is_platform(w) {
             return false;
         }
@@ -804,7 +794,7 @@ impl OsmBuilder {
         w.tags.contains_key("railway") || w.tags.contains_key("highway")
     }
 
-    fn is_platform(w: &osmpbfreader::Way) -> bool {
+    pub fn is_platform(w: &osmpbfreader::Way) -> bool {
         if let Some(r) = w.tags.get("railway") {
             if r == "platform" || r == "stop" || r == "platform_edge" {
                 return true;
@@ -818,7 +808,7 @@ impl OsmBuilder {
         false
     }
 
-    fn classify_way(
+    pub fn classify_way(
         w: &osmpbfreader::Way,
         ferry_ways: &AHashSet<i64>,
     ) -> (bool, bool, bool, bool, bool, bool) {

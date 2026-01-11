@@ -5,6 +5,7 @@ mod hilbert;
 mod matcher;
 mod mots;
 mod osm_load;
+mod osm_split;
 mod pathfinding;
 mod router;
 mod segment_matcher;

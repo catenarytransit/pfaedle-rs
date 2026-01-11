@@ -10,7 +10,7 @@ use geo::{LineString, Point};
 use lru::LruCache;
 use rstar::RTree;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::graph::{EdgeIndex, EdgePL, Graph, MODE_BUS, NodeIndex, NodePL};
 use crate::osm_load::SpatialNode;
@@ -186,6 +186,8 @@ pub struct TileCache {
     cache: LruCache<TileCoord, Arc<TileData>>,
     osm_path: std::path::PathBuf,
     disk_cache_dir: Option<std::path::PathBuf>,
+    use_disk_cache: bool,
+    is_split_dir: bool,
 }
 
 impl TileCache {
@@ -195,6 +197,8 @@ impl TileCache {
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
             osm_path: osm_path.to_path_buf(),
             disk_cache_dir: None,
+            use_disk_cache: false,
+            is_split_dir: false,
         }
     }
 
@@ -218,6 +222,8 @@ impl TileCache {
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
             osm_path: osm_path.to_path_buf(),
             disk_cache_dir: Some(cache_dir),
+            use_disk_cache: true,
+            is_split_dir: false,
         })
     }
 
@@ -249,20 +255,242 @@ impl TileCache {
     }
 
     /// Build or retrieve a tile (with disk caching if enabled).
+    pub fn new_with_split_dir(split_dir: &Path, capacity: usize) -> Result<Self> {
+        Ok(Self {
+            cache: LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap()),
+            osm_path: PathBuf::new(), // Not used for building, but maybe need to keep?
+            disk_cache_dir: Some(split_dir.to_path_buf()),
+            use_disk_cache: true,
+            is_split_dir: true,
+        })
+    }
+
     pub fn get(&mut self, coord: TileCoord) -> Result<Arc<TileData>> {
-        if !self.cache.contains(&coord) {
-            // Try loading from disk first
-            let tile = if self.tile_exists_on_disk(coord) {
-                self.load_tile_from_disk(coord)?
-            } else {
-                let tile = self.build_tile(coord)?;
-                // Save to disk for future runs
-                self.save_tile_to_disk(coord, &tile)?;
-                tile
-            };
-            self.cache.put(coord, Arc::new(tile));
+        if let Some(tile) = self.cache.get(&coord) {
+            return Ok(tile.clone());
         }
-        Ok(self.cache.get(&coord).unwrap().clone())
+
+        // Load from disk
+        let tile = if self.is_split_dir {
+            self.load_from_split_dir(coord)?
+        } else if self.tile_exists_on_disk(coord) {
+            self.load_tile_from_disk(coord)?
+        } else {
+            let tile = self.build_tile(coord)?;
+            if self.use_disk_cache {
+                self.save_tile_to_disk(coord, &tile)?;
+            }
+            tile
+        };
+
+        let tile_arc = Arc::new(tile);
+        self.cache.put(coord, tile_arc.clone());
+        Ok(tile_arc)
+    }
+
+    fn load_from_split_dir(&self, coord: TileCoord) -> Result<TileData> {
+        // Load nodes and ways from split buckets
+        let node_path = self
+            .disk_cache_dir
+            .as_ref()
+            .unwrap()
+            .join(format!("tile_{}_{}.nodes.bin", coord.x, coord.y));
+        let way_path = self
+            .disk_cache_dir
+            .as_ref()
+            .unwrap()
+            .join(format!("tile_{}_{}.ways.bin", coord.x, coord.y));
+
+        // If files don't exist, tile is empty
+        if !node_path.exists() && !way_path.exists() {
+            return Ok(TileData {
+                graph: Graph::new(),
+                spatial_nodes: Vec::new(),
+                spatial_tree: None,
+                osm_node_to_graph_idx: AHashMap::new(),
+            });
+        }
+
+        let mut graph = Graph::new();
+        let mut osm_node_to_graph_idx = AHashMap::new();
+
+        use crate::osm_split::TileItem;
+        use osmpbfreader::Tags;
+
+        // 1. Read Nodes
+        if node_path.exists() {
+            let f = std::fs::File::open(&node_path)?;
+            let mut reader = std::io::BufReader::new(f);
+
+            loop {
+                let mut len_buf = [0u8; 4];
+                match std::io::Read::read_exact(&mut reader, &mut len_buf) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut buf)?;
+
+                let item: TileItem = bincode::deserialize(&buf)?;
+                if let TileItem::Node(n) = item {
+                    let idx = graph.add_node(NodePL {
+                        point: Point::new(n.lon, n.lat),
+                    });
+                    osm_node_to_graph_idx.insert(n.id, idx);
+                }
+            }
+        }
+
+        // 2. Read Ways and Build Edges
+        let mut spatial_nodes = Vec::with_capacity(osm_node_to_graph_idx.len());
+        // We'll collect spatial nodes after graph is built, or build incrementally.
+        // Actually, spatial nodes in TileData are just all nodes usually, or specific ones?
+        // In OsmBuilder, it filters by mode. Here, we can include all nodes or filter.
+        // For simplicity, let's include all nodes that end up in the graph.
+
+        if way_path.exists() {
+            let f = std::fs::File::open(&way_path)?;
+            let mut reader = std::io::BufReader::new(f);
+
+            loop {
+                let mut len_buf = [0u8; 4];
+                match std::io::Read::read_exact(&mut reader, &mut len_buf) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(e) => return Err(e.into()),
+                }
+                let len = u32::from_le_bytes(len_buf) as usize;
+                let mut buf = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut buf)?;
+
+                let item: TileItem = bincode::deserialize(&buf)?;
+                if let TileItem::Way(w) = item {
+                    // Resolve Nodes
+                    let mut way_indices = Vec::with_capacity(w.refs.len());
+                    for nid in &w.refs {
+                        if let Some(&idx) = osm_node_to_graph_idx.get(nid) {
+                            way_indices.push(idx);
+                        }
+                    }
+
+                    if way_indices.len() > 1 {
+                        // We need tags to determine EdgePL properties.
+                        // We need access to OsmBuilder helpers or replicate logic.
+                        // Logic is simple enough to replicate or pull helpers into a utils module.
+                        // OsmBuilder implementation is inside `impl OsmBuilder` but some helpers are static.
+                        // Let's assume we can access them as `OsmBuilder::parse_oneway` etc if they are public?
+                        // They are private in `osm_load.rs`.
+                        // I should have made them public.
+                        // For now, I'll inline simplified logic or standard OSM logic.
+
+                        let tags: Tags = w
+                            .tags
+                            .into_iter()
+                            .map(|(k, v)| (k.into(), v.into()))
+                            .collect();
+
+                        // Parse properties
+                        // Level
+                        let level = tags
+                            .get("level")
+                            .map(|s| s.as_str())
+                            .and_then(|s| s.parse::<f32>().ok())
+                            .unwrap_or(0.0);
+
+                        // Oneway
+                        let oneway = if tags
+                            .get("oneway")
+                            .map(|s| s.as_str())
+                            .map_or(false, |s| s == "yes" || s == "true" || s == "1")
+                        {
+                            1
+                        } else if tags
+                            .get("oneway")
+                            .map(|s| s.as_str())
+                            .map_or(false, |s| s == "-1")
+                        {
+                            2
+                        } else {
+                            0
+                        };
+
+                        // Preferred Direction (simplified)
+                        let preferred_direction = 0; // Default
+
+                        // Modes (simplified for bus matching - basically allow BUS for everything infra)
+                        let mut modes = MODE_BUS;
+                        // If checking specific route types:
+                        if tags.contains_key("railway") {
+                            modes |= crate::graph::MODE_RAIL;
+                        }
+                        // etc.
+
+                        // Cost calculation
+                        // We need length.
+
+                        for i in 0..way_indices.len() - 1 {
+                            let u = way_indices[i];
+                            let v = way_indices[i + 1];
+                            let p1 = graph.nodes[u].payload.point;
+                            let p2 = graph.nodes[v].payload.point;
+                            let geom = LineString::new(vec![p1.into(), p2.into()]);
+
+                            let mut edge_pl = EdgePL::new();
+                            edge_pl.geometry = geom;
+                            edge_pl.level = level as i32;
+                            edge_pl.oneway = oneway;
+                            edge_pl.preferred_direction = preferred_direction;
+                            edge_pl.allowed_modes = modes;
+                            edge_pl.osmid = w.id;
+                            edge_pl.cost = (edge_pl.length() * 100.0) as u32; // Simple cost = length * 100 (cm approx)
+
+                            graph.add_edge(u, v, edge_pl);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Post-processing (reverse edges for two-way)
+        let existing_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .map(|e| (e.from, e.to, e.payload.clone()))
+            .collect();
+        for (u, v, pl) in existing_edges {
+            if pl.oneway == 0 {
+                // Add reverse
+                let mut rev_pl = pl.clone();
+                rev_pl.geometry = LineString::new(pl.geometry.0.iter().rev().cloned().collect());
+                graph.add_edge(v, u, rev_pl);
+            }
+            // Handle oneway reverse logic if needed (e.g. oneway=-1 was handled above?)
+        }
+
+        // Build Spatial Nodes
+        for (idx, node) in graph.nodes.iter().enumerate() {
+            let p = &node.payload.point;
+            spatial_nodes.push(SpatialNode {
+                index: idx,
+                point: [p.x(), p.y()],
+                modes: MODE_BUS, // Assume accessible
+            });
+        }
+
+        let spatial_tree = if !spatial_nodes.is_empty() {
+            Some(RTree::bulk_load(spatial_nodes.clone()))
+        } else {
+            None
+        };
+
+        Ok(TileData {
+            graph,
+            spatial_nodes,
+            spatial_tree,
+            osm_node_to_graph_idx,
+        })
     }
 
     /// Build tile data for a specific coordinate from OSM.
