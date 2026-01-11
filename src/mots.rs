@@ -93,6 +93,20 @@ pub fn map_route_type_to_category(rt: RouteType) -> MotCategory {
     }
 }
 
+/// Check if a route type should use tiled processing (bus-like modes only).
+/// Trams are excluded as they use dedicated track infrastructure.
+pub fn is_bus_like_route_type(rt: RouteType) -> bool {
+    matches!(
+        rt,
+        RouteType::Bus | RouteType::Coach | RouteType::Other(11) | RouteType::Other(800)
+    )
+}
+
+/// Check if a MOT category should use tiled processing.
+pub fn is_bus_like(cat: MotCategory) -> bool {
+    matches!(cat, MotCategory::Bus | MotCategory::Coach | MotCategory::Trolleybus)
+}
+
 fn map_extended_route_type(t: i32) -> MotCategory {
     match t {
         // Specific overrides (handle before ranges)

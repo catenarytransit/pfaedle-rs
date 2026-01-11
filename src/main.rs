@@ -1,11 +1,14 @@
 mod color;
 mod graph;
 mod gtfs_load;
+mod hilbert;
 mod matcher;
 mod mots;
 mod osm_load;
 mod pathfinding;
 mod router;
+mod segment_matcher;
+mod tile;
 
 use ahash::AHashMap;
 use anyhow::{Context, Result};

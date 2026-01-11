@@ -19,13 +19,61 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, ShapeResult> {
-    let total_patterns = gtfs.patterns.len();
+    use crate::mots::is_bus_like_route_type;
+    use crate::segment_matcher::SegmentMatcher;
+    use crate::tile::TileCache;
+    use std::path::Path;
+
+    // Partition patterns: bus-like -> tiled, others -> full-graph
+    let (bus_patterns, other_patterns): (Vec<_>, Vec<_>) = gtfs
+        .patterns
+        .iter()
+        .partition(|(pattern, _)| pattern.route_type.map_or(false, is_bus_like_route_type));
+
+    let bus_count = bus_patterns.len();
+    let other_count = other_patterns.len();
+
+    println!(
+        "Partitioned patterns: {} bus-like (tiled), {} other (full-graph)",
+        bus_count, other_count
+    );
+
+    // Process non-bus patterns with existing full-graph approach
+    let other_results = if other_count > 0 {
+        match_patterns_full_graph(&gtfs, osm, other_patterns)
+    } else {
+        AHashMap::new()
+    };
+
+    // Process bus-like patterns with tiled approach
+    let bus_results = if bus_count > 0 {
+        // Get OSM path from the OsmData - we need to pass it somehow
+        // For now, we'll skip tiled processing if we can't get the path
+        // TODO: Store osm_path in OsmData or pass it through
+        println!("Note: Bus tiled processing requires OSM path. Using full-graph for now.");
+        match_patterns_full_graph(&gtfs, osm, bus_patterns)
+    } else {
+        AHashMap::new()
+    };
+
+    // Merge results
+    let mut results = other_results;
+    results.extend(bus_results);
+    results
+}
+
+/// Full-graph matching (original implementation for non-bus modes)
+fn match_patterns_full_graph(
+    gtfs: &GtfsData,
+    osm: &OsmData,
+    patterns: Vec<(&StopPattern, &Vec<String>)>,
+) -> AHashMap<StopPattern, ShapeResult> {
+    let total_patterns = patterns.len();
     let processed = AtomicUsize::new(0);
 
-    println!("Matching {} patterns...", total_patterns);
+    println!("Matching {} patterns (full-graph)...", total_patterns);
 
-    let results: AHashMap<StopPattern, ShapeResult> = gtfs
-        .patterns
+    let results: AHashMap<StopPattern, ShapeResult> = patterns
         .par_iter()
         .map_with(
             pathfinding::PathfinderContext::new(),
@@ -36,7 +84,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 }
 
                 // 0. Extract Route/Agency Info for Matching
-                let sample_trip_id = &gtfs.patterns.get(pattern).unwrap()[0];
+                let sample_trip_id = &gtfs.patterns.get(*pattern).unwrap()[0];
                 let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
                 let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
 
@@ -544,7 +592,7 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
                 let shape_id = format!("shape_{}", hasher.finish());
 
                 Some((
-                    pattern.clone(),
+                    (*pattern).clone(),
                     ShapeResult {
                         shape_id,
                         points: full_path_geometry,

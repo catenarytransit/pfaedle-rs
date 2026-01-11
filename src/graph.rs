@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use geo::{HaversineLength, LineString, Point};
+use serde::{Deserialize, Serialize};
 
 pub type NodeIndex = usize;
 pub type EdgeIndex = usize;
@@ -11,20 +12,20 @@ pub const MODE_BUS: u8 = 8;
 pub const MODE_FERRY: u8 = 16;
 pub const MODE_GONDOLA: u8 = 32;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node<N> {
     pub payload: N,
     pub edges: Vec<EdgeIndex>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Edge<E> {
     pub payload: E,
     pub from: NodeIndex,
     pub to: NodeIndex,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Graph<N, E> {
     pub nodes: Vec<Node<N>>,
     pub edges: Vec<Edge<E>>,
@@ -74,12 +75,12 @@ impl<N, E> Graph<N, E> {
 
 // Payloads corresponding to pfaedle's netgraph
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodePL {
     pub point: Point<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TransitInfo {
     pub short_name: String,
     pub from_str: String,
@@ -87,7 +88,7 @@ pub struct TransitInfo {
     pub operator: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgePL {
     pub geometry: LineString<f64>,
     pub lines: Vec<TransitInfo>,
