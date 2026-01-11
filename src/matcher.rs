@@ -46,23 +46,15 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
     };
 
     // Process bus-like patterns with tiled approach
+    // NOTE: Since we already have the full graph loaded (for rail/tram), we use it directly.
+    // The "tiled" benefit would only apply if we loaded ONLY bus data from a bbox,
+    // but for mixed feeds we already have everything in memory.
+    // TODO: Future optimization - if bus-only, could use actual tiled loading.
     let bus_results = if bus_count > 0 {
         use crate::hilbert::route_hilbert_index;
-        use std::sync::{Arc, Mutex};
 
-        println!("Initializing tile cache (tiled bus mode)...");
-        let tile_cache = Arc::new(Mutex::new(
-            TileCache::new_with_disk_cache(&osm.osm_filepath, 50).unwrap_or_else(|e| {
-                eprintln!(
-                    "Warning: Failed to create disk cache: {}. Using memory only.",
-                    e
-                );
-                TileCache::new(&osm.osm_filepath, 50)
-            }),
-        ));
-
+        // Sort by Hilbert curve for cache locality in pathfinding
         let mut bus_patterns_vec: Vec<_> = bus_patterns.into_iter().collect();
-
         println!(
             "Sorting {} bus patterns by Hilbert curve for cache locality...",
             bus_count
@@ -83,91 +75,13 @@ pub fn match_patterns(gtfs: &GtfsData, osm: &OsmData) -> AHashMap<StopPattern, S
             route_hilbert_index(&coords)
         });
 
-        println!("Processing bus patterns (tiled)...");
-        let total = bus_count;
-        let counter = AtomicUsize::new(0);
+        println!(
+            "Processing {} bus patterns (using pre-loaded graph)...",
+            bus_count
+        );
 
-        let results: AHashMap<StopPattern, ShapeResult> = bus_patterns_vec
-            .into_iter()
-            .filter_map(|(pattern, _)| {
-                let idx = counter.fetch_add(1, Ordering::Relaxed);
-                if idx % 50 == 0 {
-                    use std::io::Write;
-                    print!("\r  Pattern: {}/{}", idx, total);
-                    let _ = std::io::stdout().flush();
-                }
-
-                // Get stop coordinates
-                let stop_coords: Vec<Point<f64>> = pattern
-                    .stop_ids
-                    .iter()
-                    .filter_map(|sid| gtfs.gtfs.stops.get(sid))
-                    .filter_map(|s| {
-                        if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
-                            Some(Point::new(lon, lat))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                if stop_coords.len() < 2 {
-                    return None;
-                }
-
-                // Metadata for preferred match
-                let sample_trip_id = gtfs.patterns.get(pattern)?.first()?;
-                let trip = gtfs.gtfs.trips.get(sample_trip_id)?;
-                let route = gtfs.gtfs.routes.get(&trip.route_id)?;
-
-                let agency_name = route.agency_id.as_ref().and_then(|agency_id| {
-                    gtfs.gtfs
-                        .agencies
-                        .iter()
-                        .find(|a| a.id.as_ref() == Some(agency_id))
-                        .map(|a| a.name.to_lowercase())
-                });
-
-                let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
-                let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
-
-                let preferred_match = TransitMatch {
-                    short_name: route_short_name,
-                    long_name: route_long_name,
-                    operator: agency_name,
-                };
-
-                // Match using tiled approach
-                let mut cache_guard = tile_cache.lock().unwrap();
-                let mut matcher = SegmentMatcher::new(&mut *cache_guard);
-                let geometry_opt = matcher.match_route(&stop_coords, Some(&preferred_match));
-                drop(cache_guard);
-
-                // Generate shape ID (consistent with full-graph)
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                pattern.hash(&mut hasher);
-                let shape_id = format!("shape_{}", hasher.finish());
-
-                let points = geometry_opt.unwrap_or_else(|| {
-                    // Fallback: straight line through stops
-                    stop_coords.iter().map(|p| (p.y(), p.x())).collect()
-                });
-
-                Some((
-                    pattern.clone(),
-                    ShapeResult {
-                        shape_id,
-                        points,
-                        matched_route_color: None,
-                    },
-                ))
-            })
-            .collect();
-
-        println!("\r  Pattern: {}/{} - Done.", total, total);
-        results
+        // Use the same full-graph approach but with Hilbert-sorted order
+        match_patterns_full_graph(gtfs, osm, bus_patterns_vec)
     } else {
         AHashMap::new()
     };
