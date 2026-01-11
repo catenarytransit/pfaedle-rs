@@ -908,6 +908,157 @@ fn match_sequence_globally_optimal(
 
     None
 }
+
+/// Find route color from OSM relations without computing shapes.
+/// Used when shapes are already in place but colors need to be matched.
+pub fn find_route_color_from_osm(
+    gtfs: &GtfsData,
+    osm: &OsmData,
+    pattern: &StopPattern,
+) -> Option<String> {
+    // Get route metadata for matching
+    let sample_trip_id = gtfs.patterns.get(pattern)?.first()?;
+    let trip = gtfs.gtfs.trips.get(sample_trip_id)?;
+    let route = gtfs.gtfs.routes.get(&trip.route_id)?;
+
+    let agency_name = route.agency_id.as_ref().and_then(|agency_id| {
+        gtfs.gtfs
+            .agencies
+            .iter()
+            .find(|a| a.id.as_ref() == Some(agency_id))
+            .map(|a| a.name.to_lowercase())
+    });
+
+    let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
+    let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
+
+    // Find stop coordinates
+    let stop_coords: Vec<Point<f64>> = pattern
+        .stop_ids
+        .iter()
+        .filter_map(|sid| gtfs.gtfs.stops.get(sid))
+        .filter_map(|s| {
+            if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
+                Some(Point::new(lon, lat))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if stop_coords.len() < 2 {
+        return None;
+    }
+
+    let index = osm.spatial_tree.as_ref()?;
+
+    // Determine allowed modes
+    let allowed_modes = match pattern.route_type {
+        Some(RouteType::Tramway) => MODE_TRAM,
+        Some(RouteType::Subway) => MODE_SUBWAY,
+        Some(RouteType::Rail) => MODE_RAIL,
+        Some(RouteType::Ferry) => MODE_FERRY,
+        Some(RouteType::Gondola) | Some(RouteType::Funicular) | Some(RouteType::CableCar) => {
+            MODE_GONDOLA
+        }
+        _ => MODE_BUS,
+    };
+
+    // Score relations based on stop coverage
+    let mut relation_scores: AHashMap<usize, f64> = AHashMap::new();
+
+    for point in &stop_coords {
+        let neighbors = index
+            .nearest_neighbor_iter(&[point.x(), point.y()])
+            .filter(|sn| (sn.modes & allowed_modes) != 0)
+            .take(50);
+
+        let mut seen_for_stop = AHashSet::new();
+        for sn in neighbors {
+            let node_idx = sn.index;
+            if let Some(rels) = osm.node_to_relations.get(&node_idx) {
+                for &r_idx in rels {
+                    if seen_for_stop.insert(r_idx) {
+                        *relation_scores.entry(r_idx).or_insert(0.0) += 1.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // Find best matching relation with color
+    let min_coverage = (stop_coords.len() as f64) * 0.5; // At least 50% stops covered
+
+    let mut candidates: Vec<_> = relation_scores
+        .iter()
+        .filter(|(_, score)| **score >= min_coverage)
+        .filter(|(r_idx, _)| osm.relations[**r_idx].tags.contains_key("colour"))
+        .collect();
+
+    // Sort by match score (name/operator match) + coverage
+    candidates.sort_by(|(a_idx, a_score), (b_idx, b_score)| {
+        let get_match_score = |r_idx: usize| -> u8 {
+            let rel = &osm.relations[r_idx];
+            let mut match_score = 0;
+
+            let osm_names = [
+                rel.tags.get("ref"),
+                rel.tags.get("name"),
+                rel.tags.get("official_name"),
+                rel.tags.get("alt_name"),
+            ];
+
+            for osm_name_opt in osm_names {
+                if let Some(osm_name) = osm_name_opt {
+                    let osm_val = osm_name.to_lowercase();
+                    if let Some(ref gtfs_short) = route_short_name {
+                        if osm_val.contains(gtfs_short) || gtfs_short.contains(&osm_val) {
+                            match_score += 2;
+                            break;
+                        }
+                    }
+                    if let Some(ref gtfs_long) = route_long_name {
+                        if osm_val.contains(gtfs_long) || gtfs_long.contains(&osm_val) {
+                            match_score += 2;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(target_op) = &agency_name {
+                if let Some(osm_op) = rel.tags.get("operator") {
+                    if osm_op.to_lowercase().contains(target_op)
+                        || target_op.contains(&osm_op.to_lowercase())
+                    {
+                        match_score += 1;
+                    }
+                }
+            }
+
+            match_score
+        };
+
+        let match_a = get_match_score(**a_idx);
+        let match_b = get_match_score(**b_idx);
+
+        match_b.cmp(&match_a).then_with(|| {
+            b_score
+                .partial_cmp(a_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    // Return color from best match
+    for (r_idx, _) in candidates {
+        if let Some(color) = osm.relations[*r_idx].tags.get("colour") {
+            return Some(color.to_string());
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

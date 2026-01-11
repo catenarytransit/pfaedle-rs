@@ -22,9 +22,8 @@ pub fn parse_color(input: &str) -> Option<(String, String)> {
         }
     };
 
-    let lum = 0.2126 * linear(color.red)
-        + 0.7152 * linear(color.green)
-        + 0.0722 * linear(color.blue);
+    let lum =
+        0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue);
 
     // Determine foreground color based on the highest contrast ratio.
     // Ratio formula: (L1 + 0.05) / (L2 + 0.05), where L is relative luminance.

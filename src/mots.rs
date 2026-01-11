@@ -104,7 +104,10 @@ pub fn is_bus_like_route_type(rt: RouteType) -> bool {
 
 /// Check if a MOT category should use tiled processing.
 pub fn is_bus_like(cat: MotCategory) -> bool {
-    matches!(cat, MotCategory::Bus | MotCategory::Coach | MotCategory::Trolleybus)
+    matches!(
+        cat,
+        MotCategory::Bus | MotCategory::Coach | MotCategory::Trolleybus
+    )
 }
 
 fn map_extended_route_type(t: i32) -> MotCategory {

@@ -504,7 +504,8 @@ fn main() -> Result<()> {
         println!("Updating routes.txt with colors...");
         // 1. Build map route_id -> (bg_color, fg_color)
         let mut route_colors = ahash::AHashMap::new();
-        // Iterate over results: stop_pattern -> shape_result
+
+        // First, try to get colors from computed results
         for (pattern, shape_res) in &results {
             if let Some(raw_color) = &shape_res.matched_route_color {
                 // Parse color
@@ -515,9 +516,6 @@ fn main() -> Result<()> {
                         if let Some(first_trip_id) = trip_ids.first() {
                             if let Some(trip) = gtfs_data.gtfs.trips.get(first_trip_id) {
                                 let route_id = &trip.route_id;
-                                // Insert if not present. Maybe overwrite?
-                                // If multiple patterns map to same route but different colors, we have ambiguity.
-                                // First one wins for now.
                                 route_colors.entry(route_id.clone()).or_insert((bg, fg));
                             }
                         }
@@ -525,6 +523,48 @@ fn main() -> Result<()> {
                 }
             }
         }
+
+        // If we haven't matched all routes, try to match colors from OSM relations
+        // for any routes that don't have colors yet (handles case where shapes are already in place)
+        let routes_needing_colors: ahash::AHashSet<_> = gtfs_data
+            .gtfs
+            .routes
+            .keys()
+            .filter(|rid| !route_colors.contains_key(*rid))
+            .cloned()
+            .collect();
+
+        if !routes_needing_colors.is_empty() {
+            println!(
+                "  Matching colors for {} routes without computed shapes...",
+                routes_needing_colors.len()
+            );
+
+            for (pattern, trip_ids) in &gtfs_data.patterns {
+                if let Some(first_trip_id) = trip_ids.first() {
+                    if let Some(trip) = gtfs_data.gtfs.trips.get(first_trip_id) {
+                        let route_id = &trip.route_id;
+                        if !routes_needing_colors.contains(route_id) {
+                            continue;
+                        }
+                        if route_colors.contains_key(route_id) {
+                            continue;
+                        }
+
+                        // Try to find matching OSM relation for this pattern
+                        if let Some(color) =
+                            matcher::find_route_color_from_osm(&gtfs_data, &osm_data, pattern)
+                        {
+                            if let Some((bg, fg)) = color::parse_color(&color) {
+                                route_colors.insert(route_id.clone(), (bg, fg));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("  Found colors for {} routes.", route_colors.len());
 
         // 2. Read/Update routes.txt
         let routes_path = args.gtfs_dir.join("routes.txt");
