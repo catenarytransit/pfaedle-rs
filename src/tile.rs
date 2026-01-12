@@ -94,7 +94,14 @@ pub fn compute_corridor_tiles(p1: Point<f64>, p2: Point<f64>) -> Vec<TileCoord> 
     let t2 = TileCoord::from_point(p2.x(), p2.y());
 
     if t1 == t2 {
-        return vec![t1];
+        // Ensure we cover edges of the tile by including cross-neighbors
+        return vec![
+            t1,
+            TileCoord { x: t1.x - 1, y: t1.y },
+            TileCoord { x: t1.x + 1, y: t1.y },
+            TileCoord { x: t1.x, y: t1.y - 1 },
+            TileCoord { x: t1.x, y: t1.y + 1 },
+        ];
     }
 
     let mut tiles = Vec::new();
