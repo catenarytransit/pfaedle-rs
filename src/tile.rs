@@ -87,6 +87,16 @@ impl TileCoord {
     }
 }
 
+fn cross_neighbors(t: TileCoord) -> [TileCoord; 5] {
+    [
+        t,
+        TileCoord { x: t.x - 1, y: t.y },
+        TileCoord { x: t.x + 1, y: t.y },
+        TileCoord { x: t.x, y: t.y - 1 },
+        TileCoord { x: t.x, y: t.y + 1 },
+    ]
+}
+
 /// Compute the corridor of tiles between two points.
 /// Uses Bresenham-like line algorithm on tile grid.
 pub fn compute_corridor_tiles(p1: Point<f64>, p2: Point<f64>) -> Vec<TileCoord> {
@@ -95,13 +105,7 @@ pub fn compute_corridor_tiles(p1: Point<f64>, p2: Point<f64>) -> Vec<TileCoord> 
 
     if t1 == t2 {
         // Ensure we cover edges of the tile by including cross-neighbors
-        return vec![
-            t1,
-            TileCoord { x: t1.x - 1, y: t1.y },
-            TileCoord { x: t1.x + 1, y: t1.y },
-            TileCoord { x: t1.x, y: t1.y - 1 },
-            TileCoord { x: t1.x, y: t1.y + 1 },
-        ];
+        return cross_neighbors(t1).to_vec();
     }
 
     let mut tiles = Vec::new();
@@ -124,13 +128,7 @@ pub fn compute_corridor_tiles(p1: Point<f64>, p2: Point<f64>) -> Vec<TileCoord> 
         .iter()
         .flat_map(|t| {
             // Include tile and immediate neighbors perpendicular to path
-            vec![
-                *t,
-                TileCoord { x: t.x - 1, y: t.y },
-                TileCoord { x: t.x + 1, y: t.y },
-                TileCoord { x: t.x, y: t.y - 1 },
-                TileCoord { x: t.x, y: t.y + 1 },
-            ]
+            cross_neighbors(*t)
         })
         .collect();
 
