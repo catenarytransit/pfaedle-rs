@@ -33,8 +33,8 @@ fn xy_to_hilbert(order: u32, x: u32, y: u32) -> u64 {
         // Rotate quadrant
         if ry == 0 {
             if rx == 1 {
-                x = (s - 1) - x;
-                y = (s - 1) - y;
+                x = (n - 1) - x;
+                y = (n - 1) - y;
             }
             std::mem::swap(&mut x, &mut y);
         }
