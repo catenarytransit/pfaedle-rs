@@ -116,7 +116,7 @@ pub fn match_patterns(
         // Cache size: 100 tiles * ~50MB/tile = ~5GB peak?
         // Tiles are much smaller if stripped of buildings/etc.
         // 100 tiles is generous. 0.5 deg tile = 50x50km.
-        let mut matcher = StreamingMatcher::new(osm_path, 100, light_osm, skip_small_roads)?;
+        let mut matcher = StreamingMatcher::new(osm_path, 50, light_osm, skip_small_roads)?;
         matcher.match_all(gtfs, bus_patterns)
     } else {
         AHashMap::new()

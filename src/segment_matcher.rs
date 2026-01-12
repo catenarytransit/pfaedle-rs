@@ -40,6 +40,7 @@ impl<'a> SegmentMatcher<'a> {
     }
 
     /// Match a complete route by joining segments.
+    /// DEPRECATED: Use match_route_preloaded for better performance.
     pub fn match_route(
         &mut self,
         stop_coords: &[Point<f64>],
@@ -70,6 +71,57 @@ impl<'a> SegmentMatcher<'a> {
 
         Some(full_geometry)
     }
+
+    /// Match a complete route using a single preloaded merged graph.
+    /// This is MUCH faster than match_route because it:
+    /// 1. Computes all required tiles upfront for the entire route
+    /// 2. Merges them once into a single graph
+    /// 3. Pathfinds all segments within that unified graph
+    pub fn match_route_preloaded(
+        &mut self,
+        stop_coords: &[Point<f64>],
+        preferred_match: Option<&TransitMatch>,
+    ) -> Option<Vec<(f64, f64)>> {
+        if stop_coords.len() < 2 {
+            return None;
+        }
+
+        // Load all tiles needed for entire route at once
+        let merged = self.tile_cache.get_for_route(stop_coords).ok()?;
+
+        let mut full_geometry = Vec::new();
+
+        // Add first stop
+        full_geometry.push((stop_coords[0].y(), stop_coords[0].x()));
+
+        for window in stop_coords.windows(2) {
+            let p1 = window[0];
+            let p2 = window[1];
+
+            // Pathfind within the unified graph
+            if let Some(segment) = self.pathfind_in_merged(&merged, p1, p2, preferred_match) {
+                full_geometry.extend(segment.geometry.into_iter().skip(1));
+            } else {
+                // Fallback: straight line
+                full_geometry.push((p2.y(), p2.x()));
+            }
+        }
+
+        Some(full_geometry)
+    }
+
+    /// Pathfind between two points using a pre-merged graph (Arc version).
+    fn pathfind_in_merged(
+        &mut self,
+        merged: &std::sync::Arc<MergedTileData>,
+        p1: Point<f64>,
+        p2: Point<f64>,
+        preferred_match: Option<&TransitMatch>,
+    ) -> Option<SegmentResult> {
+        // Delegate to the existing pathfind_in_tiles logic
+        self.pathfind_in_tiles(merged.as_ref(), p1, p2, preferred_match)
+    }
+
 
     /// Match a single segment between two stops.
     fn match_segment(
@@ -208,18 +260,46 @@ impl<'a> SegmentMatcher<'a> {
         p2: Point<f64>,
         preferred_match: Option<&TransitMatch>,
     ) -> Option<SegmentResult> {
-        // Find nearest nodes to start and end
-        let start_candidates: Vec<_> = merged
-            .spatial_tree
-            .nearest_neighbor_iter(&[p1.x(), p1.y()])
-            .take(10)
-            .collect();
+        // Helper to get diverse candidates (on different ways)
+        let get_diverse_candidates = |p: Point<f64>| -> Vec<crate::osm_load::SpatialNode> {
+            let neighbors = merged
+                .spatial_tree
+                .nearest_neighbor_iter(&[p.x(), p.y()])
+                .take(20);
 
-        let end_candidates: Vec<_> = merged
-            .spatial_tree
-            .nearest_neighbor_iter(&[p2.x(), p2.y()])
-            .take(10)
-            .collect();
+            let mut selected = Vec::new();
+            let mut seen_ways = AHashSet::new();
+
+            for candidate in neighbors {
+                let node = merged.graph.node(candidate.index);
+                let mut new_way = false;
+                let mut node_ways = Vec::new();
+
+                for &e_idx in &node.edges {
+                    let w_id = merged.graph.edge(e_idx).payload.osmid;
+                    node_ways.push(w_id);
+                    if !seen_ways.contains(&w_id) {
+                        new_way = true;
+                    }
+                }
+
+                // Select if it's the first one OR provides a new way
+                if selected.is_empty() || new_way {
+                    selected.push(*candidate);
+                    for w in node_ways {
+                        seen_ways.insert(w);
+                    }
+                }
+
+                if selected.len() >= 2 {
+                    break;
+                }
+            }
+            selected
+        };
+
+        let start_candidates = get_diverse_candidates(p1);
+        let end_candidates = get_diverse_candidates(p2);
 
         if start_candidates.is_empty() || end_candidates.is_empty() {
             return None;
@@ -230,8 +310,9 @@ impl<'a> SegmentMatcher<'a> {
         let mut best_start = start_candidates[0].index;
         let mut best_end = end_candidates[0].index;
 
-        for start in &start_candidates[..start_candidates.len().min(5)] {
-            for end in &end_candidates[..end_candidates.len().min(5)] {
+        // Reduce search space for performance (5x5 = 25 -> 2x2 = 4 checks)
+        for start in &start_candidates[..start_candidates.len().min(2)] {
+            for end in &end_candidates[..end_candidates.len().min(2)] {
                 if start.index == end.index {
                     // Same node
                     if best_path.is_none() {

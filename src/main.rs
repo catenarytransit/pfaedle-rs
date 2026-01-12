@@ -337,7 +337,13 @@ fn main() -> Result<()> {
     }
 
     // Insert NEW shapes
+    println!("Inserting {} new shapes from matching results...", results.len());
+    let mut empty_geom_count = 0;
     for shape_res in results.values() {
+        if shape_res.points.is_empty() {
+            empty_geom_count += 1;
+            continue; // Skip empty geometries
+        }
         let mut points = Vec::with_capacity(shape_res.points.len());
         for (i, (lat, lon)) in shape_res.points.iter().enumerate() {
             points.push(ShapePoint {
@@ -347,6 +353,10 @@ fn main() -> Result<()> {
         }
         all_shapes.insert(shape_res.shape_id.clone(), points);
     }
+    if empty_geom_count > 0 {
+        println!("  WARNING: Skipped {} shapes with empty geometry!", empty_geom_count);
+    }
+    println!("Total shapes to write: {}", all_shapes.len());
 
     // Write everything back
     // We should probably sort by shape_id to be nice?
