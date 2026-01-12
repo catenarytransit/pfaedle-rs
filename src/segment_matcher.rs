@@ -76,7 +76,7 @@ impl<'a> SegmentMatcher<'a> {
     /// This is MUCH faster than match_route because it:
     /// 1. Computes all required tiles upfront for the entire route
     /// 2. Merges them once into a single graph
-    /// 3. Pathfinds all segments within that unified graph
+    /// 3. Uses global optimization (Viterbi) to find the best sequence of candidates
     pub fn match_route_preloaded(
         &mut self,
         stop_coords: &[Point<f64>],
@@ -89,38 +89,66 @@ impl<'a> SegmentMatcher<'a> {
         // Load all tiles needed for entire route at once
         let merged = self.tile_cache.get_for_route(stop_coords).ok()?;
 
-        let mut full_geometry = Vec::new();
+        // Collect candidates for ALL stops
+        let mut stop_candidates: Vec<Vec<usize>> = Vec::with_capacity(stop_coords.len());
+        
+        for p in stop_coords {
+            // Find diverse candidates for this stop
+            // Adapted from pathfind_in_tiles logic but capturing indices
+            let neighbors = merged
+                .spatial_tree
+                .nearest_neighbor_iter(&[p.x(), p.y()])
+                .take(30);
 
-        // Add first stop
-        full_geometry.push((stop_coords[0].y(), stop_coords[0].x()));
+            let mut selected = Vec::new();
+            let mut seen_ways = AHashSet::new();
 
-        for window in stop_coords.windows(2) {
-            let p1 = window[0];
-            let p2 = window[1];
+            for candidate in neighbors {
+                let node = merged.graph.node(candidate.index);
+                let mut new_way = false;
+                let mut node_ways = Vec::new();
 
-            // Pathfind within the unified graph
-            if let Some(segment) = self.pathfind_in_merged(&merged, p1, p2, preferred_match) {
-                full_geometry.extend(segment.geometry.into_iter().skip(1));
-            } else {
-                // Fallback: straight line
-                full_geometry.push((p2.y(), p2.x()));
+                for &e_idx in &node.edges {
+                    let w_id = merged.graph.edge(e_idx).payload.osmid;
+                    node_ways.push(w_id);
+                    if !seen_ways.contains(&w_id) {
+                        new_way = true;
+                    }
+                }
+
+                // Select if it's the first one OR provides a new way
+                if selected.is_empty() || new_way {
+                    selected.push(candidate.index);
+                    for w in node_ways {
+                        seen_ways.insert(w);
+                    }
+                }
+
+                // Take up to 5 diverse candidates per stop for global optimization
+                if selected.len() >= 5 {
+                    break;
+                }
             }
+            // If no candidates found, stick in nearest neighbor just in case
+            if selected.is_empty() {
+                 if let Some(nn) = merged.spatial_tree.nearest_neighbor(&[p.x(), p.y()]) {
+                     selected.push(nn.index);
+                 }
+            }
+            stop_candidates.push(selected);
         }
 
-        Some(full_geometry)
+        // Run global optimization (Viterbi)
+        crate::matcher::match_sequence_globally_optimal(
+            &stop_candidates,
+            &merged.graph,
+            MODE_BUS,
+            preferred_match,
+            &mut self.ctx,
+        )
     }
 
-    /// Pathfind between two points using a pre-merged graph (Arc version).
-    fn pathfind_in_merged(
-        &mut self,
-        merged: &std::sync::Arc<MergedTileData>,
-        p1: Point<f64>,
-        p2: Point<f64>,
-        preferred_match: Option<&TransitMatch>,
-    ) -> Option<SegmentResult> {
-        // Delegate to the existing pathfind_in_tiles logic
-        self.pathfind_in_tiles(merged.as_ref(), p1, p2, preferred_match)
-    }
+
 
 
     /// Match a single segment between two stops.

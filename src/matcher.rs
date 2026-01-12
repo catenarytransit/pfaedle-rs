@@ -3,7 +3,7 @@ use geo::Point;
 use geo::algorithm::HaversineDistance;
 use gtfs_structures::RouteType;
 
-use crate::graph::{MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
+use crate::graph::{EdgePL, Graph, NodePL, MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
 use crate::gtfs_load::{GtfsData, StopPattern};
 use crate::osm_load::OsmData;
 use crate::pathfinding::{self, TransitMatch};
@@ -673,7 +673,7 @@ fn match_patterns_full_graph(
                     // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
                     if let Some(geometry) = match_sequence_globally_optimal(
                         &limited_candidates,
-                        osm,
+                        &osm.graph,
                         allowed_modes,
                         Some(&preferred_match),
                         ctx,
@@ -715,9 +715,9 @@ fn match_patterns_full_graph(
     results
 }
 
-fn match_sequence_globally_optimal(
+pub fn match_sequence_globally_optimal(
     stop_candidates: &[Vec<usize>],
-    osm: &OsmData,
+    graph: &Graph<NodePL, EdgePL>,
     allowed_modes: u8,
     preferred_match: Option<&TransitMatch>,
     ctx: &mut pathfinding::PathfinderContext,
@@ -772,7 +772,7 @@ fn match_sequence_globally_optimal(
                         // But usually path between stops is short.
                         if let Some((c, _)) = pathfinding::pathfind_with_context(
                             ctx,
-                            &osm.graph,
+                            graph,
                             prev_node,
                             curr_node,
                             allowed_modes,
@@ -855,7 +855,7 @@ fn match_sequence_globally_optimal(
             } else {
                 if let Some((_, edges)) = pathfinding::pathfind_with_context(
                     ctx,
-                    &osm.graph,
+                    graph,
                     prev_node,
                     curr_node,
                     allowed_modes,
@@ -863,7 +863,7 @@ fn match_sequence_globally_optimal(
                     preferred_match,
                 ) {
                     for edge_idx in edges {
-                        let edge = osm.graph.edge(edge_idx);
+                        let edge = graph.edge(edge_idx);
                         for coord in edge.payload.geometry.coords().skip(1) {
                             segment_geom.push((coord.y, coord.x));
                         }
@@ -879,7 +879,7 @@ fn match_sequence_globally_optimal(
 
         // Add start node
         let start_node = stop_candidates[0][curr_k];
-        let p = osm.graph.node(start_node).payload.point;
+        let p = graph.node(start_node).payload.point;
         full_geometry.push((p.y(), p.x()));
 
         // Segments are in reverse order (last segment first)
