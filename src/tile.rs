@@ -204,7 +204,7 @@ impl TileCache {
     pub fn new(osm_path: &Path, capacity: usize) -> Self {
         Self {
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-            merged_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            merged_cache: LruCache::new(NonZeroUsize::new(4).unwrap()),
             osm_path: osm_path.to_path_buf(),
             disk_cache_dir: None,
             use_disk_cache: false,
@@ -230,7 +230,7 @@ impl TileCache {
 
         Ok(Self {
             cache: LruCache::new(NonZeroUsize::new(capacity).unwrap()),
-            merged_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            merged_cache: LruCache::new(NonZeroUsize::new(4).unwrap()),
             osm_path: osm_path.to_path_buf(),
             disk_cache_dir: Some(cache_dir),
             use_disk_cache: true,
@@ -269,7 +269,7 @@ impl TileCache {
     pub fn new_with_split_dir(split_dir: &Path, capacity: usize) -> Result<Self> {
         Ok(Self {
             cache: LruCache::new(std::num::NonZeroUsize::new(capacity).unwrap()),
-            merged_cache: LruCache::new(NonZeroUsize::new(8).unwrap()),
+            merged_cache: LruCache::new(NonZeroUsize::new(4).unwrap()),
             osm_path: PathBuf::new(), // Not used for building, but maybe need to keep?
             disk_cache_dir: Some(split_dir.to_path_buf()),
             use_disk_cache: true,
@@ -350,8 +350,13 @@ impl TileCache {
             }
         }
 
-        // Process nodes first (build node index)
+        // Process nodes (build node index with deduplication)
         for n in nodes {
+            // Deduplicate: if we already saw this node ID (e.g. from multiple ways or ghost inclusion), skip it
+            if osm_node_to_graph_idx.contains_key(&n.id) {
+                continue;
+            }
+
             let idx = graph.add_node(NodePL {
                 point: Point::new(n.lon, n.lat),
             });

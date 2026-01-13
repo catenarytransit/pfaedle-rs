@@ -89,10 +89,26 @@ impl<'a> SegmentMatcher<'a> {
         // Load all tiles needed for entire route at once
         let merged = self.tile_cache.get_for_route(stop_coords).ok()?;
 
+        Self::match_route_with_graph(&merged, stop_coords, preferred_match, &mut self.ctx)
+    }
+
+    /// Match a route using an already-merged graph.
+    /// Useful for parallel processing where the graph is shared.
+    pub fn match_route_with_graph(
+        merged: &MergedTileData,
+        stop_coords: &[Point<f64>],
+        preferred_match: Option<&TransitMatch>,
+        ctx: &mut PathfinderContext,
+    ) -> Option<Vec<(f64, f64)>> {
+        if stop_coords.len() < 2 {
+            return None;
+        }
+
         // Collect candidates for ALL stops
         let mut stop_candidates: Vec<Vec<usize>> = Vec::with_capacity(stop_coords.len());
+        let num_stops = stop_coords.len();
         
-        for p in stop_coords {
+        for (stop_idx, p) in stop_coords.iter().enumerate() {
             // Find diverse candidates for this stop
             // Adapted from pathfind_in_tiles logic but capturing indices
             let neighbors = merged
@@ -102,6 +118,10 @@ impl<'a> SegmentMatcher<'a> {
 
             let mut selected = Vec::new();
             let mut seen_ways = AHashSet::new();
+            
+            // Use more candidates for first/last stops (accuracy matters more)
+            // Fewer for middle stops (reduces pathfinding calls by ~40%)
+            let max_candidates = if stop_idx == 0 || stop_idx == num_stops - 1 { 5 } else { 3 };
 
             for candidate in neighbors {
                 let node = merged.graph.node(candidate.index);
@@ -124,8 +144,8 @@ impl<'a> SegmentMatcher<'a> {
                     }
                 }
 
-                // Take up to 5 diverse candidates per stop for global optimization
-                if selected.len() >= 5 {
+                // Take up to max_candidates diverse candidates per stop for global optimization
+                if selected.len() >= max_candidates {
                     break;
                 }
             }
@@ -144,7 +164,7 @@ impl<'a> SegmentMatcher<'a> {
             &merged.graph,
             MODE_BUS,
             preferred_match,
-            &mut self.ctx,
+            ctx,
         )
     }
 

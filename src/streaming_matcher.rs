@@ -142,37 +142,184 @@ impl StreamingMatcher {
         // Or we could use a thread pool with a shared cache wrapped in Mutex.
         // Let's try sequential first to guarantee memory safety.
 
-        // Progress tracking
-        let processed_count = 0;
+        // 2. Parallel Batch Processing
+        // We accumulate patterns into batches to share tile loading.
+        // Routes from the same agency (sequential in list) are likely close, sharing tiles.
+        
+        const BATCH_SIZE: usize = 32;       // Reduced from 64 for memory efficiency
+        const MAX_BATCH_TILES: usize = 80;  // Reduced from 200 to prevent OOM
+        
         let mut results = AHashMap::new();
+        let total_patterns = patterns_vec.len();
+        
+        let light_osm = &self.light_osm;
+        
+        // Helper to process a batch
+        let process_batch = |batch: &[(&StopPattern, &Vec<String>)], 
+                             tile_cache: &mut TileCache, 
+                             results: &mut AHashMap<StopPattern, ShapeResult>| {
+            
+            // 1. Identify all tiles needed for this batch
+            let mut batch_tiles = ahash::AHashSet::new();
+            let mut batch_info = Vec::with_capacity(batch.len());
 
-        for (i, (pattern, trips)) in patterns_vec.iter().enumerate() {
-            if i % 50 == 0 {
-                println!(
-                    "  Processed {}/{} ({:.1}%) - Cache Usage: {} entries",
-                    i,
-                    total,
-                    (i as f64 / total as f64) * 100.0,
-                    self.tile_cache.len()
+            for (pattern, _trips) in batch {
+                 // Get coords
+                 let stop_coords: Vec<Point<f64>> = pattern
+                    .stop_ids
+                    .iter()
+                    .filter_map(|sid| gtfs.gtfs.stops.get(sid))
+                    .filter_map(|s| {
+                        if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
+                            Some(Point::new(lon, lat))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                    
+                 if stop_coords.len() >= 2 {
+                     let tiles = crate::tile::compute_route_tiles(&stop_coords);
+                     for t in &tiles {
+                         batch_tiles.insert(*t);
+                     }
+                     batch_info.push((pattern, stop_coords));
+                 }
+            }
+            
+            let unique_tiles: Vec<_> = batch_tiles.into_iter().collect();
+            
+            if unique_tiles.is_empty() {
+                return;
+            }
+
+            // 2. Load merged graph for the whole batch
+            // This is the heavy I/O step, done once per batch
+            if let Ok(merged_arc) = tile_cache.merge_tiles_cached(&unique_tiles) {
+                
+                // 3. Parallel Match
+                let batch_results: Vec<_> = batch_info
+                    .par_iter()
+                    .map(|(pattern, stop_coords)| {
+                         // Build context locally per thread
+                         let mut ctx = PathfinderContext::new();
+                         
+                         // Extract route info for matching preferences
+                         let sample_trip_id = gtfs.patterns.get(pattern).and_then(|t| t.first());
+                         let trip = sample_trip_id.and_then(|tid| gtfs.gtfs.trips.get(tid));
+                         let route = trip.and_then(|t| gtfs.gtfs.routes.get(&t.route_id));
+                         
+                         let agency_name = route.and_then(|r| r.agency_id.as_ref()).and_then(|id| { // Nested and_then fixes the double-pass? No, standard logic
+                             gtfs.gtfs.agencies.iter().find(|a| a.id.as_ref() == Some(id)).map(|a| a.name.to_lowercase())
+                         });
+                         
+                         let preferred_match = TransitMatch {
+                             short_name: route.and_then(|r| r.short_name.as_ref()).map(|s| s.to_lowercase()),
+                             long_name: route.and_then(|r| r.long_name.as_ref()).map(|s| s.to_lowercase()),
+                             operator: agency_name,
+                         };
+
+                         // Match!
+                         if let Some(geometry) = SegmentMatcher::match_route_with_graph(
+                             &merged_arc,
+                             stop_coords,
+                             Some(&preferred_match),
+                             &mut ctx
+                         ) {
+                             // Success
+                             let mut hasher = DefaultHasher::new();
+                             pattern.hash(&mut hasher);
+                             let shape_id = format!("shape_{}", hasher.finish());
+                             
+                             Some((
+                                 (*pattern).clone(),
+                                 ShapeResult {
+                                     shape_id,
+                                     points: geometry,
+                                     matched_route_color: light_osm.find_color(
+                                         preferred_match.short_name.as_deref(),
+                                         preferred_match.long_name.as_deref(),
+                                         preferred_match.operator.as_deref()
+                                     ),
+                                 }
+                             ))
+                         } else {
+                             None
+                         }
+                    })
+                    .collect();
+                
+                // 4. Collect results
+                for res in batch_results {
+                    if let Some((pat, shape_res)) = res {
+                        results.insert(pat.clone(), shape_res);
+                    }
+                }
+                
+                // Explicitly drop the merged graph to free memory immediately
+                drop(merged_arc);
+            } else {
+                // Log failure with details to help diagnose
+                eprintln!(
+                    "    WARNING: Failed to load {} tiles for batch of {} patterns. Skipping batch.",
+                    unique_tiles.len(),
+                    batch.len()
                 );
             }
+        };
 
-            let start = std::time::Instant::now();
-            if let Some(result) = self.match_pattern(gtfs, pattern) {
-                let elapsed = start.elapsed();
-                if i % 50 == 0 || elapsed.as_millis() > 1000 {
-                    println!("    Pattern {}: {} points, shape_id={} (took {:?})", i, result.points.len(), result.shape_id, elapsed);
-                }
-                if result.points.is_empty() {
-                    println!("    WARNING: Empty geometry for pattern {}!", i);
-                }
-                results.insert((*pattern).clone(), result);
+        // Main Loop
+        let mut current_batch = Vec::new();
+        let mut current_batch_tiles = ahash::AHashSet::new(); 
+        
+        for (i, item) in patterns_vec.iter().enumerate() {
+            if i % 100 == 0 {
+                println!("  Processed {}/{} patterns... (Results: {})", i, total_patterns, results.len());
+            }
+            
+            // Estimate tiles for this pattern (quick approximation or full compute?)
+            // We need full compute to check capacity.
+            let (pattern, _) = item;
+            let stop_coords: Vec<Point<f64>> = pattern.stop_ids.iter()
+                .filter_map(|sid| gtfs.gtfs.stops.get(sid))
+                .filter_map(|s| if let (Some(x), Some(y)) = (s.longitude, s.latitude) { Some(Point::new(x, y)) } else { None })
+                .collect();
+            
+            // Just compute tiles for checking batch limits
+            let tiles = if stop_coords.len() >= 2 {
+                crate::tile::compute_route_tiles(&stop_coords)
             } else {
-                let elapsed = start.elapsed();
-                if i % 50 == 0 || elapsed.as_millis() > 1000 {
-                    println!("    Pattern {}: FAILED to match (took {:?})", i, elapsed);
+                Vec::new()
+            };
+            
+            let mut new_tiles_count = 0;
+            for t in &tiles {
+                if !current_batch_tiles.contains(t) {
+                    new_tiles_count += 1;
                 }
             }
+            
+            // Check if adding this pattern breaks batch limits
+            if !current_batch.is_empty() && (
+               current_batch.len() >= BATCH_SIZE || 
+               current_batch_tiles.len() + new_tiles_count > MAX_BATCH_TILES
+            ) {
+                 // FLUSH BATCH
+                 process_batch(&current_batch, &mut self.tile_cache, &mut results);
+                 current_batch.clear();
+                 current_batch_tiles.clear();
+            }
+            
+            // Add to current
+            current_batch.push(*item);
+            for t in tiles {
+                current_batch_tiles.insert(t);
+            }
+        }
+        
+        // Flush last batch
+        if !current_batch.is_empty() {
+             process_batch(&current_batch, &mut self.tile_cache, &mut results);
         }
 
         println!("Streaming match complete. Found {} shapes.", results.len());

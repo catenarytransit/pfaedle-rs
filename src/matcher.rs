@@ -739,6 +739,10 @@ pub fn match_sequence_globally_optimal(
 
     let mut min_costs: Vec<Vec<Option<(f64, usize)>>> = Vec::with_capacity(num_stops);
 
+    // Path cache: (from_node, to_node) -> cost
+    // Avoids redundant pathfinding when same node pairs appear
+    let mut path_cache: AHashMap<(usize, usize), Option<f64>> = AHashMap::new();
+
     // Initialize first stop
     let first_candidates_len = stop_candidates[0].len();
     let mut first_costs = Vec::with_capacity(first_candidates_len);
@@ -759,6 +763,7 @@ pub fn match_sequence_globally_optimal(
         for (prev_k, prev_cost_opt) in min_costs[i - 1].iter().enumerate() {
             if let Some((prev_total_cost, _)) = prev_cost_opt {
                 let prev_node = prev_candidates[prev_k];
+                let prev_point = graph.node(prev_node).payload.point;
 
                 // Try to reach each candidate in current step
                 for (curr_k, &curr_node) in curr_candidates.iter().enumerate() {
@@ -767,18 +772,28 @@ pub fn match_sequence_globally_optimal(
                     if prev_node == curr_node {
                         cost_inc = 0.0;
                     } else {
-                        // Pathfind
-                        // Note: This can be slow if we have many candidates (20*20 = 400 pathfinds per stop).
-                        // But usually path between stops is short.
-                        if let Some((c, _)) = pathfinding::pathfind_with_context(
-                            ctx,
-                            graph,
-                            prev_node,
-                            curr_node,
-                            allowed_modes,
-                            None,
-                            preferred_match,
-                        ) {
+                        // Check cache first
+                        let cache_key = (prev_node, curr_node);
+                        
+                        let cached_cost = if let Some(&cached) = path_cache.get(&cache_key) {
+                            cached
+                        } else {
+                            // Pathfind and cache the result
+                            let result = pathfinding::pathfind_with_context(
+                                ctx,
+                                graph,
+                                prev_node,
+                                curr_node,
+                                allowed_modes,
+                                None,
+                                preferred_match,
+                            ).map(|(c, _)| c);
+                            
+                            path_cache.insert(cache_key, result);
+                            result
+                        };
+                        
+                        if let Some(c) = cached_cost {
                             cost_inc = c;
                         } else {
                             continue; // Unreachable
@@ -1120,7 +1135,7 @@ mod tests {
         let stop_candidates = vec![vec![n0, n2], vec![n1, n3], vec![n4]];
 
         let mut ctx = pathfinding::PathfinderContext::new();
-        let result = match_sequence_globally_optimal(&stop_candidates, &osm, 255, None, &mut ctx);
+        let result = match_sequence_globally_optimal(&stop_candidates, &osm.graph, 255, None, &mut ctx);
 
         // Should succeed by picking 2 -> 3 -> 4
         assert!(result.is_some());

@@ -184,6 +184,29 @@ impl OsmSplitter {
                         entry.extend_from_slice(&len.to_le_bytes());
                         entry.extend_from_slice(&bytes);
 
+                        // CRITICAL FIX: Write "Ghost Nodes"
+                        // If a node referenced by this way belongs to a different tile, it wasn't written
+                        // to *this* tile in Pass 3. We must write it now so the tile graph is self-contained.
+                        for nid in &w.nodes {
+                            if let Some(&(lon, lat)) = node_locs.get(&nid.0) {
+                                let node_tile = TileCoord::from_point(lon, lat);
+                                if node_tile != tile {
+                                    // This is a ghost node! Write it to the current tile.
+                                    let node_item = TileItem::Node(NodeData {
+                                        id: nid.0,
+                                        lon,
+                                        lat,
+                                    });
+                                    // We can just unwrap here safely because NodeData serialize shouldn't fail
+                                    if let Ok(node_bytes) = bincode::serialize(&node_item) {
+                                        let node_len = node_bytes.len() as u32;
+                                        entry.extend_from_slice(&node_len.to_le_bytes());
+                                        entry.extend_from_slice(&node_bytes);
+                                    }
+                                }
+                            }
+                        }
+
                         // Flush large buffers incrementally
                         if entry.len() > MAX_TILE_BUFFER_SIZE {
                             let data = std::mem::replace(entry, Vec::with_capacity(64 * 1024));
