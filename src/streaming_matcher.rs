@@ -127,199 +127,143 @@ impl StreamingMatcher {
         println!("    Agency order ({} agencies): {:?}", ordered_agencies.len(), 
             ordered_agencies.iter().take(5).collect::<Vec<_>>());
         
-        // 4. Flatten patterns in TSP order
-        let mut patterns_vec: Vec<(&StopPattern, &Vec<String>)> = Vec::with_capacity(total);
-        for agency in &ordered_agencies {
-            if let Some(mut agency_pats) = agency_patterns.remove(agency) {
-                patterns_vec.append(&mut agency_pats);
-            }
-        }
+        // 4. Flatten patterns in TSP order but process by AGENCY
+        // We already have agency_patterns map. But we want to follow TSP order.
 
-        // 2. Sequential Processing
-        // We cannot use parallel iterator easily here because TileCache is mutable (LRU updates).
-        // However, we can use a Mutex, but contention might be high.
-        // Given that we are waiting for disk I/O for tiles (initially), sequential might be safer for memory stability.
-        // Or we could use a thread pool with a shared cache wrapped in Mutex.
-        // Let's try sequential first to guarantee memory safety.
-
-        // 2. Parallel Batch Processing
-        // We accumulate patterns into batches to share tile loading.
-        // Routes from the same agency (sequential in list) are likely close, sharing tiles.
-        
-        const BATCH_SIZE: usize = 32;       // Reduced from 64 for memory efficiency
-        const MAX_BATCH_TILES: usize = 80;  // Reduced from 200 to prevent OOM
-        
         let mut results = AHashMap::new();
-        let total_patterns = patterns_vec.len();
-        
-        let light_osm = &self.light_osm;
-        
-        // Helper to process a batch
-        let process_batch = |batch: &[(&StopPattern, &Vec<String>)], 
-                             tile_cache: &mut TileCache, 
-                             results: &mut AHashMap<StopPattern, ShapeResult>| {
-            
-            // 1. Identify all tiles needed for this batch
-            let mut batch_tiles = ahash::AHashSet::new();
-            let mut batch_info = Vec::with_capacity(batch.len());
+        let total_agencies = ordered_agencies.len();
 
-            for (pattern, _trips) in batch {
-                 // Get coords
-                 let stop_coords: Vec<Point<f64>> = pattern
-                    .stop_ids
-                    .iter()
-                    .filter_map(|sid| gtfs.gtfs.stops.get(sid))
-                    .filter_map(|s| {
-                        if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
-                            Some(Point::new(lon, lat))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                    
-                 if stop_coords.len() >= 2 {
-                     let tiles = crate::tile::compute_route_tiles(&stop_coords);
-                     for t in &tiles {
-                         batch_tiles.insert(*t);
+        for (i, agency_name) in ordered_agencies.iter().enumerate() {
+            println!("  Processing agency {}/{} ({})", i + 1, total_agencies, agency_name);
+
+            if let Some(patterns) = agency_patterns.get(agency_name) {
+                 if patterns.is_empty() { continue; }
+
+                 // 1. Calculate BBox for this agency
+                 let mut min_lon = f64::MAX;
+                 let mut min_lat = f64::MAX;
+                 let mut max_lon = f64::MIN;
+                 let mut max_lat = f64::MIN;
+                 let mut found_any = false;
+
+                 for (pattern, _) in patterns {
+                     for stop_id in &pattern.stop_ids {
+                         if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
+                             if let (Some(lon), Some(lat)) = (stop.longitude, stop.latitude) {
+                                 if lon < min_lon { min_lon = lon; }
+                                 if lat < min_lat { min_lat = lat; }
+                                 if lon > max_lon { max_lon = lon; }
+                                 if lat > max_lat { max_lat = lat; }
+                                 found_any = true;
+                             }
+                         }
                      }
-                     batch_info.push((pattern, stop_coords));
+                 }
+
+                 if !found_any {
+                     continue;
+                 }
+
+                 // 2. Get Tiles for Agency BBox
+                 // We rely on new compute_bbox_tiles to include padding
+                 let tiles = crate::tile::compute_bbox_tiles(min_lon, min_lat, max_lon, max_lat);
+                 // println!("    Loading {} tiles for {} patterns...", tiles.len(), patterns.len());
+
+                 if tiles.is_empty() {
+                     continue;
+                 }
+
+                 // 3. Merge Tiles (Once per agency)
+                 // Use cached merge to be smart if agencies overlap significantly (unlikely but safe)
+                 if let Ok(merged_arc) = self.tile_cache.merge_tiles_cached(&tiles) {
+
+                     // 4. Parallel Match
+                     let agency_results: Vec<_> = patterns
+                        .par_iter()
+                        .map(|(pattern, _trips)| {
+                             // Build context locally per thread
+                             let mut ctx = PathfinderContext::new();
+
+                             // Extract route info for matching preferences
+                             let sample_trip_id = gtfs.patterns.get(pattern).and_then(|t| t.first());
+                             let trip = sample_trip_id.and_then(|tid| gtfs.gtfs.trips.get(tid));
+                             let route = trip.and_then(|t| gtfs.gtfs.routes.get(&t.route_id));
+
+                             let agency_name_extracted = route.and_then(|r| r.agency_id.as_ref()).and_then(|id| {
+                                 gtfs.gtfs.agencies.iter().find(|a| a.id.as_ref() == Some(id)).map(|a| a.name.to_lowercase())
+                             });
+
+                             // Use extracted agency name or fallback to the loop var? The loop var is canonical.
+                             let _ = agency_name_extracted; // Unused, we use loop var effectively? No, matcher needs proper name from GTFS for string matching logic
+
+                             let preferred_match = TransitMatch {
+                                 short_name: route.and_then(|r| r.short_name.as_ref()).map(|s| s.to_lowercase()),
+                                 long_name: route.and_then(|r| r.long_name.as_ref()).map(|s| s.to_lowercase()),
+                                 operator: Some(agency_name.clone()),
+                             };
+
+                             // Re-get stop coords (inefficient to do twice? but needed for match_route)
+                             let stop_coords: Vec<Point<f64>> = pattern
+                                .stop_ids
+                                .iter()
+                                .filter_map(|sid| gtfs.gtfs.stops.get(sid))
+                                .filter_map(|s| {
+                                    if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
+                                        Some(Point::new(lon, lat))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+
+                             if stop_coords.len() < 2 {
+                                 return None;
+                             }
+
+                             // Match!
+                             if let Some(geometry) = SegmentMatcher::match_route_with_graph(
+                                 &merged_arc,
+                                 &stop_coords,
+                                 Some(&preferred_match),
+                                 &mut ctx
+                             ) {
+                                 // Success
+                                 let mut hasher = DefaultHasher::new();
+                                 pattern.hash(&mut hasher);
+                                 let shape_id = format!("shape_{}", hasher.finish());
+
+                                 Some((
+                                     (*pattern).clone(),
+                                     ShapeResult {
+                                         shape_id,
+                                         points: geometry,
+                                         matched_route_color: self.light_osm.find_color(
+                                             preferred_match.short_name.as_deref(),
+                                             preferred_match.long_name.as_deref(),
+                                             preferred_match.operator.as_deref()
+                                         ),
+                                     }
+                                 ))
+                             } else {
+                                 None
+                             }
+                        })
+                        .collect();
+
+                     // 5. Collect results
+                     for res in agency_results {
+                         if let Some((pat, shape_res)) = res {
+                             results.insert(pat, shape_res);
+                         }
+                     }
+
+                     // Explicitly drop to free memory
+                     drop(merged_arc);
+
+                 } else {
+                     eprintln!("    WARNING: Failed to merge tiles for agency {}. Skipping.", agency_name);
                  }
             }
-            
-            let unique_tiles: Vec<_> = batch_tiles.into_iter().collect();
-            
-            if unique_tiles.is_empty() {
-                return;
-            }
-
-            // 2. Load merged graph for the whole batch
-            // This is the heavy I/O step, done once per batch
-            if let Ok(merged_arc) = tile_cache.merge_tiles_cached(&unique_tiles) {
-                
-                // 3. Parallel Match
-                let batch_results: Vec<_> = batch_info
-                    .par_iter()
-                    .map(|(pattern, stop_coords)| {
-                         // Build context locally per thread
-                         let mut ctx = PathfinderContext::new();
-                         
-                         // Extract route info for matching preferences
-                         let sample_trip_id = gtfs.patterns.get(pattern).and_then(|t| t.first());
-                         let trip = sample_trip_id.and_then(|tid| gtfs.gtfs.trips.get(tid));
-                         let route = trip.and_then(|t| gtfs.gtfs.routes.get(&t.route_id));
-                         
-                         let agency_name = route.and_then(|r| r.agency_id.as_ref()).and_then(|id| { // Nested and_then fixes the double-pass? No, standard logic
-                             gtfs.gtfs.agencies.iter().find(|a| a.id.as_ref() == Some(id)).map(|a| a.name.to_lowercase())
-                         });
-                         
-                         let preferred_match = TransitMatch {
-                             short_name: route.and_then(|r| r.short_name.as_ref()).map(|s| s.to_lowercase()),
-                             long_name: route.and_then(|r| r.long_name.as_ref()).map(|s| s.to_lowercase()),
-                             operator: agency_name,
-                         };
-
-                         // Match!
-                         if let Some(geometry) = SegmentMatcher::match_route_with_graph(
-                             &merged_arc,
-                             stop_coords,
-                             Some(&preferred_match),
-                             &mut ctx
-                         ) {
-                             // Success
-                             let mut hasher = DefaultHasher::new();
-                             pattern.hash(&mut hasher);
-                             let shape_id = format!("shape_{}", hasher.finish());
-                             
-                             Some((
-                                 (*pattern).clone(),
-                                 ShapeResult {
-                                     shape_id,
-                                     points: geometry,
-                                     matched_route_color: light_osm.find_color(
-                                         preferred_match.short_name.as_deref(),
-                                         preferred_match.long_name.as_deref(),
-                                         preferred_match.operator.as_deref()
-                                     ),
-                                 }
-                             ))
-                         } else {
-                             None
-                         }
-                    })
-                    .collect();
-                
-                // 4. Collect results
-                for res in batch_results {
-                    if let Some((pat, shape_res)) = res {
-                        results.insert(pat.clone(), shape_res);
-                    }
-                }
-                
-                // Explicitly drop the merged graph to free memory immediately
-                drop(merged_arc);
-            } else {
-                // Log failure with details to help diagnose
-                eprintln!(
-                    "    WARNING: Failed to load {} tiles for batch of {} patterns. Skipping batch.",
-                    unique_tiles.len(),
-                    batch.len()
-                );
-            }
-        };
-
-        // Main Loop
-        let mut current_batch = Vec::new();
-        let mut current_batch_tiles = ahash::AHashSet::new(); 
-        
-        for (i, item) in patterns_vec.iter().enumerate() {
-            if i % 100 == 0 {
-                println!("  Processed {}/{} patterns... (Results: {})", i, total_patterns, results.len());
-            }
-            
-            // Estimate tiles for this pattern (quick approximation or full compute?)
-            // We need full compute to check capacity.
-            let (pattern, _) = item;
-            let stop_coords: Vec<Point<f64>> = pattern.stop_ids.iter()
-                .filter_map(|sid| gtfs.gtfs.stops.get(sid))
-                .filter_map(|s| if let (Some(x), Some(y)) = (s.longitude, s.latitude) { Some(Point::new(x, y)) } else { None })
-                .collect();
-            
-            // Just compute tiles for checking batch limits
-            let tiles = if stop_coords.len() >= 2 {
-                crate::tile::compute_route_tiles(&stop_coords)
-            } else {
-                Vec::new()
-            };
-            
-            let mut new_tiles_count = 0;
-            for t in &tiles {
-                if !current_batch_tiles.contains(t) {
-                    new_tiles_count += 1;
-                }
-            }
-            
-            // Check if adding this pattern breaks batch limits
-            if !current_batch.is_empty() && (
-               current_batch.len() >= BATCH_SIZE || 
-               current_batch_tiles.len() + new_tiles_count > MAX_BATCH_TILES
-            ) {
-                 // FLUSH BATCH
-                 process_batch(&current_batch, &mut self.tile_cache, &mut results);
-                 current_batch.clear();
-                 current_batch_tiles.clear();
-            }
-            
-            // Add to current
-            current_batch.push(*item);
-            for t in tiles {
-                current_batch_tiles.insert(t);
-            }
-        }
-        
-        // Flush last batch
-        if !current_batch.is_empty() {
-             process_batch(&current_batch, &mut self.tile_cache, &mut results);
         }
 
         println!("Streaming match complete. Found {} shapes.", results.len());

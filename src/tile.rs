@@ -15,9 +15,9 @@ use std::path::{Path, PathBuf};
 use crate::graph::{EdgeIndex, EdgePL, Graph, MODE_BUS, NodeIndex, NodePL};
 use crate::osm_load::SpatialNode;
 
-/// Tile size in degrees. 0.1° ≈ 10km at mid-latitudes.
+/// Tile size in degrees. 0.2° ≈ 20km at mid-latitudes.
 /// Smaller tiles = less memory per tile but more tiles needed.
-pub const TILE_SIZE: f64 = 0.1;
+pub const TILE_SIZE: f64 = 0.2;
 
 /// Buffer in degrees to add around tile edges for seamless routing.
 /// ~100m at mid-latitudes.
@@ -670,6 +670,36 @@ pub fn compute_route_tiles(stop_coords: &[Point<f64>]) -> Vec<TileCoord> {
     let mut result: Vec<_> = all_tiles.into_iter().collect();
     result.sort_by_key(|t| (t.x, t.y));
     result
+}
+
+/// Compute all tiles intersecting a bounding box (including buffer).
+pub fn compute_bbox_tiles(
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
+) -> Vec<TileCoord> {
+    let mut tiles = Vec::new();
+
+    // Determine range of tile indices
+    let t_min = TileCoord::from_point(min_lon, min_lat);
+    let t_max = TileCoord::from_point(max_lon, max_lat);
+
+    // Add padding (buffer) by including neighbors of the min/max in the range
+    // Actually, TileCoord::from_point is just floor(val/size).
+    // If we want a buffer around the full graph, we should just iterate the range inclusive.
+    // The user requirement said "bbox of all stops (+ padding)".
+    // So if the input bbox already includes padding, we just take all tiles touching it.
+    // Let's assume input bbox is "tight" stops bbox, so we might want to add 1 tile buffer?
+    // "compute all tiles intersecting that bbox".
+    // Let's be safe and iterate.
+
+    for x in (t_min.x - 1)..=(t_max.x + 1) {
+        for y in (t_min.y - 1)..=(t_max.y + 1) {
+            tiles.push(TileCoord { x, y });
+        }
+    }
+    tiles
 }
 
 
