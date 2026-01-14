@@ -173,6 +173,26 @@ impl StreamingMatcher {
                      continue;
                  }
 
+                 // 3. OOM Protection: If agency is too huge, process sequentially per pattern
+                 // Merging >400 tiles (approx size of Germany) creates a massive graph that OOMs.
+                 // Fallback to per-pattern matching which loads only relevant tiles for each trip.
+                 if tiles.len() > 400 {
+                     println!("    Agency covers {} tiles (>400). Using sequential matching to avoid OOM.", tiles.len());
+                     let chunk_size = std::cmp::max(1, patterns.len() / 20);
+                     for (idx, (pattern, _)) in patterns.iter().enumerate() {
+                         if idx > 0 && idx % chunk_size == 0 {
+                             print!(".");
+                             use std::io::Write;
+                             std::io::stdout().flush().ok();
+                         }
+                         if let Some(res) = self.match_pattern(gtfs, pattern) {
+                             results.insert((*pattern).clone(), res);
+                         }
+                     }
+                     println!();
+                     continue;
+                 }
+
                  // 3. Merge Tiles (Once per agency)
                  // Use cached merge to be smart if agencies overlap significantly (unlikely but safe)
                  if let Ok(merged_arc) = self.tile_cache.merge_tiles_cached(&tiles) {

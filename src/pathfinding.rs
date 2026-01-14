@@ -160,13 +160,19 @@ pub fn pathfind_with_context(
     let start_cos = start_lat.to_radians().cos();
 
     // Heuristics
+    let heuristic_factor = if allowed_modes == crate::graph::MODE_BUS {
+        0.7
+    } else {
+        0.1
+    };
+
     let h_fwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        heuristic_m(p, end_lat, end_lon, end_cos) * 0.1
+        heuristic_m(p, end_lat, end_lon, end_cos) * heuristic_factor
     };
     let h_bwd = |n: NodeIndex| -> f64 {
         let p = graph.node(n).payload.point;
-        heuristic_m(p, start_lat, start_lon, start_cos) * 0.1
+        heuristic_m(p, start_lat, start_lon, start_cos) * heuristic_factor
     };
 
     // Initialize
