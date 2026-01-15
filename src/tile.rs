@@ -150,10 +150,10 @@ pub fn compute_corridor_tiles(p1: Point<f64>, p2: Point<f64>) -> Vec<TileCoord> 
 pub struct TileData {
     pub graph: Graph<NodePL, EdgePL>,
     pub spatial_nodes: Vec<SpatialNode>, // Stored flat for serialization
-    pub osm_node_to_graph_idx: AHashMap<i64, NodeIndex>,
     #[serde(skip)]
     pub spatial_tree: Option<RTree<SpatialNode>>, // Built on load
 }
+
 
 impl TileData {
     pub fn new() -> Self {
@@ -161,8 +161,8 @@ impl TileData {
             graph: Graph::new(),
             spatial_nodes: Vec::new(),
             spatial_tree: None,
-            osm_node_to_graph_idx: AHashMap::new(),
         }
+
     }
 
     /// Rebuild spatial tree from nodes (call after deserialization)
@@ -222,7 +222,7 @@ impl TileCache {
         osm_path.hash(&mut hasher);
         let hash = hasher.finish();
 
-        let cache_dir = std::path::PathBuf::from(format!("/tmp/pfaedle-tiles-{:x}", hash));
+        let cache_dir = std::path::PathBuf::from(format!("/tmp/pfaedle-tiles-v2-{:x}", hash));
         std::fs::create_dir_all(&cache_dir)
             .with_context(|| format!("Failed to create tile cache dir: {:?}", cache_dir))?;
 
@@ -314,8 +314,8 @@ impl TileCache {
                 graph: Graph::new(),
                 spatial_nodes: Vec::new(),
                 spatial_tree: None,
-                osm_node_to_graph_idx: AHashMap::new(),
             });
+
         }
 
         let mut graph = Graph::new();
@@ -330,6 +330,7 @@ impl TileCache {
         {
             let f = std::fs::File::open(&tile_path)?;
             let mut reader = std::io::BufReader::new(f);
+            let mut buf = Vec::with_capacity(1024);
 
             loop {
                 let mut len_buf = [0u8; 4];
@@ -339,7 +340,9 @@ impl TileCache {
                     Err(e) => return Err(e.into()),
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
-                let mut buf = vec![0u8; len];
+                
+                // Buffer reuse optimization: resize instead of reallocate
+                buf.resize(len, 0);
                 std::io::Read::read_exact(&mut reader, &mut buf)?;
 
                 let item: TileItem = bincode::deserialize(&buf)?;
@@ -435,8 +438,8 @@ impl TileCache {
             graph,
             spatial_nodes,
             spatial_tree,
-            osm_node_to_graph_idx,
         })
+
     }
 
     /// Build tile data for a specific coordinate from OSM.
@@ -466,8 +469,8 @@ impl TileCache {
             graph: osm_data.graph,
             spatial_nodes,
             spatial_tree,
-            osm_node_to_graph_idx: AHashMap::new(),
         })
+
     }
 
     /// Save tile to disk using bincode.

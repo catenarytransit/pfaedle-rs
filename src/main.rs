@@ -592,5 +592,5 @@ fn main() -> Result<()> {
 
     println!("Done!");
 
-    Ok(())
+    std::process::exit(0);
 }

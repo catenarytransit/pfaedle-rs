@@ -174,7 +174,7 @@ impl StreamingMatcher {
                  }
 
                  // 3. OOM Protection: If agency is too huge, process sequentially per pattern
-                 // Merging >400 tiles (approx size of Germany) creates a massive graph that OOMs.
+                 // Merging >400 tiles (approx size of a small province) creates a massive graph that OOMs.
                  // Fallback to per-pattern matching which loads only relevant tiles for each trip.
                  if tiles.len() > 400 {
                      println!("    Agency covers {} tiles (>400). Using sequential matching to avoid OOM.", tiles.len());
