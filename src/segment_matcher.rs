@@ -107,7 +107,7 @@ impl<'a> SegmentMatcher<'a> {
         // Collect candidates for ALL stops
         let mut stop_candidates: Vec<Vec<usize>> = Vec::with_capacity(stop_coords.len());
         let num_stops = stop_coords.len();
-        
+
         for (stop_idx, p) in stop_coords.iter().enumerate() {
             // Find diverse candidates for this stop
             // Adapted from pathfind_in_tiles logic but capturing indices
@@ -118,10 +118,14 @@ impl<'a> SegmentMatcher<'a> {
 
             let mut selected = Vec::new();
             let mut seen_ways = AHashSet::new();
-            
+
             // Use more candidates for first/last stops (accuracy matters more)
             // Fewer for middle stops (reduces pathfinding calls by ~40%)
-            let max_candidates = if stop_idx == 0 || stop_idx == num_stops - 1 { 5 } else { 3 };
+            let max_candidates = if stop_idx == 0 || stop_idx == num_stops - 1 {
+                5
+            } else {
+                3
+            };
 
             for candidate in neighbors {
                 let node = merged.graph.node(candidate.index);
@@ -151,9 +155,9 @@ impl<'a> SegmentMatcher<'a> {
             }
             // If no candidates found, stick in nearest neighbor just in case
             if selected.is_empty() {
-                 if let Some(nn) = merged.spatial_tree.nearest_neighbor(&[p.x(), p.y()]) {
-                     selected.push(nn.index);
-                 }
+                if let Some(nn) = merged.spatial_tree.nearest_neighbor(&[p.x(), p.y()]) {
+                    selected.push(nn.index);
+                }
             }
             stop_candidates.push(selected);
         }
@@ -167,9 +171,6 @@ impl<'a> SegmentMatcher<'a> {
             ctx,
         )
     }
-
-
-
 
     /// Match a single segment between two stops.
     fn match_segment(

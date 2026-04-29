@@ -154,7 +154,6 @@ pub struct TileData {
     pub spatial_tree: Option<RTree<SpatialNode>>, // Built on load
 }
 
-
 impl TileData {
     pub fn new() -> Self {
         Self {
@@ -162,7 +161,6 @@ impl TileData {
             spatial_nodes: Vec::new(),
             spatial_tree: None,
         }
-
     }
 
     /// Rebuild spatial tree from nodes (call after deserialization)
@@ -197,7 +195,6 @@ pub struct TileCache {
     use_disk_cache: bool,
     is_split_dir: bool,
 }
-
 
 impl TileCache {
     /// Create a new tile cache with in-memory LRU only.
@@ -315,13 +312,12 @@ impl TileCache {
                 spatial_nodes: Vec::new(),
                 spatial_tree: None,
             });
-
         }
 
         let mut graph = Graph::new();
         let mut osm_node_to_graph_idx = AHashMap::new();
 
-        use crate::osm_split::{TileItem, NodeData, WayData};
+        use crate::osm_split::{NodeData, TileItem, WayData};
 
         // Single-pass file reading: collect nodes and ways in memory
         let mut nodes: Vec<NodeData> = Vec::new();
@@ -340,7 +336,7 @@ impl TileCache {
                     Err(e) => return Err(e.into()),
                 }
                 let len = u32::from_le_bytes(len_buf) as usize;
-                
+
                 // Buffer reuse optimization: resize instead of reallocate
                 buf.resize(len, 0);
                 std::io::Read::read_exact(&mut reader, &mut buf)?;
@@ -439,7 +435,6 @@ impl TileCache {
             spatial_nodes,
             spatial_tree,
         })
-
     }
 
     /// Build tile data for a specific coordinate from OSM.
@@ -470,7 +465,6 @@ impl TileCache {
             spatial_nodes,
             spatial_tree,
         })
-
     }
 
     /// Save tile to disk using bincode.
@@ -704,7 +698,6 @@ pub fn compute_bbox_tiles(
     }
     tiles
 }
-
 
 #[cfg(test)]
 mod tests {
