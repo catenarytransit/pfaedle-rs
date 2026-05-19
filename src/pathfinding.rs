@@ -80,6 +80,7 @@ pub fn pathfind(
     start: NodeIndex,
     end: NodeIndex,
     allowed_modes: u8,
+    fallback_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>,
     preferred_match: Option<&TransitMatch>,
 ) -> Option<(f64, Vec<usize>)> {
@@ -90,6 +91,7 @@ pub fn pathfind(
         start,
         end,
         allowed_modes,
+        fallback_modes,
         allowed_edges,
         preferred_match,
     )
@@ -138,6 +140,7 @@ pub fn pathfind_with_context(
     start: NodeIndex,
     end: NodeIndex,
     allowed_modes: u8,
+    fallback_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
     preferred_match: Option<&TransitMatch>,
 ) -> Option<(f64, Vec<usize>)> {
@@ -255,12 +258,15 @@ pub fn pathfind_with_context(
                         }
                     }
                     let edge = graph.edge(edge_idx);
-                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                    if (edge.payload.allowed_modes & (allowed_modes | fallback_modes)) == 0 {
                         continue;
                     }
 
                     let v = if edge.from == u { edge.to } else { edge.from };
-                    let cost = get_edge_cost(edge);
+                    let mut cost = get_edge_cost(edge);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        cost *= 10.0;
+                    }
                     let tentative_g = current_g + cost;
 
                     if tentative_g < *ctx.g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
@@ -297,12 +303,15 @@ pub fn pathfind_with_context(
                         }
                     }
                     let edge = graph.edge(edge_idx);
-                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                    if (edge.payload.allowed_modes & (allowed_modes | fallback_modes)) == 0 {
                         continue;
                     }
 
                     let v = if edge.from == u { edge.to } else { edge.from };
-                    let cost = get_edge_cost(edge);
+                    let mut cost = get_edge_cost(edge);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        cost *= 10.0;
+                    }
                     let tentative_g = current_g + cost;
 
                     if tentative_g < *ctx.g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
@@ -382,21 +391,21 @@ mod tests {
         graph.add_edge(n0, n1, e1);
 
         // Test Rail
-        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, None, None);
+        let path_rail = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, None);
         assert!(path_rail.is_some());
         let (_, edges) = path_rail.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_RAIL);
 
         // Test Bus
-        let path_bus = pathfind(&graph, n0, n1, MODE_BUS, None, None);
+        let path_bus = pathfind(&graph, n0, n1, MODE_BUS, 0, None, None);
         assert!(path_bus.is_some());
         let (_, edges) = path_bus.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(graph.edge(edges[0]).payload.allowed_modes, MODE_BUS);
 
         // Test None
-        let path_none = pathfind(&graph, n0, n1, 0, None, None);
+        let path_none = pathfind(&graph, n0, n1, 0, 0, None, None);
         assert!(path_none.is_none());
     }
 
@@ -434,7 +443,7 @@ mod tests {
         let idx_norm2 = graph.add_edge(n2, n1, e_normal2);
 
         // Pathfind
-        let result = pathfind(&graph, n0, n1, MODE_RAIL, None, None).expect("Should find path");
+        let result = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, None).expect("Should find path");
         let (_, path) = result;
 
         // Should choose the detour (2 edges) because total cost 2000 < 1,000,000
@@ -507,8 +516,7 @@ mod tests {
         };
 
         // Pathfind with preference
-        let result =
-            pathfind(&graph, n0, n1, MODE_RAIL, None, Some(&match_pref)).expect("Should find path");
+            pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref)).expect("Should find path");
         let (_, path) = result;
 
         // Should choose path via n2 because (55+55)*0.2 = 22 < 100

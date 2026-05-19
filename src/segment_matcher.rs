@@ -167,6 +167,7 @@ impl<'a> SegmentMatcher<'a> {
             &stop_candidates,
             &merged.graph,
             MODE_BUS,
+            0,
             preferred_match,
             ctx,
         )
@@ -379,6 +380,7 @@ impl<'a> SegmentMatcher<'a> {
                     start.index,
                     end.index,
                     MODE_BUS,
+                    0,
                     None,
                     preferred_match,
                 ) {

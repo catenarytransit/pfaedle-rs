@@ -235,6 +235,14 @@ fn match_patterns_full_graph(
                     _ => MODE_BUS,
                 };
 
+                let fallback_modes = match pattern.route_type {
+                    Some(RouteType::Tramway) => MODE_SUBWAY | MODE_RAIL,
+                    Some(RouteType::Subway) => MODE_TRAM | MODE_RAIL,
+                    Some(RouteType::Rail) => MODE_SUBWAY | MODE_TRAM,
+                    _ => 0,
+                };
+                let all_allowed_modes = allowed_modes | fallback_modes;
+
                 // 2. Snap to nearest OSM nodes (Candidates)
                 if osm.spatial_tree.is_none() {
                     return None;
@@ -263,7 +271,7 @@ fn match_patterns_full_graph(
 
                     let neighbors = index
                         .nearest_neighbor_iter(&[point.x(), point.y()])
-                        .filter(|sn| (sn.modes & allowed_modes) != 0)
+                        .filter(|sn| (sn.modes & all_allowed_modes) != 0)
                         .take(search_limit);
 
                     let mut candidates: Vec<usize> = Vec::new();
@@ -629,6 +637,7 @@ fn match_patterns_full_graph(
                                 current_node,
                                 next_node,
                                 allowed_modes,
+                                fallback_modes,
                                 Some(&rel.edges),
                                 Some(&preferred_match),
                             ) {
@@ -675,6 +684,7 @@ fn match_patterns_full_graph(
                         &limited_candidates,
                         &osm.graph,
                         allowed_modes,
+                        fallback_modes,
                         Some(&preferred_match),
                         ctx,
                     ) {
@@ -719,6 +729,7 @@ pub fn match_sequence_globally_optimal(
     stop_candidates: &[Vec<usize>],
     graph: &Graph<NodePL, EdgePL>,
     allowed_modes: u8,
+    fallback_modes: u8,
     preferred_match: Option<&TransitMatch>,
     ctx: &mut pathfinding::PathfinderContext,
 ) -> Option<Vec<(f64, f64)>> {
@@ -785,6 +796,7 @@ pub fn match_sequence_globally_optimal(
                                 prev_node,
                                 curr_node,
                                 allowed_modes,
+                                fallback_modes,
                                 None,
                                 preferred_match,
                             ).map(|(c, _)| c);
@@ -874,6 +886,7 @@ pub fn match_sequence_globally_optimal(
                     prev_node,
                     curr_node,
                     allowed_modes,
+                    fallback_modes,
                     None,
                     preferred_match,
                 ) {
@@ -1135,7 +1148,7 @@ mod tests {
         let stop_candidates = vec![vec![n0, n2], vec![n1, n3], vec![n4]];
 
         let mut ctx = pathfinding::PathfinderContext::new();
-        let result = match_sequence_globally_optimal(&stop_candidates, &osm.graph, 255, None, &mut ctx);
+        let result = match_sequence_globally_optimal(&stop_candidates, &osm.graph, 255, 0, None, &mut ctx);
 
         // Should succeed by picking 2 -> 3 -> 4
         assert!(result.is_some());
