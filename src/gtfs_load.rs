@@ -2,6 +2,8 @@ use crate::mots::{self, MotCategory};
 use ahash::{AHashMap, AHashSet};
 use anyhow::Result;
 use gtfs_structures::{Gtfs, RouteType};
+use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -31,38 +33,90 @@ pub struct GtfsData {
     pub used_route_types: AHashSet<RouteType>,
 }
 
-pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<GtfsData> {
-    println!("Loading GTFS from {:?}", path);
-    // Use ? to extract the Gtfs result, then wrap it in the GtfsData struct.
-    // NOTE: gtfs_structures::Gtfs::new returns Result<Gtfs, Error>
-    // Load raw GTFS data first
-    let path_str = path.to_str().unwrap();
-    println!("Loading raw GTFS for pfaedle from {}", path_str);
-    let mut raw = gtfs_structures::RawGtfs::from_path(path_str)
-        .map_err(|e| anyhow::anyhow!("Failed to load raw GTFS for pfaedle: {:?}", e))?;
+fn faster_stop_time_reader_injection(
+    mut gtfs: Gtfs,
+    stop_times_path: &Path,
+) -> Result<Gtfs> {
+    let file = File::open(stop_times_path)?;
+    let buf_reader = BufReader::new(file);
+    let mut rdr = csv::ReaderBuilder::new()
+        .trim(csv::Trim::All)
+        .from_reader(buf_reader);
 
-    // If shapes.txt is missing/invalid, ignore it and remove shape references from trips
-    let shapes_missing = match &raw.shapes {
-        Some(Ok(_)) => false,
-        _ => true,
-    };
+    let mut current_trip_id = String::new();
+    let mut stop_times_buffer = Vec::with_capacity(1024);
 
-    if shapes_missing {
-        println!("shapes.txt missing or invalid, ignoring and clearing shape_ids from trips.");
-        raw.shapes = Some(Ok(vec![]));
-        if let Ok(ref mut trips) = raw.trips {
-            for trip in trips {
-                trip.shape_id = None;
+    for result in rdr.deserialize() {
+        let stop_time_raw: gtfs_structures::RawStopTime = result?;
+
+        if !current_trip_id.is_empty() {
+            if stop_time_raw.trip_id != current_trip_id {
+                if let Some(trip) = gtfs.trips.get_mut(current_trip_id.as_str()) {
+                    trip.stop_times.reserve_exact(stop_times_buffer.len());
+                    for st in stop_times_buffer.drain(..) {
+                        trip.stop_times.push(st);
+                    }
+                } else {
+                    stop_times_buffer.clear();
+                }
+                current_trip_id = stop_time_raw.trip_id.clone();
+            }
+        } else {
+            current_trip_id = stop_time_raw.trip_id.clone();
+        }
+
+        if let Some(stop) = gtfs.stops.get(stop_time_raw.stop_id.as_str()) {
+            let stop_time = gtfs_structures::StopTime::from(stop_time_raw, stop.clone());
+            stop_times_buffer.push(stop_time);
+        }
+    }
+
+    if !current_trip_id.is_empty() {
+        if let Some(trip) = gtfs.trips.get_mut(current_trip_id.as_str()) {
+            trip.stop_times.reserve_exact(stop_times_buffer.len());
+            for st in stop_times_buffer.drain(..) {
+                trip.shape_id = trip.shape_id.clone();
+                trip.stop_times.push(st);
             }
         }
     }
 
-    // Optimization: We don't use the original shapes for matching, and we handle shapes.txt I/O manually in main.rs
-    // So we can drop the shapes from memory here to save significant RAM.
-    raw.shapes = None;
+    Ok(gtfs)
+}
 
-    let gtfs = Gtfs::try_from(raw)
-        .map_err(|e| anyhow::anyhow!("Failed to process GTFS for pfaedle: {}", e))?;
+pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<GtfsData> {
+    println!("Loading GTFS from {:?}", path);
+    let path_str = path.to_str().unwrap();
+    println!("Loading GTFS structures for pfaedle from {}", path_str);
+
+    let mut gtfs = gtfs_structures::GtfsReader::default()
+        .read_shapes(false)
+        .read_stop_times(false)
+        .read(path_str)
+        .map_err(|e| anyhow::anyhow!("Failed to read GTFS for pfaedle: {:?}", e))?;
+
+    let shapes_missing = !path.join("shapes.txt").exists();
+    if shapes_missing {
+        println!("shapes.txt missing or invalid, ignoring and clearing shape_ids from trips.");
+        for trip in gtfs.trips.values_mut() {
+            trip.shape_id = None;
+        }
+    }
+
+    // Pre-filter routes by allowed MOTs to avoid loading stop times for unused modes.
+    gtfs.routes.retain(|_, route| {
+        let cat = mots::map_route_type_to_category(route.route_type);
+        allowed_mots.contains(&cat)
+    });
+
+    // Pre-filter trips to keep only those referencing the retained routes.
+    gtfs.trips.retain(|_, trip| {
+        gtfs.routes.contains_key(&trip.route_id)
+    });
+
+    println!("Injecting stop times...");
+    let stop_times_path = path.join("stop_times.txt");
+    let gtfs = faster_stop_time_reader_injection(gtfs, &stop_times_path)?;
 
     println!(
         "Loaded {} stops, {} trips",
@@ -75,14 +129,7 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
     for (trip_id, trip) in &gtfs.trips {
         let route = gtfs.routes.get(&trip.route_id);
 
-        // Filter by MOT
-        if let Some(r) = route {
-            let cat = mots::map_route_type_to_category(r.route_type);
-            if !allowed_mots.contains(&cat) {
-                continue;
-            }
-        } else {
-            // If no route found, maybe skip? or process? safe to skip probably.
+        if route.is_none() {
             continue;
         }
 
