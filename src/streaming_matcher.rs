@@ -21,6 +21,7 @@ use crate::tile::TileCache;
 pub struct StreamingMatcher {
     tile_cache: TileCache,
     light_osm: Arc<LightOsmData>,
+    cache_dir: std::path::PathBuf,
 }
 
 impl StreamingMatcher {
@@ -64,6 +65,7 @@ impl StreamingMatcher {
         Ok(Self {
             tile_cache,
             light_osm: Arc::new(light_osm),
+            cache_dir,
         })
     }
 
@@ -414,6 +416,12 @@ impl StreamingMatcher {
     }
 }
 
+impl Drop for StreamingMatcher {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.cache_dir);
+    }
+}
+
 /// Helper function to get the agency name for a pattern
 fn get_pattern_agency_name(gtfs: &GtfsData, pattern: &StopPattern) -> String {
     gtfs.patterns
@@ -430,4 +438,27 @@ fn get_pattern_agency_name(gtfs: &GtfsData, pattern: &StopPattern) -> String {
                 .map(|a| a.name.to_lowercase())
         })
         .unwrap_or_else(|| String::from("zzz_unknown"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_streaming_matcher_cleanup() {
+        let temp_dir = std::env::temp_dir().join(format!("pfaedle-test-split-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("test.bin"), b"dummy data").unwrap();
+        assert!(temp_dir.exists());
+
+        {
+            let _matcher = StreamingMatcher {
+                tile_cache: TileCache::new(std::path::Path::new(""), 1),
+                light_osm: Arc::new(LightOsmData::new()),
+                cache_dir: temp_dir.clone(),
+            };
+        }
+
+        assert!(!temp_dir.exists());
+    }
 }
