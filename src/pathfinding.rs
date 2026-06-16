@@ -516,8 +516,8 @@ mod tests {
         };
 
         // Pathfind with preference
-        let result =
-            pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref)).expect("Should find path");
+        let result = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref))
+            .expect("Should find path");
         let (_, path) = result;
 
         // Should choose path via n2 because (55+55)*0.2 = 22 < 100

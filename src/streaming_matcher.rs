@@ -161,170 +161,181 @@ impl StreamingMatcher {
                     continue;
                 }
 
-                // 1. Calculate BBox for this agency
-                let mut min_lon = f64::MAX;
-                let mut min_lat = f64::MAX;
-                let mut max_lon = f64::MIN;
-                let mut max_lat = f64::MIN;
-                let mut found_any = false;
+                // Phase 1: Pre-compute per-pattern corridor tile sets and centroids
+                let mut pattern_info: Vec<(
+                    (&StopPattern, &Vec<String>),
+                    Vec<crate::tile::TileCoord>,
+                    (f64, f64),
+                )> = Vec::new();
 
-                for (pattern, _) in patterns {
+                for (pattern, trips) in patterns {
+                    let mut stop_coords = Vec::new();
                     for stop_id in &pattern.stop_ids {
                         if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
                             if let (Some(lon), Some(lat)) = (stop.longitude, stop.latitude) {
-                                if lon < min_lon {
-                                    min_lon = lon;
-                                }
-                                if lat < min_lat {
-                                    min_lat = lat;
-                                }
-                                if lon > max_lon {
-                                    max_lon = lon;
-                                }
-                                if lat > max_lat {
-                                    max_lat = lat;
-                                }
-                                found_any = true;
+                                stop_coords.push(Point::new(lon, lat));
                             }
                         }
                     }
+
+                    if stop_coords.is_empty() {
+                        continue;
+                    }
+
+                    let route_tiles = crate::tile::compute_route_tiles(&stop_coords);
+
+                    // Centroid for Hilbert sorting
+                    let sum_lon: f64 = stop_coords.iter().map(|p| p.x()).sum();
+                    let sum_lat: f64 = stop_coords.iter().map(|p| p.y()).sum();
+                    let centroid = (
+                        sum_lon / stop_coords.len() as f64,
+                        sum_lat / stop_coords.len() as f64,
+                    );
+
+                    pattern_info.push(((*pattern, trips), route_tiles, centroid));
                 }
 
-                if !found_any {
+                if pattern_info.is_empty() {
                     continue;
                 }
 
-                // 2. Get Tiles for Agency BBox
-                // We rely on new compute_bbox_tiles to include padding
-                let tiles = crate::tile::compute_bbox_tiles(min_lon, min_lat, max_lon, max_lat);
-                // println!("    Loading {} tiles for {} patterns...", tiles.len(), patterns.len());
+                // Phase 2: Hilbert sort by centroid
+                pattern_info.sort_by_cached_key(|(_, _, (lon, lat))| {
+                    crate::hilbert::hilbert_index(*lon, *lat)
+                });
 
-                if tiles.is_empty() {
-                    continue;
+                // Phase 3: Greedy partition into groups (tile union <= 350)
+                let max_tiles_per_group = 350;
+                let mut groups: Vec<(
+                    Vec<(&StopPattern, &Vec<String>)>,
+                    ahash::AHashSet<crate::tile::TileCoord>,
+                )> = Vec::new();
+                let mut current_group = Vec::new();
+                let mut current_union = ahash::AHashSet::new();
+
+                for (pat_data, route_tiles, _) in pattern_info {
+                    let mut candidate_union = current_union.clone();
+                    for tile in &route_tiles {
+                        candidate_union.insert(*tile);
+                    }
+
+                    if candidate_union.len() > max_tiles_per_group && !current_group.is_empty() {
+                        groups.push((current_group, current_union));
+
+                        current_group = vec![pat_data];
+                        current_union = ahash::AHashSet::new();
+                        for tile in route_tiles {
+                            current_union.insert(tile);
+                        }
+                    } else {
+                        current_group.push(pat_data);
+                        current_union = candidate_union;
+                    }
+                }
+                if !current_group.is_empty() {
+                    groups.push((current_group, current_union));
                 }
 
-                // 3. OOM Protection: If agency is too huge, process sequentially per pattern
-                // Merging >400 tiles (approx size of a small province) creates a massive graph that OOMs.
-                // Fallback to per-pattern matching which loads only relevant tiles for each trip.
-                if tiles.len() > 400 {
+                let num_groups = groups.len();
+                if num_groups > 1 {
                     println!(
-                        "    Agency covers {} tiles (>400). Using sequential matching to avoid OOM.",
-                        tiles.len()
+                        "    Agency too large to process at once. Sub-divided into {} tile-aware groups.",
+                        num_groups
                     );
-                    let chunk_size = std::cmp::max(1, patterns.len() / 20);
-                    for (idx, (pattern, _)) in patterns.iter().enumerate() {
-                        if idx > 0 && idx % chunk_size == 0 {
-                            print!(".");
-                            use std::io::Write;
-                            std::io::stdout().flush().ok();
-                        }
-                        if let Some(res) = self.match_pattern(gtfs, pattern) {
-                            results.insert((*pattern).clone(), res);
-                        }
-                    }
-                    println!();
-                    continue;
                 }
 
-                // 3. Merge Tiles (Once per agency)
-                // Use cached merge to be smart if agencies overlap significantly (unlikely but safe)
-                if let Ok(merged_arc) = self.tile_cache.merge_tiles_cached(&tiles) {
-                    // 4. Parallel Match
-                    let agency_results: Vec<_> = patterns
-                        .par_iter()
-                        .map(|(pattern, _trips)| {
-                            // Build context locally per thread
-                            let mut ctx = PathfinderContext::new();
-
-                            // Extract route info for matching preferences
-                            let sample_trip_id = gtfs.patterns.get(pattern).and_then(|t| t.first());
-                            let trip = sample_trip_id.and_then(|tid| gtfs.gtfs.trips.get(tid));
-                            let route = trip.and_then(|t| gtfs.gtfs.routes.get(&t.route_id));
-
-                            let agency_name_extracted =
-                                route.and_then(|r| r.agency_id.as_ref()).and_then(|id| {
-                                    gtfs.gtfs
-                                        .agencies
-                                        .iter()
-                                        .find(|a| a.id.as_ref() == Some(id))
-                                        .map(|a| a.name.to_lowercase())
-                                });
-
-                            // Use extracted agency name or fallback to the loop var? The loop var is canonical.
-                            let _ = agency_name_extracted; // Unused, we use loop var effectively? No, matcher needs proper name from GTFS for string matching logic
-
-                            let preferred_match = TransitMatch {
-                                short_name: route
-                                    .and_then(|r| r.short_name.as_ref())
-                                    .map(|s| s.to_lowercase()),
-                                long_name: route
-                                    .and_then(|r| r.long_name.as_ref())
-                                    .map(|s| s.to_lowercase()),
-                                operator: Some(agency_name.clone()),
-                            };
-
-                            // Re-get stop coords (inefficient to do twice? but needed for match_route)
-                            let stop_coords: Vec<Point<f64>> = pattern
-                                .stop_ids
-                                .iter()
-                                .filter_map(|sid| gtfs.gtfs.stops.get(sid))
-                                .filter_map(|s| {
-                                    if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
-                                        Some(Point::new(lon, lat))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect();
-
-                            if stop_coords.len() < 2 {
-                                return None;
-                            }
-
-                            // Match!
-                            if let Some(geometry) = SegmentMatcher::match_route_with_graph(
-                                &merged_arc,
-                                &stop_coords,
-                                Some(&preferred_match),
-                                &mut ctx,
-                            ) {
-                                // Success
-                                let mut hasher = DefaultHasher::new();
-                                pattern.hash(&mut hasher);
-                                let shape_id = format!("shape_{}", hasher.finish());
-
-                                Some((
-                                    (*pattern).clone(),
-                                    ShapeResult {
-                                        shape_id,
-                                        points: geometry,
-                                        matched_route_color: self.light_osm.find_color(
-                                            preferred_match.short_name.as_deref(),
-                                            preferred_match.long_name.as_deref(),
-                                            preferred_match.operator.as_deref(),
-                                        ),
-                                    },
-                                ))
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
-
-                    // 5. Collect results
-                    for res in agency_results {
-                        if let Some((pat, shape_res)) = res {
-                            results.insert(pat, shape_res);
-                        }
+                // Phase 4: Merge + par_iter per group
+                for (group_idx, (group_patterns, group_tiles_set)) in groups.into_iter().enumerate()
+                {
+                    if num_groups > 1 {
+                        println!(
+                            "    Processing group {}/{} ({} patterns, {} tiles)",
+                            group_idx + 1,
+                            num_groups,
+                            group_patterns.len(),
+                            group_tiles_set.len()
+                        );
                     }
 
-                    // Explicitly drop to free memory
-                    drop(merged_arc);
-                } else {
-                    eprintln!(
-                        "    WARNING: Failed to merge tiles for agency {}. Skipping.",
-                        agency_name
-                    );
+                    let group_tiles: Vec<_> = group_tiles_set.into_iter().collect();
+
+                    if let Ok(merged_arc) = self.tile_cache.merge_tiles_cached(&group_tiles) {
+                        // Parallel Match
+                        let group_results: Vec<_> = group_patterns
+                            .par_iter()
+                            .map(|(pattern, _trips)| {
+                                let mut ctx = PathfinderContext::new();
+
+                                let sample_trip_id =
+                                    gtfs.patterns.get(pattern).and_then(|t| t.first());
+                                let trip = sample_trip_id.and_then(|tid| gtfs.gtfs.trips.get(tid));
+                                let route = trip.and_then(|t| gtfs.gtfs.routes.get(&t.route_id));
+
+                                let preferred_match = TransitMatch {
+                                    short_name: route
+                                        .and_then(|r| r.short_name.as_ref())
+                                        .map(|s| s.to_lowercase()),
+                                    long_name: route
+                                        .and_then(|r| r.long_name.as_ref())
+                                        .map(|s| s.to_lowercase()),
+                                    operator: Some(agency_name.clone()),
+                                };
+
+                                let stop_coords: Vec<Point<f64>> = pattern
+                                    .stop_ids
+                                    .iter()
+                                    .filter_map(|sid| gtfs.gtfs.stops.get(sid))
+                                    .filter_map(|s| {
+                                        if let (Some(lon), Some(lat)) = (s.longitude, s.latitude) {
+                                            Some(Point::new(lon, lat))
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect();
+
+                                if stop_coords.len() < 2 {
+                                    return None;
+                                }
+
+                                if let Some(geometry) = SegmentMatcher::match_route_with_graph(
+                                    &merged_arc,
+                                    &stop_coords,
+                                    Some(&preferred_match),
+                                    &mut ctx,
+                                ) {
+                                    let mut hasher = DefaultHasher::new();
+                                    pattern.hash(&mut hasher);
+                                    let shape_id = format!("shape_{}", hasher.finish());
+
+                                    Some((
+                                        (*pattern).clone(),
+                                        ShapeResult {
+                                            shape_id,
+                                            points: geometry,
+                                            matched_route_color: self.light_osm.find_color(
+                                                preferred_match.short_name.as_deref(),
+                                                preferred_match.long_name.as_deref(),
+                                                preferred_match.operator.as_deref(),
+                                            ),
+                                        },
+                                    ))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        for res in group_results {
+                            if let Some((pat, shape_res)) = res {
+                                results.insert(pat, shape_res);
+                            }
+                        }
+
+                        drop(merged_arc);
+                    } else {
+                        eprintln!("    WARNING: Failed to merge tiles for agency group. Skipping.");
+                    }
                 }
             }
         }
@@ -446,7 +457,8 @@ mod tests {
 
     #[test]
     fn test_streaming_matcher_cleanup() {
-        let temp_dir = std::env::temp_dir().join(format!("pfaedle-test-split-{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("pfaedle-test-split-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         std::fs::write(temp_dir.join("test.bin"), b"dummy data").unwrap();
         assert!(temp_dir.exists());

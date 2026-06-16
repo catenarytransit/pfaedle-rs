@@ -3,7 +3,9 @@ use geo::Point;
 use geo::algorithm::HaversineDistance;
 use gtfs_structures::RouteType;
 
-use crate::graph::{EdgePL, Graph, NodePL, MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM};
+use crate::graph::{
+    EdgePL, Graph, MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodePL,
+};
 use crate::gtfs_load::{GtfsData, StopPattern};
 use crate::osm_load::OsmData;
 use crate::pathfinding::{self, TransitMatch};
@@ -785,7 +787,7 @@ pub fn match_sequence_globally_optimal(
                     } else {
                         // Check cache first
                         let cache_key = (prev_node, curr_node);
-                        
+
                         let cached_cost = if let Some(&cached) = path_cache.get(&cache_key) {
                             cached
                         } else {
@@ -799,12 +801,13 @@ pub fn match_sequence_globally_optimal(
                                 fallback_modes,
                                 None,
                                 preferred_match,
-                            ).map(|(c, _)| c);
-                            
+                            )
+                            .map(|(c, _)| c);
+
                             path_cache.insert(cache_key, result);
                             result
                         };
-                        
+
                         if let Some(c) = cached_cost {
                             cost_inc = c;
                         } else {
@@ -1148,7 +1151,8 @@ mod tests {
         let stop_candidates = vec![vec![n0, n2], vec![n1, n3], vec![n4]];
 
         let mut ctx = pathfinding::PathfinderContext::new();
-        let result = match_sequence_globally_optimal(&stop_candidates, &osm.graph, 255, 0, None, &mut ctx);
+        let result =
+            match_sequence_globally_optimal(&stop_candidates, &osm.graph, 255, 0, None, &mut ctx);
 
         // Should succeed by picking 2 -> 3 -> 4
         assert!(result.is_some());

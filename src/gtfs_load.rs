@@ -33,10 +33,7 @@ pub struct GtfsData {
     pub used_route_types: AHashSet<RouteType>,
 }
 
-fn faster_stop_time_reader_injection(
-    mut gtfs: Gtfs,
-    stop_times_path: &Path,
-) -> Result<Gtfs> {
+fn faster_stop_time_reader_injection(mut gtfs: Gtfs, stop_times_path: &Path) -> Result<Gtfs> {
     let file = File::open(stop_times_path)?;
     let buf_reader = BufReader::new(file);
     let mut rdr = csv::ReaderBuilder::new()
@@ -110,9 +107,8 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
     });
 
     // Pre-filter trips to keep only those referencing the retained routes.
-    gtfs.trips.retain(|_, trip| {
-        gtfs.routes.contains_key(&trip.route_id)
-    });
+    gtfs.trips
+        .retain(|_, trip| gtfs.routes.contains_key(&trip.route_id));
 
     println!("Injecting stop times...");
     let stop_times_path = path.join("stop_times.txt");
