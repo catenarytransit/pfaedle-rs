@@ -204,8 +204,8 @@ impl StreamingMatcher {
                     crate::hilbert::hilbert_index(*lon, *lat)
                 });
 
-                // Phase 3: Greedy partition into groups (tile union <= 350)
-                let max_tiles_per_group = 350;
+                // Phase 3: Greedy partition into groups (tile union <= 50)
+                let max_tiles_per_group = 50;
                 let mut groups: Vec<(
                     Vec<(&StopPattern, &Vec<String>)>,
                     ahash::AHashSet<crate::tile::TileCoord>,
