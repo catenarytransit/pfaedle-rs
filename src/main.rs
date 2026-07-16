@@ -364,8 +364,6 @@ fn main() -> Result<()> {
 
         // If we haven't matched all routes, try to match colors from OSM relations
         // for any routes that don't have colors yet (handles case where shapes are already in place)
-        // If we haven't matched all routes, try to match colors from OSM relations
-        // for any routes that don't have colors yet (handles case where shapes are already in place)
         // NOTE: This fallback is currently disabled because we don't load full OSM data in main anymore.
         // If needed, we could use LightOsmData here, but we'd need to load it or get it from matcher.
         /*
