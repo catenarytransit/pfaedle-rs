@@ -13,17 +13,28 @@ use crate::pathfinding::{self, TransitMatch};
 #[derive(Debug, Clone)]
 pub struct ShapeResult {
     pub shape_id: String,
-    pub points: Vec<(f64, f64)>, // Lat, Lon
+    pub empty_geometry: bool,
     pub matched_route_color: Option<String>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct BinaryShapeRecord {
+    pub shape_id: String,
+    pub shape_pt_lat: f64,
+    pub shape_pt_lon: f64,
+    pub shape_pt_sequence: usize,
+}
+
 use rayon::prelude::*;
+use std::fs::OpenOptions;
+use std::io::{BufWriter, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub fn match_patterns(
     gtfs: &GtfsData,
     osm_path: &std::path::Path,
     skip_small_roads: bool,
+    cache_file_path: &std::path::Path,
 ) -> Result<AHashMap<StopPattern, ShapeResult>, anyhow::Error> {
     use crate::mots::is_bus_like_route_type;
     use crate::osm_load::OsmBuilder;
@@ -107,7 +118,33 @@ pub fn match_patterns(
         println!("  Calculated bbox for {} patterns: {:?}", other_count, bbox);
         let osm_data = load_osm(osm_path, &types, bbox, false)?;
 
-        match_patterns_full_graph(&gtfs, &osm_data, other_patterns)
+        let other_results_with_geom = match_patterns_full_graph(&gtfs, &osm_data, other_patterns);
+
+        // Stream generated points to the cache file immediately
+        let mut cache_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_file_path)?;
+        let mut writer = BufWriter::new(cache_file);
+
+        let mut results = AHashMap::new();
+        for (pattern, (shape_res, points)) in other_results_with_geom {
+            if !shape_res.empty_geometry {
+                for (i, p) in points.into_iter().enumerate() {
+                    let record = BinaryShapeRecord {
+                        shape_id: shape_res.shape_id.clone(),
+                        shape_pt_lat: p.0,
+                        shape_pt_lon: p.1,
+                        shape_pt_sequence: i + 1,
+                    };
+                    bincode::serialize_into(&mut writer, &record)
+                        .context("Failed to write to cache file")?;
+                }
+            }
+            results.insert(pattern, shape_res);
+        }
+        writer.flush()?;
+        results
     } else {
         println!("No non-bus patterns found. Skipping full graph load.");
         AHashMap::new()
@@ -119,7 +156,7 @@ pub fn match_patterns(
         // Tiles are much smaller if stripped of buildings/etc.
         // 100 tiles is generous. 0.5 deg tile = 50x50km.
         let mut matcher = StreamingMatcher::new(osm_path, 50, light_osm, skip_small_roads)?;
-        matcher.match_all(gtfs, bus_patterns)
+        matcher.match_all(gtfs, bus_patterns, cache_file_path)
     } else {
         AHashMap::new()
     };
@@ -170,13 +207,13 @@ fn match_patterns_full_graph(
     gtfs: &GtfsData,
     osm: &OsmData,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
-) -> AHashMap<StopPattern, ShapeResult> {
+) -> AHashMap<StopPattern, (ShapeResult, Vec<(f64, f64)>)> {
     let total_patterns = patterns.len();
     let processed = AtomicUsize::new(0);
 
     println!("Matching {} patterns (full-graph)...", total_patterns);
 
-    let results: AHashMap<StopPattern, ShapeResult> = patterns
+    let results: AHashMap<StopPattern, (ShapeResult, Vec<(f64, f64)>)> = patterns
         .par_iter()
         .map_with(
             pathfinding::PathfinderContext::new(),
@@ -704,13 +741,18 @@ fn match_patterns_full_graph(
                 pattern.hash(&mut hasher);
                 let shape_id = format!("shape_{}", hasher.finish());
 
+                let empty_geometry = full_path_geometry.is_empty();
+
                 Some((
                     (*pattern).clone(),
-                    ShapeResult {
-                        shape_id,
-                        points: full_path_geometry,
-                        matched_route_color,
-                    },
+                    (
+                        ShapeResult {
+                            shape_id,
+                            empty_geometry,
+                            matched_route_color,
+                        },
+                        full_path_geometry,
+                    ),
                 ))
             },
         )

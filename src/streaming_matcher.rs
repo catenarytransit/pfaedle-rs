@@ -75,6 +75,7 @@ impl StreamingMatcher {
         &mut self,
         gtfs: &GtfsData,
         patterns: Vec<(&StopPattern, &Vec<String>)>,
+        cache_file_path: &std::path::Path,
     ) -> AHashMap<StopPattern, ShapeResult> {
         let total = patterns.len();
         println!("Streaming matching for {} patterns...", total);
@@ -147,6 +148,13 @@ impl StreamingMatcher {
 
         let mut results = AHashMap::new();
         let total_agencies = ordered_agencies.len();
+
+        let mut cache_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(cache_file_path)
+            .expect("Failed to open cache file");
+        let mut cache_writer = std::io::BufWriter::new(cache_file);
 
         for (i, agency_name) in ordered_agencies.iter().enumerate() {
             println!(
@@ -312,13 +320,14 @@ impl StreamingMatcher {
                                         (*pattern).clone(),
                                         ShapeResult {
                                             shape_id,
-                                            points: geometry,
+                                            empty_geometry: geometry.is_empty(),
                                             matched_route_color: self.light_osm.find_color(
                                                 preferred_match.short_name.as_deref(),
                                                 preferred_match.long_name.as_deref(),
                                                 preferred_match.operator.as_deref(),
                                             ),
                                         },
+                                        geometry,
                                     ))
                                 } else {
                                     None
@@ -327,7 +336,19 @@ impl StreamingMatcher {
                             .collect();
 
                         for res in group_results {
-                            if let Some((pat, shape_res)) = res {
+                            if let Some((pat, shape_res, points)) = res {
+                                if !shape_res.empty_geometry {
+                                    for (j, p) in points.into_iter().enumerate() {
+                                        let record = crate::matcher::BinaryShapeRecord {
+                                            shape_id: shape_res.shape_id.clone(),
+                                            shape_pt_lat: p.0,
+                                            shape_pt_lon: p.1,
+                                            shape_pt_sequence: j + 1,
+                                        };
+                                        bincode::serialize_into(&mut cache_writer, &record)
+                                            .expect("Failed to write to cache file");
+                                    }
+                                }
                                 results.insert(pat, shape_res);
                             }
                         }
@@ -339,9 +360,11 @@ impl StreamingMatcher {
                 }
             }
         }
+        use std::io::Write;
+        cache_writer.flush().expect("Failed to flush cache file");
 
         println!("Streaming match complete. Found {} shapes.", results.len());
-        let non_empty = results.values().filter(|r| !r.points.is_empty()).count();
+        let non_empty = results.values().filter(|r| !r.empty_geometry).count();
         println!("  {} shapes have non-empty geometry.", non_empty);
         if non_empty < results.len() {
             println!(
@@ -421,7 +444,7 @@ impl StreamingMatcher {
 
         Some(ShapeResult {
             shape_id,
-            points: geometry,
+            empty_geometry: geometry.is_empty(),
             matched_route_color: matched_colour,
         })
     }

@@ -98,132 +98,6 @@ struct Args {
     low_priority: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct ShapePoint {
-    pub geometry: Point<f64>,
-    pub sequence: usize,
-}
-
-#[derive(Deserialize)]
-struct RawShape {
-    #[serde(rename = "shape_id")]
-    pub id: String,
-    #[serde(rename = "shape_pt_lat")]
-    pub latitude: f64,
-    #[serde(rename = "shape_pt_lon")]
-    pub longitude: f64,
-    #[serde(rename = "shape_pt_sequence")]
-    pub sequence: usize,
-    // #[serde(rename = "shape_dist_traveled")]
-    // pub dist_traveled: Option<f32>,
-}
-
-#[derive(serde::Serialize)]
-struct ShapeRecordOut<'a> {
-    shape_id: &'a str,
-    shape_pt_lat: f64,
-    shape_pt_lon: f64,
-    shape_pt_sequence: usize,
-}
-
-/// O(n) check; only sort if any sequence is out of order.
-fn maybe_sort_by_sequence(points: &mut Vec<ShapePoint>) {
-    if points.len() < 2 {
-        return;
-    }
-
-    let mut prev = points[0].sequence;
-    let mut sorted = true;
-
-    for p in points.iter().skip(1) {
-        if p.sequence < prev {
-            sorted = false;
-            break;
-        }
-        prev = p.sequence;
-    }
-
-    if !sorted {
-        // In-place, no extra allocation
-        points.sort_unstable_by_key(|p| p.sequence);
-    }
-}
-
-/// Reads a shapes.txt file and aggregates points into a HashMap.
-///
-/// This implementation assumes the input CSV is sorted by `shape_id` for efficiency,
-/// but will handle unsorted data correctly (just less efficiently due to lookups/resizing).
-/// ACTUALLY, the streaming logic provided by user *relies* on sorting to flush.
-/// If not sorted, we'd overwrite or need to append.
-/// Most GTFS shapes.txt are sorted. If not, this logic effectively splits them if they are interleaved
-/// (which is fine, we just get multiple entries potentially? No, HashMap overwrites).
-/// NO, the user logic accumulates `current_points` and inserts once ID changes.
-/// If IDs are interleaved (A, B, A), we would insert A, then B, then overwrite A with the second chunk.
-/// This would be DATA LOSS for interleaved files.
-/// To be SAFE, we should probably check if key exists and append?
-/// OR, just assume standard GTFS which is grouped. usage of `sort` command on linux can ensure this
-/// but we are in rust.
-/// Let's assume standard grouping.
-pub fn faster_shape_reader(
-    path: PathBuf,
-) -> Result<AHashMap<String, Vec<ShapePoint>>, Box<dyn Error>> {
-    let file = File::open(path).context("Failed to open shapes.txt")?;
-    let buf_reader = BufReader::new(file);
-    let mut rdr = csv::Reader::from_reader(buf_reader);
-
-    // Initial capacity guess
-    let mut shapes: AHashMap<String, Vec<ShapePoint>> = AHashMap::with_capacity(1000);
-
-    // State buffers
-    let mut current_points: Vec<ShapePoint> = Vec::with_capacity(500);
-    let mut current_shape_id: Option<String> = None;
-
-    for result in rdr.deserialize() {
-        let record: RawShape = result?;
-
-        if let Some(ref curr_id) = current_shape_id {
-            if *curr_id != record.id {
-                // ID changed
-                if !current_points.is_empty() {
-                    maybe_sort_by_sequence(&mut current_points);
-                    // If key exists (interleaved), we append?
-                    // Safe approach: entry().or_default().extend(...)
-                    shapes
-                        .entry(curr_id.clone())
-                        .or_default()
-                        .append(&mut current_points); // Moves contents
-
-                    // current_points is now empty but capacity kept?
-                    // append moves elements. Capacity of `current_points` remains?
-                    // No, `append` drains other. `current_points` becomes empty.
-                    // We might need to re-reserve if capacity dropped? Usually Vec keeps capacity.
-                }
-                current_shape_id = Some(record.id.clone());
-            }
-        } else {
-            current_shape_id = Some(record.id.clone());
-        }
-
-        let point = ShapePoint {
-            geometry: Point::new(record.longitude, record.latitude),
-            sequence: record.sequence,
-        };
-        current_points.push(point);
-    }
-
-    if let Some(last_id) = current_shape_id {
-        if !current_points.is_empty() {
-            maybe_sort_by_sequence(&mut current_points);
-            shapes
-                .entry(last_id)
-                .or_default()
-                .append(&mut current_points);
-        }
-    }
-
-    Ok(shapes)
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     println!("Running pfaedle-rs with args: {:?}", args);
@@ -253,38 +127,38 @@ fn main() -> Result<()> {
     let gtfs_data = gtfs_load::load_gtfs(&args.gtfs_dir, &allowed_mots)
         .context("Failed to load GTFS for Pfaedle")?;
 
+    #[derive(Deserialize)]
+    struct RawShape {
+        #[serde(rename = "shape_id")]
+        pub id: String,
+        #[serde(rename = "shape_pt_lat")]
+        pub latitude: f64,
+        #[serde(rename = "shape_pt_lon")]
+        pub longitude: f64,
+        #[serde(rename = "shape_pt_sequence")]
+        pub sequence: usize,
+    }
+
+    #[derive(serde::Serialize)]
+    struct ShapeRecordOut<'a> {
+        shape_id: &'a str,
+        shape_pt_lat: f64,
+        shape_pt_lon: f64,
+        shape_pt_sequence: usize,
+    }
+
     // 2. Match Patterns (loads OSM on demand)
     // We strictly skip processing small roads for performance unless configured otherwise
-    let results = matcher::match_patterns(&gtfs_data, &args.osm_file, args.skip_small_roads)?;
+    let cache_file_path = out_dir.join("shapes_cache.bin");
+    let results = matcher::match_patterns(
+        &gtfs_data,
+        &args.osm_file,
+        args.skip_small_roads,
+        &cache_file_path,
+    )?;
 
     // 4. Write shapes.txt
     println!("Updating shapes.txt at {:?}", shapes_path);
-
-    let mut all_shapes: AHashMap<String, Vec<ShapePoint>> = AHashMap::new();
-
-    if shapes_path.exists() {
-        // Optimization: If we are going to wipe all shapes anyway, don't read them!
-        let will_wipe_all = args.mots == "all" && args.wipe_shapes;
-
-        if !will_wipe_all {
-            println!("Reading existing shapes (optimized)...");
-            // Use our new faster reader
-            match faster_shape_reader(shapes_path.clone()) {
-                Ok(shapes) => {
-                    all_shapes = shapes;
-                    println!("Loaded {} existing shapes.", all_shapes.len());
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to read existing shapes: {}. Proceeding with empty set.",
-                        e
-                    );
-                }
-            }
-        } else {
-            println!("Skipping read of existing shapes because wipe_shapes is set and MOTs=all.");
-        }
-    }
 
     // Determine shapes to wipe/replace based on selected MOTs
     let mut shapes_to_replace = ahash::AHashSet::new();
@@ -307,87 +181,80 @@ fn main() -> Result<()> {
             "Identified {} shape_ids for selected MOTs.",
             shapes_to_replace.len()
         );
+    }
 
-        // When wipe_shapes is set, remove these shapes (even before computing new ones)
-        if args.wipe_shapes && !shapes_to_replace.is_empty() {
-            let before_count = all_shapes.len();
-            all_shapes.retain(|id, _| !shapes_to_replace.contains(id));
-            println!(
-                "Wiped {} shapes for selected MOTs (kept {} other shapes).",
-                before_count - all_shapes.len(),
-                all_shapes.len()
-            );
-        }
-    } else {
-        if args.wipe_shapes {
-            println!("MOTs='all' and wipe_shapes=true. Clearing all existing shapes.");
-            all_shapes.clear();
+    let will_wipe_all = args.mots == "all" && args.wipe_shapes;
+    let shapes_new_path = out_dir.join("shapes-new.txt");
+
+    let mut wtr = csv::Writer::from_path(&shapes_new_path)?;
+
+    let mut new_shape_ids = ahash::AHashSet::new();
+    for res in results.values() {
+        if !res.empty_geometry {
+            new_shape_ids.insert(res.shape_id.clone());
         }
     }
 
-    // Remove obsolete shapes (only if not already wiped above)
-    if !args.wipe_shapes && !shapes_to_replace.is_empty() {
-        let before_count = all_shapes.len();
-        all_shapes.retain(|id, _| !shapes_to_replace.contains(id));
-        println!(
-            "Pruned {} existing shapes (kept {}).",
-            before_count - all_shapes.len(),
-            all_shapes.len()
-        );
-    }
-
-    // Insert NEW shapes
-    println!(
-        "Inserting {} new shapes from matching results...",
-        results.len()
-    );
-    let mut empty_geom_count = 0;
-    for shape_res in results.values() {
-        if shape_res.points.is_empty() {
-            empty_geom_count += 1;
-            continue; // Skip empty geometries
-        }
-        let mut points = Vec::with_capacity(shape_res.points.len());
-        for (i, (lat, lon)) in shape_res.points.iter().enumerate() {
-            points.push(ShapePoint {
-                geometry: Point::new(*lon, *lat),
-                sequence: i + 1,
-            });
-        }
-        all_shapes.insert(shape_res.shape_id.clone(), points);
-    }
-    if empty_geom_count > 0 {
-        println!(
-            "  WARNING: Skipped {} shapes with empty geometry!",
-            empty_geom_count
-        );
-    }
-    println!("Total shapes to write: {}", all_shapes.len());
-
-    // Write everything back
-    // We should probably sort by shape_id to be nice?
-    // And for each shape, ensure points valid?
-    let mut wtr = csv::Writer::from_path(&shapes_path)?;
-
-    // Convert HashMap to Vec for sorting keys (optional but good practice for consistency)
-    let mut sorted_keys: Vec<&String> = all_shapes.keys().collect();
-    sorted_keys.sort();
-
-    for key in sorted_keys {
-        if let Some(points) = all_shapes.get(key) {
-            for point in points {
-                wtr.serialize(ShapeRecordOut {
-                    shape_id: key,
-                    shape_pt_lat: point.geometry.y(),
-                    shape_pt_lon: point.geometry.x(),
-                    shape_pt_sequence: point.sequence,
-                })?;
+    if shapes_path.exists() && !will_wipe_all {
+        println!("Streaming existing shapes (optimized)...");
+        match csv::Reader::from_path(&shapes_path) {
+            Ok(mut rdr) => {
+                for result in rdr.deserialize() {
+                    let record: RawShape = match result {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("Warning: Error reading shape record: {}", e);
+                            continue;
+                        }
+                    };
+                    // Keep the old shape only if it's not explicitly replaced by MOT selection AND not overwritten by a newly matched shape.
+                    if !shapes_to_replace.contains(&record.id)
+                        && !new_shape_ids.contains(&record.id)
+                    {
+                        wtr.serialize(ShapeRecordOut {
+                            shape_id: &record.id,
+                            shape_pt_lat: record.latitude,
+                            shape_pt_lon: record.longitude,
+                            shape_pt_sequence: record.sequence,
+                        })?;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: Failed to read existing shapes: {}. Proceeding with empty set.",
+                    e
+                );
             }
         }
     }
 
+    // Insert NEW shapes
+    println!("Appending new shapes from cache...");
+    let mut new_shapes_count = 0;
+    if cache_file_path.exists() {
+        let cache_file = File::open(&cache_file_path)?;
+        let mut cache_reader = BufReader::new(cache_file);
+        while let Ok(rec) =
+            bincode::deserialize_from::<_, crate::matcher::BinaryShapeRecord>(&mut cache_reader)
+        {
+            wtr.serialize(ShapeRecordOut {
+                shape_id: &rec.shape_id,
+                shape_pt_lat: rec.shape_pt_lat,
+                shape_pt_lon: rec.shape_pt_lon,
+                shape_pt_sequence: rec.shape_pt_sequence,
+            })?;
+            new_shapes_count += 1;
+        }
+
+        std::fs::remove_file(&cache_file_path).ok();
+    }
+    println!("Total new shape points written: {}", new_shapes_count);
+
     wtr.flush()?;
     drop(wtr);
+
+    std::fs::rename(&shapes_new_path, &shapes_path)?;
 
     // 5. Update trips.txt
     // We need to associate trips with new shape_ids
