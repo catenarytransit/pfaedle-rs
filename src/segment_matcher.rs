@@ -383,6 +383,7 @@ impl<'a> SegmentMatcher<'a> {
                     0,
                     None,
                     preferred_match,
+                    None,
                 ) {
                     if best_path.is_none() || cost < best_path.as_ref().unwrap().0 {
                         best_path = Some((cost, edges));

@@ -96,6 +96,10 @@ struct Args {
     /// Run with low priority (nice 10)
     #[arg(long, default_value_t = false)]
     low_priority: bool,
+
+    /// Number of concurrent full-graph matching workers
+    #[arg(long, default_value_t = 2)]
+    match_threads: usize,
 }
 
 fn main() -> Result<()> {
@@ -155,6 +159,7 @@ fn main() -> Result<()> {
         &args.osm_file,
         args.skip_small_roads,
         &cache_file_path,
+        args.match_threads,
     )?;
 
     // 4. Write shapes.txt

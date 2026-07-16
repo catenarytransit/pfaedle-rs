@@ -35,6 +35,7 @@ pub fn match_patterns(
     osm_path: &std::path::Path,
     skip_small_roads: bool,
     cache_file_path: &std::path::Path,
+    match_threads: usize,
 ) -> Result<AHashMap<StopPattern, ShapeResult>, anyhow::Error> {
     use crate::mots::is_bus_like_route_type;
     use crate::osm_load::OsmBuilder;
@@ -42,12 +43,10 @@ pub fn match_patterns(
     use crate::streaming_matcher::StreamingMatcher;
     use anyhow::Context;
 
-    // 1. Light OSM pass for relations/colors
-    println!("Performing light OSM pass...");
-    let light_osm =
-        OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?;
+    // Truncate stale output from a previous failed/OOM run.
+    std::fs::File::create(cache_file_path).context("Failed to truncate cache file")?;
 
-    // 2. Partition patterns: bus-like -> tiled, others -> full-graph
+    // 1. Partition patterns: bus-like -> tiled, others -> full-graph
     let (bus_patterns, other_patterns): (Vec<_>, Vec<_>) = gtfs
         .patterns
         .iter()
@@ -60,6 +59,18 @@ pub fn match_patterns(
         "Partitioned patterns: {} bus-like (streaming), {} other (full-graph)",
         bus_count, other_count
     );
+
+    // 2. Light OSM pass for relations/colors (only if needed by bus patterns)
+    let light_osm = if bus_count > 0 {
+        println!("Performing light OSM pass...");
+        OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?
+    } else {
+        println!("No bus-like patterns found. Skipping light OSM pass.");
+        crate::osm_load::LightOsmData {
+            relations: Vec::new(),
+            way_to_relations: ahash::AHashMap::new(),
+        }
+    };
 
     // 3. Process non-bus patterns with existing full-graph approach
     let other_results = if other_count > 0 {
@@ -118,32 +129,13 @@ pub fn match_patterns(
         println!("  Calculated bbox for {} patterns: {:?}", other_count, bbox);
         let osm_data = load_osm(osm_path, &types, bbox, false)?;
 
-        let other_results_with_geom = match_patterns_full_graph(&gtfs, &osm_data, other_patterns);
-
-        // Stream generated points to the cache file immediately
-        let mut cache_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(cache_file_path)?;
-        let mut writer = BufWriter::new(cache_file);
-
-        let mut results = AHashMap::new();
-        for (pattern, (shape_res, points)) in other_results_with_geom {
-            if !shape_res.empty_geometry {
-                for (i, p) in points.into_iter().enumerate() {
-                    let record = BinaryShapeRecord {
-                        shape_id: shape_res.shape_id.clone(),
-                        shape_pt_lat: p.0,
-                        shape_pt_lon: p.1,
-                        shape_pt_sequence: i + 1,
-                    };
-                    bincode::serialize_into(&mut writer, &record)
-                        .context("Failed to write to cache file")?;
-                }
-            }
-            results.insert(pattern, shape_res);
-        }
-        writer.flush()?;
+        let results = match_patterns_full_graph(
+            &gtfs,
+            &osm_data,
+            other_patterns,
+            cache_file_path,
+            match_threads,
+        )?;
         results
     } else {
         println!("No non-bus patterns found. Skipping full graph load.");
@@ -207,390 +199,251 @@ fn match_patterns_full_graph(
     gtfs: &GtfsData,
     osm: &OsmData,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
-) -> AHashMap<StopPattern, (ShapeResult, Vec<(f64, f64)>)> {
-    let total_patterns = patterns.len();
-    let processed = AtomicUsize::new(0);
+    cache_file_path: &std::path::Path,
+    match_threads: usize,
+) -> anyhow::Result<AHashMap<StopPattern, ShapeResult>> {
+    use rayon::prelude::*;
+    use std::fs::OpenOptions;
+    use std::io::{BufWriter, Write};
 
+    let total_patterns = patterns.len();
+    let mut processed = 0;
     println!("Matching {} patterns (full-graph)...", total_patterns);
 
-    let results: AHashMap<StopPattern, (ShapeResult, Vec<(f64, f64)>)> = patterns
-        .par_iter()
-        .map_with(
-            pathfinding::PathfinderContext::new(),
-            |ctx, (pattern, _trips)| {
-                let current_processed = processed.fetch_add(1, Ordering::Relaxed);
-                if current_processed % 100 == 0 {
-                    println!("Processed {}/{}", current_processed, total_patterns);
-                }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(cache_file_path)?;
+    let mut writer = BufWriter::new(file);
 
-                // 0. Extract Route/Agency Info for Matching
-                let sample_trip_id = &gtfs.patterns.get(*pattern).unwrap()[0];
-                let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
-                let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(match_threads)
+        .build()?;
 
-                // Find agency
-                let agency_name = if let Some(agency_id) = &route.agency_id {
-                    gtfs.gtfs
-                        .agencies
-                        .iter()
-                        .find(|a| a.id.as_ref() == Some(agency_id))
-                        .map(|a| a.name.to_lowercase())
-                } else {
-                    None
-                };
+    let mut results = AHashMap::with_capacity(patterns.len());
+    let batch_size = (match_threads * 2).max(1);
 
-                let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
-                let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
+    for batch in patterns.chunks(batch_size) {
+        let batch_results: Vec<_> = pool.install(|| {
+            batch
+                .par_iter()
+                .map_init(
+                    pathfinding::PathfinderContext::new,
+                    |ctx, (pattern, trips)| {
+                        let res = match_one_pattern(gtfs, osm, pattern, trips, ctx);
+                        ctx.discard_if_oversized(500_000);
+                        res
+                    },
+                )
+                .collect()
+        });
 
-                let preferred_match = TransitMatch {
-                    short_name: route_short_name.clone(),
-                    long_name: route_long_name.clone(),
-                    operator: agency_name.clone(),
-                };
+        for matched in batch_results.into_iter().flatten() {
+            let (pattern, shape_result, points) = matched;
 
-                // 1. Get Stop Coordinates
-                let mut stop_coords = Vec::new();
-                for stop_id in &pattern.stop_ids {
-                    if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
-                        // Geo: x=lon, y=lat. Handle Option fields.
-                        if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
-                            stop_coords.push(Point::new(lon, lat));
-                        }
-                    }
-                }
-
-                if stop_coords.len() < 2 {
-                    return None;
-                }
-
-                let allowed_modes = match pattern.route_type {
-                    Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
-                    Some(RouteType::Subway) => MODE_SUBWAY,
-                    Some(RouteType::Rail) => MODE_RAIL,
-                    Some(RouteType::Ferry) => MODE_FERRY,
-                    Some(RouteType::Gondola)
-                    | Some(RouteType::Funicular)
-                    | Some(RouteType::CableCar) => MODE_GONDOLA,
-                    _ => MODE_BUS,
-                };
-
-                let fallback_modes = match pattern.route_type {
-                    Some(RouteType::Tramway) => MODE_SUBWAY | MODE_RAIL,
-                    Some(RouteType::Subway) => MODE_TRAM | MODE_RAIL,
-                    Some(RouteType::Rail) => MODE_SUBWAY | MODE_TRAM,
-                    _ => 0,
-                };
-                let all_allowed_modes = allowed_modes | fallback_modes;
-
-                // 2. Snap to nearest OSM nodes (Candidates)
-                if osm.spatial_tree.is_none() {
-                    return None;
-                }
-                let index = osm.spatial_tree.as_ref().unwrap();
-
-                let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
-                // How many candidates to consider per stop?
-                // We fetch more initially, then filter down to a smaller set of diverse candidates.
-
-                let (search_node_limit, target_candidates, max_dist_meters) =
-                    if allowed_modes == MODE_RAIL {
-                        (4000, 20, 500.0)
-                    } else if allowed_modes == MODE_BUS {
-                        (100, 10, 40.0)
-                    } else {
-                        (100, 20, f64::INFINITY)
+            if !shape_result.empty_geometry {
+                for (sequence, (lat, lon)) in points.into_iter().enumerate() {
+                    let record = BinaryShapeRecord {
+                        shape_id: shape_result.shape_id.clone(),
+                        shape_pt_lat: lat,
+                        shape_pt_lon: lon,
+                        shape_pt_sequence: sequence + 1,
                     };
 
-                for point in &stop_coords {
-                    let search_limit = search_node_limit;
-
-                    // For rail, we also want to filter by distance.
-                    // The index gives us nearest neighbors, but valid tracks might be a bit further away (up to 200m)
-                    // We'll iterate until we find enough valid ones OR we exceed max distance.
-
-                    let neighbors = index
-                        .nearest_neighbor_iter(&[point.x(), point.y()])
-                        .filter(|sn| (sn.modes & all_allowed_modes) != 0)
-                        .take(search_limit);
-
-                    let mut candidates: Vec<usize> = Vec::new();
-                    let mut matched_candidates: Vec<usize> = Vec::new();
-                    let mut other_candidates: Vec<usize> = Vec::new();
-
-                    let mut seen_ways: AHashSet<i64> = AHashSet::new();
-                    let mut fallback_candidates: Vec<usize> = Vec::new();
-
-                    for sn in neighbors {
-                        // Check distance
-                        if max_dist_meters < f64::INFINITY {
-                            let node_pl = &osm.graph.node(sn.index).payload;
-                            let dist = node_pl
-                                .point
-                                .haversine_distance(&Point::new(point.x(), point.y()));
-                            if dist > max_dist_meters {
-                                // Too far, stop searching
-                                break;
-                            }
-                        }
-
-                        let node_idx = sn.index;
-                        let node = osm.graph.node(node_idx);
-
-                        // Check if this node matches our route!
-                        // Check Edges
-                        let mut node_matches = false;
-                        for &edge_idx in &node.edges {
-                            let edge = osm.graph.edge(edge_idx);
-                            // Check lines
-                            for line in &edge.payload.lines {
-                                let mut line_matches = false;
-                                // Check short name
-                                if let (Some(target), Some(line_name)) =
-                                    (&preferred_match.short_name, Some(&line.short_name))
-                                {
-                                    if target.contains(&line_name.to_lowercase())
-                                        || line_name.to_lowercase().contains(target)
-                                    {
-                                        line_matches = true;
-                                    }
-                                }
-
-                                // Check operator
-                                if !line_matches {
-                                    if let (Some(target_op), Some(line_op)) =
-                                        (&preferred_match.operator, &line.operator)
-                                    {
-                                        if target_op.contains(&line_op.to_lowercase())
-                                            || line_op.to_lowercase().contains(target_op)
-                                        {
-                                            line_matches = true;
-                                        }
-                                    }
-                                }
-                                if line_matches {
-                                    node_matches = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Check Relations
-                        if !node_matches {
-                            if let Some(rels) = osm.node_to_relations.get(&node_idx) {
-                                for &r_idx in rels {
-                                    let rel = &osm.relations[r_idx];
-                                    let osm_names = [
-                                        rel.tags.get("ref"),
-                                        rel.tags.get("name"),
-                                        rel.tags.get("official_name"),
-                                        rel.tags.get("alt_name"),
-                                    ];
-                                    let mut name_matched = false;
-                                    for osm_name_opt in osm_names {
-                                        if let Some(osm_name) = osm_name_opt {
-                                            let osm_val = osm_name.to_lowercase();
-                                            if let Some(ref gtfs_short) = preferred_match.short_name
-                                            {
-                                                if osm_val.contains(gtfs_short)
-                                                    || gtfs_short.contains(&osm_val)
-                                                {
-                                                    name_matched = true;
-                                                }
-                                            }
-                                            if let Some(ref gtfs_long) = preferred_match.long_name {
-                                                if osm_val.contains(gtfs_long)
-                                                    || gtfs_long.contains(&osm_val)
-                                                {
-                                                    name_matched = true;
-                                                }
-                                            }
-                                        }
-                                        if name_matched {
-                                            break;
-                                        }
-                                    }
-                                    if name_matched {
-                                        node_matches = true;
-                                        break;
-                                    }
-                                    // Operator check
-                                    if let (Some(target_op), Some(osm_op)) =
-                                        (&preferred_match.operator, rel.tags.get("operator"))
-                                    {
-                                        if target_op.contains(&osm_op.to_lowercase())
-                                            || osm_op.to_lowercase().contains(target_op)
-                                        {
-                                            node_matches = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Identify ways this node belongs to
-                        let mut node_ways = Vec::new();
-                        for &edge_idx in &node.edges {
-                            let edge = osm.graph.edge(edge_idx);
-                            if edge.payload.osmid != 0 {
-                                node_ways.push(edge.payload.osmid);
-                            }
-                        }
-
-                        // Check if this node introduces a new way
-                        let is_new_way = node_ways.iter().any(|w| !seen_ways.contains(w));
-
-                        if node_matches {
-                            // High priority!
-                            matched_candidates.push(node_idx);
-                            // Also prevent using ways again? Or allow multiples if matched?
-                            // Let's mark ways as seen so we don't spam the same way.
-                            for w in node_ways {
-                                seen_ways.insert(w);
-                            }
-                        } else if is_new_way {
-                            if other_candidates.len() < target_candidates {
-                                other_candidates.push(node_idx);
-                            }
-                            for w in node_ways {
-                                seen_ways.insert(w);
-                            }
-                        } else {
-                            // Also keep some fallbacks just in case
-                            if fallback_candidates.len() < target_candidates {
-                                fallback_candidates.push(node_idx);
-                            }
-                        }
-
-                        if matched_candidates.len() >= target_candidates {
-                            break;
-                        }
-                    }
-
-                    // Decision: If we found ANY matches, we use ONLY matches.
-                    // This prevents "Great Eastern Main Line" from polluting "Elizabeth Line" results if Elizabeth Line exists.
-                    if !matched_candidates.is_empty() {
-                        candidates = matched_candidates;
-                    } else {
-                        candidates = other_candidates;
-                    }
-
-                    // If we didn't find enough unique-way candidates, fill up with fallbacks
-                    if candidates.len() < 5 {
-                        let needed = 5 - candidates.len();
-                        for &fb in fallback_candidates.iter().take(needed) {
-                            candidates.push(fb);
-                        }
-                    }
-
-                    // Limit to TARGET just in case fallbacks pushed over (unlikely with logic above but good for safety)
-                    // Actually fallback logic above ensures we have at least 5 if possible.
-                    // If we stopped loop at TARGET_CANDIDATES, we are good.
-
-                    if candidates.is_empty() {
-                        // If we can't snap a stop, we can't route properly?
-                        // For now, keep empty vec, handle downstream
-                    }
-                    stop_candidates.push(candidates);
+                    bincode::serialize_into(&mut writer, &record)?;
                 }
+            }
 
-                if stop_candidates.len() != stop_coords.len()
-                    || stop_candidates.iter().any(|c| c.is_empty())
-                {
-                    // If any stop failed to snap, we might have issues.
-                    // But let's proceed if majority are there? No, hard fail for now or fallback?
-                    // Actually original logic continued if len != len.
-                    if stop_candidates.len() != stop_coords.len() {
-                        // println!("Warning: Could not snap all stops for pattern");
-                        return None;
+            results.insert(pattern, shape_result);
+        }
+
+        processed += batch.len();
+        println!("Processed {}/{}", processed, total_patterns);
+    }
+
+    writer.flush()?;
+    Ok(results)
+}
+
+fn match_one_pattern(
+    gtfs: &GtfsData,
+    osm: &OsmData,
+    pattern: &StopPattern,
+    _trips: &Vec<String>,
+    ctx: &mut pathfinding::PathfinderContext,
+) -> Option<(StopPattern, ShapeResult, Vec<(f64, f64)>)> {
+    // 0. Extract Route/Agency Info for Matching
+    let sample_trip_id = &gtfs.patterns.get(pattern).unwrap()[0];
+    let trip = gtfs.gtfs.trips.get(sample_trip_id).unwrap();
+    let route = gtfs.gtfs.routes.get(&trip.route_id).unwrap();
+
+    // Find agency
+    let agency_name = if let Some(agency_id) = &route.agency_id {
+        gtfs.gtfs
+            .agencies
+            .iter()
+            .find(|a| a.id.as_ref() == Some(agency_id))
+            .map(|a| a.name.to_lowercase())
+    } else {
+        None
+    };
+
+    let route_short_name = route.short_name.as_ref().map(|s| s.to_lowercase());
+    let route_long_name = route.long_name.as_ref().map(|s| s.to_lowercase());
+
+    let preferred_match = TransitMatch {
+        short_name: route_short_name.clone(),
+        long_name: route_long_name.clone(),
+        operator: agency_name.clone(),
+    };
+
+    // 1. Get Stop Coordinates
+    let mut stop_coords = Vec::new();
+    for stop_id in &pattern.stop_ids {
+        if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
+            // Geo: x=lon, y=lat. Handle Option fields.
+            if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
+                stop_coords.push(Point::new(lon, lat));
+            }
+        }
+    }
+
+    if stop_coords.len() < 2 {
+        return None;
+    }
+
+    let allowed_modes = match pattern.route_type {
+        Some(RouteType::Tramway) => MODE_TRAM, // Trams can sometimes use bus lanes/road, but mostly track. Sticking to TRAM.
+        Some(RouteType::Subway) => MODE_SUBWAY,
+        Some(RouteType::Rail) => MODE_RAIL,
+        Some(RouteType::Ferry) => MODE_FERRY,
+        Some(RouteType::Gondola) | Some(RouteType::Funicular) | Some(RouteType::CableCar) => {
+            MODE_GONDOLA
+        }
+        _ => MODE_BUS,
+    };
+
+    let fallback_modes = match pattern.route_type {
+        Some(RouteType::Tramway) => MODE_SUBWAY | MODE_RAIL,
+        Some(RouteType::Subway) => MODE_TRAM | MODE_RAIL,
+        Some(RouteType::Rail) => MODE_SUBWAY | MODE_TRAM,
+        _ => 0,
+    };
+    let all_allowed_modes = allowed_modes | fallback_modes;
+
+    // 2. Snap to nearest OSM nodes (Candidates)
+    if osm.spatial_tree.is_none() {
+        return None;
+    }
+    let index = osm.spatial_tree.as_ref().unwrap();
+
+    let mut stop_candidates: Vec<Vec<usize>> = Vec::new();
+    // How many candidates to consider per stop?
+    // We fetch more initially, then filter down to a smaller set of diverse candidates.
+
+    let (search_node_limit, target_candidates, max_dist_meters) = if allowed_modes == MODE_RAIL {
+        (4000, 20, 500.0)
+    } else if allowed_modes == MODE_BUS {
+        (100, 10, 40.0)
+    } else {
+        (100, 20, f64::INFINITY)
+    };
+
+    for point in &stop_coords {
+        let search_limit = search_node_limit;
+
+        // For rail, we also want to filter by distance.
+        // The index gives us nearest neighbors, but valid tracks might be a bit further away (up to 200m)
+        // We'll iterate until we find enough valid ones OR we exceed max distance.
+
+        let neighbors = index
+            .nearest_neighbor_iter(&[point.x(), point.y()])
+            .filter(|sn| (sn.modes & all_allowed_modes) != 0)
+            .take(search_limit);
+
+        let mut candidates: Vec<usize> = Vec::new();
+        let mut matched_candidates: Vec<usize> = Vec::new();
+        let mut other_candidates: Vec<usize> = Vec::new();
+
+        let mut seen_ways: AHashSet<i64> = AHashSet::new();
+        let mut fallback_candidates: Vec<usize> = Vec::new();
+
+        for sn in neighbors {
+            // Check distance
+            if max_dist_meters < f64::INFINITY {
+                let node_pl = &osm.graph.node(sn.index).payload;
+                let dist = node_pl
+                    .point
+                    .haversine_distance(&Point::new(point.x(), point.y()));
+                if dist > max_dist_meters {
+                    // Too far, stop searching
+                    break;
+                }
+            }
+
+            let node_idx = sn.index;
+            let node = osm.graph.node(node_idx);
+
+            // Check if this node matches our route!
+            // Check Edges
+            let mut node_matches = false;
+            for &edge_idx in &node.edges {
+                let edge = osm.graph.edge(edge_idx);
+                // Check lines
+                for line in &edge.payload.lines {
+                    let mut line_matches = false;
+                    // Check short name
+                    if let (Some(target), Some(line_name)) =
+                        (&preferred_match.short_name, Some(&line.short_name))
+                    {
+                        if target.contains(&line_name.to_lowercase())
+                            || line_name.to_lowercase().contains(target)
+                        {
+                            line_matches = true;
+                        }
+                    }
+
+                    // Check operator
+                    if !line_matches {
+                        if let (Some(target_op), Some(line_op)) =
+                            (&preferred_match.operator, &line.operator)
+                        {
+                            if target_op.contains(&line_op.to_lowercase())
+                                || line_op.to_lowercase().contains(target_op)
+                            {
+                                line_matches = true;
+                            }
+                        }
+                    }
+                    if line_matches {
+                        node_matches = true;
+                        break;
                     }
                 }
+            }
 
-                // 3. Try Relation Matching
-                let mut full_path_geometry = Vec::new();
-                let mut relation_found = false;
-
-                // GTFS Info hoisted above
-
-                // Relation Candidate logic
-                // Vote for relations based on ALL candidates
-                // Scoring: Calculate coverage ratio (stops covered / total stops)
-                // Map: Relation Index -> (Coverage Score, Candidate Count)
-
-                let mut relation_scores: AHashMap<usize, (f64, usize)> = AHashMap::new();
-
-                for candidates in &stop_candidates {
-                    // Identify unique relations covering this stop
-                    let mut seen_for_stop = AHashSet::new();
-                    for &node_idx in candidates {
-                        if let Some(rels) = osm.node_to_relations.get(&node_idx) {
-                            for &r_idx in rels {
-                                if seen_for_stop.insert(r_idx) {
-                                    // First time this relation covers this stop
-                                    let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
-                                    entry.0 += 1.0;
-                                }
-                                // Increment candidate count
-                                let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
-                                entry.1 += 1;
-                            }
-                        }
-                    }
-                }
-
-                let mut candidates: Vec<usize> = relation_scores
-                    .iter()
-                    .filter(|(r_idx, (_covered_stops, _count))| {
-                        let rel = &osm.relations[**r_idx];
-
-                        if stop_candidates.is_empty() {
-                            return false;
-                        }
-
-                        let start_candidates = &stop_candidates[0];
-                        let end_candidates = stop_candidates.last().unwrap();
-                        let has_start = start_candidates.iter().any(|&n| rel.nodes.contains(&n));
-                        let has_end = end_candidates.iter().any(|&n| rel.nodes.contains(&n));
-
-                        has_start && has_end
-                    })
-                    .map(|(k, _)| *k)
-                    .collect();
-
-                // Sort candidates by:
-                // 1. Coverage Score (Desc)
-                // 2. Name/Operator Match (Desc)
-                // 3. Candidate Count (Desc)
-                candidates.sort_by(|&a, &b| {
-                    let (score_a, count_a) = relation_scores[&a];
-                    let (score_b, count_b) = relation_scores[&b];
-
-                    // Calculate Match Score
-                    let get_match_score = |r_idx: usize| -> u8 {
+            // Check Relations
+            if !node_matches {
+                if let Some(rels) = osm.node_to_relations.get(&node_idx) {
+                    for &r_idx in rels {
                         let rel = &osm.relations[r_idx];
-                        let mut match_score = 0;
-
-                        // Name Match
-                        // Check 'ref', 'name', 'official_name', 'alt_name'
                         let osm_names = [
                             rel.tags.get("ref"),
                             rel.tags.get("name"),
                             rel.tags.get("official_name"),
                             rel.tags.get("alt_name"),
                         ];
-
                         let mut name_matched = false;
                         for osm_name_opt in osm_names {
                             if let Some(osm_name) = osm_name_opt {
                                 let osm_val = osm_name.to_lowercase();
-                                // Check containment both ways
-                                if let Some(ref gtfs_short) = route_short_name {
+                                if let Some(ref gtfs_short) = preferred_match.short_name {
                                     if osm_val.contains(gtfs_short) || gtfs_short.contains(&osm_val)
                                     {
                                         name_matched = true;
                                     }
                                 }
-                                if let Some(ref gtfs_long) = route_long_name {
+                                if let Some(ref gtfs_long) = preferred_match.long_name {
                                     if osm_val.contains(gtfs_long) || gtfs_long.contains(&osm_val) {
                                         name_matched = true;
                                     }
@@ -601,172 +454,344 @@ fn match_patterns_full_graph(
                             }
                         }
                         if name_matched {
-                            match_score += 2;
-                        }
-
-                        // Operator Match
-                        if let Some(target_op) = &agency_name {
-                            if let Some(osm_op) = rel.tags.get("operator") {
-                                if osm_op.to_lowercase().contains(target_op)
-                                    || target_op.contains(&osm_op.to_lowercase())
-                                {
-                                    match_score += 1;
-                                }
-                            }
-                        }
-
-                        match_score
-                    };
-
-                    let match_a = get_match_score(a);
-                    let match_b = get_match_score(b);
-
-                    // Compare scores (f64)
-                    score_b
-                        .partial_cmp(&score_a)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| match_b.cmp(&match_a))
-                        .then_with(|| count_b.cmp(&count_a))
-                });
-
-                let mut matched_route_color = None;
-
-                for r_idx in candidates {
-                    let rel = &osm.relations[r_idx];
-
-                    let mut candidate_geometry = Vec::new();
-                    let mut current_node_idx_opt = None; // Track the actual chosen node for the previous stop
-
-                    // Select best start node for this relation
-                    if let Some(first_candidates) = stop_candidates.first() {
-                        // Find closest candidate that is IN the relation
-                        // Candidates are already sorted by distance (nearest_neighbor_iter)
-                        if let Some(&start_node) =
-                            first_candidates.iter().find(|&n| rel.nodes.contains(n))
-                        {
-                            let start_pl = &osm.graph.node(start_node).payload;
-                            candidate_geometry.push((start_pl.point.y(), start_pl.point.x()));
-                            current_node_idx_opt = Some(start_node);
-                        }
-                    }
-
-                    if current_node_idx_opt.is_none() {
-                        continue; // Couldn't find valid start for this relation
-                    }
-
-                    let mut possible = true;
-                    let mut current_node = current_node_idx_opt.unwrap();
-
-                    for i in 0..stop_candidates.len() - 1 {
-                        let next_candidates = &stop_candidates[i + 1];
-
-                        // Find best target node for the next stop in this relation
-                        let next_node_opt = next_candidates.iter().find(|&n| rel.nodes.contains(n));
-
-                        if let Some(&next_node) = next_node_opt {
-                            if current_node == next_node {
-                                // Same node, no movement needed, but maybe record geometry?
-                                // Just continue loop
-                                continue;
-                            }
-
-                            if let Some((_cost, edges)) = pathfinding::pathfind_with_context(
-                                ctx,
-                                &osm.graph,
-                                current_node,
-                                next_node,
-                                allowed_modes,
-                                fallback_modes,
-                                Some(&rel.edges),
-                                Some(&preferred_match),
-                            ) {
-                                for edge_idx in edges {
-                                    let edge = osm.graph.edge(edge_idx);
-                                    for dp in edge.payload.geometry.coords().skip(1) {
-                                        candidate_geometry.push((dp.y, dp.x));
-                                    }
-                                }
-                                current_node = next_node;
-                            } else {
-                                possible = false;
-                                break;
-                            }
-                        } else {
-                            // Next stop not in relation?
-                            // This creates a gap. Relation doesn't fully cover the route?
-                            // We can attempt to proceed if we allow gaps, but for "Relation Matching" we usually want full coverage.
-                            // Or we can try to pathfind to the *nearest* candidate even if not in relation?
-                            // But that defeats the purpose of "on relation".
-                            possible = false;
+                            node_matches = true;
                             break;
                         }
-                    }
-
-                    if possible {
-                        relation_found = true;
-                        full_path_geometry = candidate_geometry;
-                        matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
-                        break;
-                    }
-                }
-
-                if !relation_found {
-                    // 4. Fallback to Backtracking Pathfinding to handle dead ends
-                    // Limit search space for performance: take only top 5 candidates per stop
-                    let limited_candidates: Vec<Vec<usize>> = stop_candidates
-                        .iter()
-                        .map(|c| c.iter().take(5).cloned().collect())
-                        .collect();
-
-                    // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
-                    if let Some(geometry) = match_sequence_globally_optimal(
-                        &limited_candidates,
-                        &osm.graph,
-                        allowed_modes,
-                        fallback_modes,
-                        Some(&preferred_match),
-                        ctx,
-                    ) {
-                        // println!("  Fallback successful!");
-                        full_path_geometry = geometry;
-                    } else {
-                        // println!("  Fallback failed.");
+                        // Operator check
+                        if let (Some(target_op), Some(osm_op)) =
+                            (&preferred_match.operator, rel.tags.get("operator"))
+                        {
+                            if target_op.contains(&osm_op.to_lowercase())
+                                || osm_op.to_lowercase().contains(target_op)
+                            {
+                                node_matches = true;
+                                break;
+                            }
+                        }
                     }
                 }
+            }
 
-                // Create Shape ID
-                use std::collections::hash_map::DefaultHasher;
-                use std::hash::{Hash, Hasher};
-                let mut hasher = DefaultHasher::new();
-                pattern.hash(&mut hasher);
-                let shape_id = format!("shape_{}", hasher.finish());
+            // Identify ways this node belongs to
+            let mut node_ways = Vec::new();
+            for &edge_idx in &node.edges {
+                let edge = osm.graph.edge(edge_idx);
+                if edge.payload.osmid != 0 {
+                    node_ways.push(edge.payload.osmid);
+                }
+            }
 
-                let empty_geometry = full_path_geometry.is_empty();
+            // Check if this node introduces a new way
+            let is_new_way = node_ways.iter().any(|w| !seen_ways.contains(w));
 
-                Some((
-                    (*pattern).clone(),
-                    (
-                        ShapeResult {
-                            shape_id,
-                            empty_geometry,
-                            matched_route_color,
-                        },
-                        full_path_geometry,
-                    ),
-                ))
-            },
-        )
-        .filter_map(|x| x)
-        .fold(AHashMap::new, |mut acc, (k, v)| {
-            acc.insert(k, v);
-            acc
+            if node_matches {
+                // High priority!
+                matched_candidates.push(node_idx);
+                // Also prevent using ways again? Or allow multiples if matched?
+                // Let's mark ways as seen so we don't spam the same way.
+                for w in node_ways {
+                    seen_ways.insert(w);
+                }
+            } else if is_new_way {
+                if other_candidates.len() < target_candidates {
+                    other_candidates.push(node_idx);
+                }
+                for w in node_ways {
+                    seen_ways.insert(w);
+                }
+            } else {
+                // Also keep some fallbacks just in case
+                if fallback_candidates.len() < target_candidates {
+                    fallback_candidates.push(node_idx);
+                }
+            }
+
+            if matched_candidates.len() >= target_candidates {
+                break;
+            }
+        }
+
+        // Decision: If we found ANY matches, we use ONLY matches.
+        // This prevents "Great Eastern Main Line" from polluting "Elizabeth Line" results if Elizabeth Line exists.
+        if !matched_candidates.is_empty() {
+            candidates = matched_candidates;
+        } else {
+            candidates = other_candidates;
+        }
+
+        // If we didn't find enough unique-way candidates, fill up with fallbacks
+        if candidates.len() < 5 {
+            let needed = 5 - candidates.len();
+            for &fb in fallback_candidates.iter().take(needed) {
+                candidates.push(fb);
+            }
+        }
+
+        // Limit to TARGET just in case fallbacks pushed over (unlikely with logic above but good for safety)
+        // Actually fallback logic above ensures we have at least 5 if possible.
+        // If we stopped loop at TARGET_CANDIDATES, we are good.
+
+        if candidates.is_empty() {
+            // If we can't snap a stop, we can't route properly?
+            // For now, keep empty vec, handle downstream
+        }
+        stop_candidates.push(candidates);
+    }
+
+    if stop_candidates.len() != stop_coords.len() || stop_candidates.iter().any(|c| c.is_empty()) {
+        // If any stop failed to snap, we might have issues.
+        // But let's proceed if majority are there? No, hard fail for now or fallback?
+        // Actually original logic continued if len != len.
+        if stop_candidates.len() != stop_coords.len() {
+            // println!("Warning: Could not snap all stops for pattern");
+            return None;
+        }
+    }
+
+    // 3. Try Relation Matching
+    let mut full_path_geometry = Vec::new();
+    let mut relation_found = false;
+
+    // GTFS Info hoisted above
+
+    // Relation Candidate logic
+    // Vote for relations based on ALL candidates
+    // Scoring: Calculate coverage ratio (stops covered / total stops)
+    // Map: Relation Index -> (Coverage Score, Candidate Count)
+
+    let mut relation_scores: AHashMap<usize, (f64, usize)> = AHashMap::new();
+
+    for candidates in &stop_candidates {
+        // Identify unique relations covering this stop
+        let mut seen_for_stop = AHashSet::new();
+        for &node_idx in candidates {
+            if let Some(rels) = osm.node_to_relations.get(&node_idx) {
+                for &r_idx in rels {
+                    if seen_for_stop.insert(r_idx) {
+                        // First time this relation covers this stop
+                        let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
+                        entry.0 += 1.0;
+                    }
+                    // Increment candidate count
+                    let entry = relation_scores.entry(r_idx).or_insert((0.0, 0));
+                    entry.1 += 1;
+                }
+            }
+        }
+    }
+
+    let mut candidates: Vec<usize> = relation_scores
+        .iter()
+        .filter(|(r_idx, (_covered_stops, _count))| {
+            let rel = &osm.relations[**r_idx];
+
+            if stop_candidates.is_empty() {
+                return false;
+            }
+
+            let start_candidates = &stop_candidates[0];
+            let end_candidates = stop_candidates.last().unwrap();
+            let has_start = start_candidates.iter().any(|&n| rel.nodes.contains(&n));
+            let has_end = end_candidates.iter().any(|&n| rel.nodes.contains(&n));
+
+            has_start && has_end
         })
-        .reduce(AHashMap::new, |mut acc, map| {
-            acc.extend(map);
-            acc
-        });
+        .map(|(k, _)| *k)
+        .collect();
 
-    results
+    // Sort candidates by:
+    // 1. Coverage Score (Desc)
+    // 2. Name/Operator Match (Desc)
+    // 3. Candidate Count (Desc)
+    candidates.sort_by(|&a, &b| {
+        let (score_a, count_a) = relation_scores[&a];
+        let (score_b, count_b) = relation_scores[&b];
+
+        // Calculate Match Score
+        let get_match_score = |r_idx: usize| -> u8 {
+            let rel = &osm.relations[r_idx];
+            let mut match_score = 0;
+
+            // Name Match
+            // Check 'ref', 'name', 'official_name', 'alt_name'
+            let osm_names = [
+                rel.tags.get("ref"),
+                rel.tags.get("name"),
+                rel.tags.get("official_name"),
+                rel.tags.get("alt_name"),
+            ];
+
+            let mut name_matched = false;
+            for osm_name_opt in osm_names {
+                if let Some(osm_name) = osm_name_opt {
+                    let osm_val = osm_name.to_lowercase();
+                    // Check containment both ways
+                    if let Some(ref gtfs_short) = route_short_name {
+                        if osm_val.contains(gtfs_short) || gtfs_short.contains(&osm_val) {
+                            name_matched = true;
+                        }
+                    }
+                    if let Some(ref gtfs_long) = route_long_name {
+                        if osm_val.contains(gtfs_long) || gtfs_long.contains(&osm_val) {
+                            name_matched = true;
+                        }
+                    }
+                }
+                if name_matched {
+                    break;
+                }
+            }
+            if name_matched {
+                match_score += 2;
+            }
+
+            // Operator Match
+            if let Some(target_op) = &agency_name {
+                if let Some(osm_op) = rel.tags.get("operator") {
+                    if osm_op.to_lowercase().contains(target_op)
+                        || target_op.contains(&osm_op.to_lowercase())
+                    {
+                        match_score += 1;
+                    }
+                }
+            }
+
+            match_score
+        };
+
+        let match_a = get_match_score(a);
+        let match_b = get_match_score(b);
+
+        // Compare scores (f64)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| match_b.cmp(&match_a))
+            .then_with(|| count_b.cmp(&count_a))
+    });
+
+    let mut matched_route_color = None;
+
+    for r_idx in candidates {
+        let rel = &osm.relations[r_idx];
+
+        let mut candidate_geometry = Vec::new();
+        let mut current_node_idx_opt = None; // Track the actual chosen node for the previous stop
+
+        // Select best start node for this relation
+        if let Some(first_candidates) = stop_candidates.first() {
+            // Find closest candidate that is IN the relation
+            // Candidates are already sorted by distance (nearest_neighbor_iter)
+            if let Some(&start_node) = first_candidates.iter().find(|&n| rel.nodes.contains(n)) {
+                let start_pl = &osm.graph.node(start_node).payload;
+                candidate_geometry.push((start_pl.point.y(), start_pl.point.x()));
+                current_node_idx_opt = Some(start_node);
+            }
+        }
+
+        if current_node_idx_opt.is_none() {
+            continue; // Couldn't find valid start for this relation
+        }
+
+        let mut possible = true;
+        let mut current_node = current_node_idx_opt.unwrap();
+
+        for i in 0..stop_candidates.len() - 1 {
+            let next_candidates = &stop_candidates[i + 1];
+
+            // Find best target node for the next stop in this relation
+            let next_node_opt = next_candidates.iter().find(|&n| rel.nodes.contains(n));
+
+            if let Some(&next_node) = next_node_opt {
+                if current_node == next_node {
+                    // Same node, no movement needed, but maybe record geometry?
+                    // Just continue loop
+                    continue;
+                }
+
+                if let Some((_cost, edges)) = pathfinding::pathfind_with_context(
+                    ctx,
+                    &osm.graph,
+                    current_node,
+                    next_node,
+                    allowed_modes,
+                    fallback_modes,
+                    Some(&rel.edges),
+                    Some(&preferred_match),
+                    None,
+                ) {
+                    for edge_idx in edges {
+                        let edge = osm.graph.edge(edge_idx);
+                        for dp in edge.payload.geometry.coords().skip(1) {
+                            candidate_geometry.push((dp.y, dp.x));
+                        }
+                    }
+                    current_node = next_node;
+                } else {
+                    possible = false;
+                    break;
+                }
+            } else {
+                // Next stop not in relation?
+                // This creates a gap. Relation doesn't fully cover the route?
+                // We can attempt to proceed if we allow gaps, but for "Relation Matching" we usually want full coverage.
+                // Or we can try to pathfind to the *nearest* candidate even if not in relation?
+                // But that defeats the purpose of "on relation".
+                possible = false;
+                break;
+            }
+        }
+
+        if possible {
+            relation_found = true;
+            full_path_geometry = candidate_geometry;
+            matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
+            break;
+        }
+    }
+
+    if !relation_found {
+        // 4. Fallback to Backtracking Pathfinding to handle dead ends
+        // Limit search space for performance: take only top 5 candidates per stop
+        let limited_candidates: Vec<Vec<usize>> = stop_candidates
+            .iter()
+            .map(|c| c.iter().take(5).cloned().collect())
+            .collect();
+
+        // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
+        if let Some(geometry) = match_sequence_globally_optimal(
+            &limited_candidates,
+            &osm.graph,
+            allowed_modes,
+            fallback_modes,
+            Some(&preferred_match),
+            ctx,
+        ) {
+            // println!("  Fallback successful!");
+            full_path_geometry = geometry;
+        } else {
+            // println!("  Fallback failed.");
+        }
+    }
+
+    // Create Shape ID
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    pattern.hash(&mut hasher);
+    let shape_id = format!("shape_{}", hasher.finish());
+
+    let empty_geometry = full_path_geometry.is_empty();
+
+    Some((
+        (*pattern).clone(),
+        ShapeResult {
+            shape_id,
+            empty_geometry,
+            matched_route_color,
+        },
+        full_path_geometry,
+    ))
 }
 
 pub fn match_sequence_globally_optimal(
@@ -812,6 +837,29 @@ pub fn match_sequence_globally_optimal(
         let curr_candidates = &stop_candidates[i];
         let mut curr_costs = vec![None; curr_candidates.len()];
 
+        let mut min_lon = f64::MAX;
+        let mut max_lon = f64::MIN;
+        let mut min_lat = f64::MAX;
+        let mut max_lat = f64::MIN;
+        for &n in prev_candidates.iter().chain(curr_candidates.iter()) {
+            let p = graph.node(n).payload.point;
+            min_lon = min_lon.min(p.x());
+            max_lon = max_lon.max(p.x());
+            min_lat = min_lat.min(p.y());
+            max_lat = max_lat.max(p.y());
+        }
+        let margin = if allowed_modes == crate::graph::MODE_RAIL {
+            0.5
+        } else {
+            0.1
+        };
+        let bounding_box = Some((
+            min_lon - margin,
+            min_lat - margin,
+            max_lon + margin,
+            max_lat + margin,
+        ));
+
         let mut any_reachable = false;
 
         // For each candidate in previous step
@@ -834,7 +882,7 @@ pub fn match_sequence_globally_optimal(
                             cached
                         } else {
                             // Pathfind and cache the result
-                            let result = pathfinding::pathfind_with_context(
+                            let result = pathfinding::pathfind_cost_with_context(
                                 ctx,
                                 graph,
                                 prev_node,
@@ -843,8 +891,8 @@ pub fn match_sequence_globally_optimal(
                                 fallback_modes,
                                 None,
                                 preferred_match,
-                            )
-                            .map(|(c, _)| c);
+                                bounding_box,
+                            );
 
                             path_cache.insert(cache_key, result);
                             result
@@ -920,6 +968,30 @@ pub fn match_sequence_globally_optimal(
             let curr_node = stop_candidates[i][curr_k];
             let prev_node = stop_candidates[i - 1][prev_k];
 
+            let mut min_lon = f64::MAX;
+            let mut max_lon = f64::MIN;
+            let mut min_lat = f64::MAX;
+            let mut max_lat = f64::MIN;
+            let p1 = graph.node(prev_node).payload.point;
+            let p2 = graph.node(curr_node).payload.point;
+            for p in &[p1, p2] {
+                min_lon = min_lon.min(p.x());
+                max_lon = max_lon.max(p.x());
+                min_lat = min_lat.min(p.y());
+                max_lat = max_lat.max(p.y());
+            }
+            let margin = if allowed_modes == crate::graph::MODE_RAIL {
+                0.5
+            } else {
+                0.1
+            };
+            let bounding_box = Some((
+                min_lon - margin,
+                min_lat - margin,
+                max_lon + margin,
+                max_lat + margin,
+            ));
+
             let mut segment_geom = Vec::new();
 
             if curr_node == prev_node {
@@ -934,6 +1006,7 @@ pub fn match_sequence_globally_optimal(
                     fallback_modes,
                     None,
                     preferred_match,
+                    bounding_box,
                 ) {
                     for edge_idx in edges {
                         let edge = graph.edge(edge_idx);

@@ -73,6 +73,21 @@ impl PathfinderContext {
         self.g_fwd.clear();
         self.g_bwd.clear();
     }
+
+    pub fn retained_entries(&self) -> usize {
+        self.open_fwd.capacity()
+            + self.open_bwd.capacity()
+            + self.came_from_fwd.capacity()
+            + self.came_from_bwd.capacity()
+            + self.g_fwd.capacity()
+            + self.g_bwd.capacity()
+    }
+
+    pub fn discard_if_oversized(&mut self, maximum_entries: usize) {
+        if self.retained_entries() > maximum_entries {
+            *self = Self::new();
+        }
+    }
 }
 
 pub fn pathfind(
@@ -94,6 +109,7 @@ pub fn pathfind(
         fallback_modes,
         allowed_edges,
         preferred_match,
+        None,
     )
 }
 
@@ -143,6 +159,7 @@ pub fn pathfind_with_context(
     fallback_modes: u8,
     allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
     preferred_match: Option<&TransitMatch>,
+    bounding_box: Option<(f64, f64, f64, f64)>, // (min_lon, min_lat, max_lon, max_lat)
 ) -> Option<(f64, Vec<usize>)> {
     ctx.reset();
 
@@ -527,4 +544,217 @@ mod tests {
 
         assert!(!path.contains(&idx_wrong));
     }
+}
+
+pub fn pathfind_cost_with_context(
+    ctx: &mut PathfinderContext,
+    graph: &Graph<NodePL, EdgePL>,
+    start: NodeIndex,
+    end: NodeIndex,
+    allowed_modes: u8,
+    fallback_modes: u8,
+    allowed_edges: Option<&AHashSet<usize>>, // EdgeIndices are usize
+    preferred_match: Option<&TransitMatch>,
+    bounding_box: Option<(f64, f64, f64, f64)>, // (min_lon, min_lat, max_lon, max_lat)
+) -> Option<f64> {
+    ctx.reset();
+
+    if start == end {
+        return Some(0.0);
+    }
+
+    let end_point = graph.node(end).payload.point;
+    let start_point = graph.node(start).payload.point;
+
+    // Heuristics
+    let end_lat = end_point.y();
+    let end_lon = end_point.x();
+    let end_cos = end_lat.to_radians().cos();
+
+    let start_lat = start_point.y();
+    let start_lon = start_point.x();
+    let start_cos = start_lat.to_radians().cos();
+
+    // Heuristics
+    let heuristic_factor = if allowed_modes == crate::graph::MODE_BUS {
+        0.7
+    } else {
+        0.1
+    };
+
+    let h_fwd = |n: NodeIndex| -> f64 {
+        let p = graph.node(n).payload.point;
+        heuristic_m(p, end_lat, end_lon, end_cos) * heuristic_factor
+    };
+    let h_bwd = |n: NodeIndex| -> f64 {
+        let p = graph.node(n).payload.point;
+        heuristic_m(p, start_lat, start_lon, start_cos) * heuristic_factor
+    };
+
+    // Initialize
+    ctx.g_fwd.insert(start, 0.0);
+    ctx.g_bwd.insert(end, 0.0);
+
+    ctx.open_fwd.push(State {
+        cost: h_fwd(start),
+        node: start,
+    });
+    ctx.open_bwd.push(State {
+        cost: h_bwd(end),
+        node: end,
+    });
+
+    let mut mu = f64::INFINITY;
+
+    // Helper cost calculator
+    let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
+        let mut cost = edge.payload.cost as f64;
+        if let Some(pm) = preferred_match {
+            for line in &edge.payload.lines {
+                let mut matches = false;
+                if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
+                    if contains_ignore_case(line_name, target)
+                        || target.contains(&line_name.to_lowercase())
+                    {
+                        matches = true;
+                    }
+                }
+                if !matches {
+                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
+                        if contains_ignore_case(line_op, target_op)
+                            || target_op.contains(&line_op.to_lowercase())
+                        {
+                            matches = true;
+                        }
+                    }
+                }
+                if matches {
+                    cost *= 0.2; // Discount for matching lines
+                    break;
+                }
+            }
+        }
+        cost
+    };
+
+    while !ctx.open_fwd.is_empty() && !ctx.open_bwd.is_empty() {
+        let min_f = ctx.open_fwd.peek().unwrap().cost;
+        let min_b = ctx.open_bwd.peek().unwrap().cost;
+
+        if min_f + min_b >= mu {
+            break;
+        }
+
+        let expand_fwd = ctx.open_fwd.len() <= ctx.open_bwd.len();
+
+        if expand_fwd {
+            if let Some(State { cost: _, node: u }) = ctx.open_fwd.pop() {
+                let current_g = *ctx.g_fwd.get(&u).unwrap_or(&f64::INFINITY);
+
+                if current_g + h_fwd(u) >= mu {
+                    continue;
+                }
+
+                for &edge_idx in &graph.node(u).edges {
+                    if let Some(allowed) = allowed_edges {
+                        if !allowed.contains(&edge_idx) {
+                            continue;
+                        }
+                    }
+                    let edge = graph.edge(edge_idx);
+                    if (edge.payload.allowed_modes & (allowed_modes | fallback_modes)) == 0 {
+                        continue;
+                    }
+
+                    let v = if edge.from == u { edge.to } else { edge.from };
+
+                    if let Some((min_lon, min_lat, max_lon, max_lat)) = bounding_box {
+                        let p = graph.node(v).payload.point;
+                        if p.x() < min_lon || p.x() > max_lon || p.y() < min_lat || p.y() > max_lat
+                        {
+                            continue;
+                        }
+                    }
+
+                    let mut cost = get_edge_cost(edge);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        cost *= 10.0;
+                    }
+                    let tentative_g = current_g + cost;
+
+                    if tentative_g < *ctx.g_fwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        ctx.g_fwd.insert(v, tentative_g);
+                        ctx.open_fwd.push(State {
+                            cost: tentative_g + h_fwd(v),
+                            node: v,
+                        });
+
+                        if let Some(&g_b) = ctx.g_bwd.get(&v) {
+                            let dist = tentative_g + g_b;
+                            if dist < mu {
+                                mu = dist;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            if let Some(State { cost: _, node: u }) = ctx.open_bwd.pop() {
+                let current_g = *ctx.g_bwd.get(&u).unwrap_or(&f64::INFINITY);
+
+                if current_g + h_bwd(u) >= mu {
+                    continue;
+                }
+
+                for &edge_idx in &graph.node(u).edges {
+                    if let Some(allowed) = allowed_edges {
+                        if !allowed.contains(&edge_idx) {
+                            continue;
+                        }
+                    }
+                    let edge = graph.edge(edge_idx);
+                    if (edge.payload.allowed_modes & (allowed_modes | fallback_modes)) == 0 {
+                        continue;
+                    }
+
+                    let v = if edge.from == u { edge.to } else { edge.from };
+
+                    if let Some((min_lon, min_lat, max_lon, max_lat)) = bounding_box {
+                        let p = graph.node(v).payload.point;
+                        if p.x() < min_lon || p.x() > max_lon || p.y() < min_lat || p.y() > max_lat
+                        {
+                            continue;
+                        }
+                    }
+
+                    let mut cost = get_edge_cost(edge);
+                    if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                        cost *= 10.0;
+                    }
+                    let tentative_g = current_g + cost;
+
+                    if tentative_g < *ctx.g_bwd.get(&v).unwrap_or(&f64::INFINITY) {
+                        ctx.g_bwd.insert(v, tentative_g);
+                        ctx.open_bwd.push(State {
+                            cost: tentative_g + h_bwd(v),
+                            node: v,
+                        });
+
+                        if let Some(&g_f) = ctx.g_fwd.get(&v) {
+                            let dist = g_f + tentative_g;
+                            if dist < mu {
+                                mu = dist;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if mu < f64::INFINITY {
+        return Some(mu);
+    }
+
+    None
 }
