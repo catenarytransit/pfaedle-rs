@@ -35,7 +35,7 @@ pub fn match_patterns(
     osm_path: &std::path::Path,
     skip_small_roads: bool,
     cache_file_path: &std::path::Path,
-    match_threads: usize,
+    match_threads: Option<usize>,
 ) -> Result<AHashMap<StopPattern, ShapeResult>, anyhow::Error> {
     use crate::mots::is_bus_like_route_type;
     use crate::osm_load::OsmBuilder;
@@ -200,7 +200,7 @@ fn match_patterns_full_graph(
     osm: &OsmData,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
     cache_file_path: &std::path::Path,
-    match_threads: usize,
+    match_threads: Option<usize>,
 ) -> anyhow::Result<AHashMap<StopPattern, ShapeResult>> {
     use rayon::prelude::*;
     use std::fs::OpenOptions;
@@ -216,15 +216,31 @@ fn match_patterns_full_graph(
         .open(cache_file_path)?;
     let mut writer = BufWriter::new(file);
 
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(match_threads)
-        .build()?;
+    let num_threads = match_threads.unwrap_or_else(rayon::current_num_threads);
+    let batch_size = (num_threads * 2).max(1);
+
+    let pool = match_threads
+        .map(|threads| rayon::ThreadPoolBuilder::new().num_threads(threads).build())
+        .transpose()?;
 
     let mut results = AHashMap::with_capacity(patterns.len());
-    let batch_size = (match_threads * 2).max(1);
 
     for batch in patterns.chunks(batch_size) {
-        let batch_results: Vec<_> = pool.install(|| {
+        let batch_results: Vec<_> = if let Some(ref pool) = pool {
+            pool.install(|| {
+                batch
+                    .par_iter()
+                    .map_init(
+                        pathfinding::PathfinderContext::new,
+                        |ctx, (pattern, trips)| {
+                            let res = match_one_pattern(gtfs, osm, pattern, trips, ctx);
+                            ctx.discard_if_oversized(500_000);
+                            res
+                        },
+                    )
+                    .collect()
+            })
+        } else {
             batch
                 .par_iter()
                 .map_init(
@@ -236,7 +252,7 @@ fn match_patterns_full_graph(
                     },
                 )
                 .collect()
-        });
+        };
 
         for matched in batch_results.into_iter().flatten() {
             let (pattern, shape_result, points) = matched;

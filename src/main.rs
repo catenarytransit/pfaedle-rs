@@ -98,8 +98,8 @@ struct Args {
     low_priority: bool,
 
     /// Number of concurrent full-graph matching workers
-    #[arg(long, default_value_t = 4)]
-    match_threads: usize,
+    #[arg(long)]
+    match_threads: Option<usize>,
 }
 
 fn main() -> Result<()> {
