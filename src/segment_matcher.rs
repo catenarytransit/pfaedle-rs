@@ -132,7 +132,7 @@ impl<'a> SegmentMatcher<'a> {
                 let mut new_way = false;
                 let mut node_ways = Vec::new();
 
-                for &e_idx in &node.edges {
+                for &e_idx in node.edges() {
                     let w_id = merged.graph.edge(e_idx).payload.osmid;
                     node_ways.push(w_id);
                     if !seen_ways.contains(&w_id) {
@@ -325,7 +325,7 @@ impl<'a> SegmentMatcher<'a> {
                 let mut new_way = false;
                 let mut node_ways = Vec::new();
 
-                for &e_idx in &node.edges {
+                for &e_idx in node.edges() {
                     let w_id = merged.graph.edge(e_idx).payload.osmid;
                     node_ways.push(w_id);
                     if !seen_ways.contains(&w_id) {

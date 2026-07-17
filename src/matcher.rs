@@ -403,7 +403,7 @@ fn match_one_pattern(
             // Check if this node matches our route!
             // Check Edges
             let mut node_matches = false;
-            for &edge_idx in &node.edges {
+            for &edge_idx in node.edges() {
                 let edge = osm.graph.edge(edge_idx);
                 // Check lines
                 for line in &edge.payload.lines {
@@ -490,7 +490,7 @@ fn match_one_pattern(
 
             // Identify ways this node belongs to
             let mut node_ways = Vec::new();
-            for &edge_idx in &node.edges {
+            for &edge_idx in node.edges() {
                 let edge = osm.graph.edge(edge_idx);
                 if edge.payload.osmid != 0 {
                     node_ways.push(edge.payload.osmid);
@@ -878,60 +878,67 @@ pub fn match_sequence_globally_optimal(
 
         let mut any_reachable = false;
 
-        // For each candidate in previous step
+        let mut valid_starts = Vec::new();
+        let mut start_node_to_prev_k = ahash::AHashMap::new();
+
         for (prev_k, prev_cost_opt) in min_costs[i - 1].iter().enumerate() {
             if let Some((prev_total_cost, _)) = prev_cost_opt {
-                let prev_node = prev_candidates[prev_k];
-                let prev_point = graph.node(prev_node).payload.point;
+                let start_node = prev_candidates[prev_k];
+                valid_starts.push((start_node, *prev_total_cost));
 
-                // Try to reach each candidate in current step
-                for (curr_k, &curr_node) in curr_candidates.iter().enumerate() {
-                    let cost_inc: f64;
-
-                    if prev_node == curr_node {
-                        cost_inc = 0.0;
-                    } else {
-                        // Check cache first
-                        let cache_key = (prev_node, curr_node);
-
-                        let cached_cost = if let Some(&cached) = path_cache.get(&cache_key) {
-                            cached
-                        } else {
-                            // Pathfind and cache the result
-                            let result = pathfinding::pathfind_cost_with_context(
-                                ctx,
-                                graph,
-                                prev_node,
-                                curr_node,
-                                allowed_modes,
-                                fallback_modes,
-                                None,
-                                preferred_match,
-                                bounding_box,
-                            );
-
-                            path_cache.insert(cache_key, result);
-                            result
-                        };
-
-                        if let Some(c) = cached_cost {
-                            cost_inc = c;
-                        } else {
-                            continue; // Unreachable
+                if let Some(&existing_k) = start_node_to_prev_k.get(&start_node) {
+                    if let Some((existing_cost, _)) = min_costs[i - 1][existing_k] {
+                        if prev_total_cost < &existing_cost {
+                            start_node_to_prev_k.insert(start_node, prev_k);
                         }
                     }
+                } else {
+                    start_node_to_prev_k.insert(start_node, prev_k);
+                }
+            }
+        }
 
-                    let new_total_cost = prev_total_cost + cost_inc;
+        // Component pruning
+        let mut valid_targets = Vec::new();
+        let mut target_to_idx = ahash::AHashMap::new();
 
-                    // Update if better
-                    if let Some((existing_cost, _)) = curr_costs[curr_k] {
-                        if new_total_cost < existing_cost {
-                            curr_costs[curr_k] = Some((new_total_cost, prev_k));
-                        }
-                    } else {
-                        curr_costs[curr_k] = Some((new_total_cost, prev_k));
+        for (curr_k, &curr_node) in curr_candidates.iter().enumerate() {
+            let curr_comp = graph.node(curr_node).payload.comp_id;
+            let mut reachable = false;
+            for &(start_node, _) in &valid_starts {
+                if graph.node(start_node).payload.comp_id == curr_comp || curr_node == start_node {
+                    reachable = true;
+                    break;
+                }
+            }
+            if reachable {
+                valid_targets.push(curr_node);
+                target_to_idx.insert(curr_node, curr_k);
+            }
+        }
+
+        if !valid_targets.is_empty() && !valid_starts.is_empty() {
+            let max_cost = 1_000_000.0;
+
+            let results = pathfinding::multi_target_dijkstra(
+                graph,
+                &valid_starts,
+                &valid_targets,
+                allowed_modes,
+                fallback_modes,
+                None, // allowed_edges
+                preferred_match,
+                bounding_box,
+                max_cost,
+            );
+
+            // Process results
+            for (&target_node, &(total_cost, best_start_node)) in &results {
+                if let Some(&curr_k) = target_to_idx.get(&target_node) {
+                    if let Some(&prev_k) = start_node_to_prev_k.get(&best_start_node) {
+                        curr_costs[curr_k] = Some((total_cost, prev_k));
+                        any_reachable = true;
                     }
-                    any_reachable = true;
                 }
             }
         }
@@ -1224,18 +1231,23 @@ mod tests {
 
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(1.0, 0.0),
         });
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 1.0),
         });
         let n3 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(1.0, 1.0),
         });
         let n4 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(2.0, 1.0),
         });
 

@@ -8,6 +8,7 @@ use std::collections::BinaryHeap;
 #[derive(Copy, Clone, PartialEq)]
 struct State {
     cost: f64,
+    g: f64,
     node: NodeIndex,
 }
 
@@ -201,10 +202,12 @@ pub fn pathfind_with_context(
 
     ctx.open_fwd.push(State {
         cost: h_fwd(start),
+        g: 0.0,
         node: start,
     });
     ctx.open_bwd.push(State {
         cost: h_bwd(end),
+        g: 0.0,
         node: end,
     });
 
@@ -261,14 +264,19 @@ pub fn pathfind_with_context(
         let expand_fwd = ctx.open_fwd.len() <= ctx.open_bwd.len();
 
         if expand_fwd {
-            if let Some(State { cost: _, node: u }) = ctx.open_fwd.pop() {
+            if let Some(State {
+                cost: _,
+                g,
+                node: u,
+            }) = ctx.open_fwd.pop()
+            {
                 let current_g = *ctx.g_fwd.get(&u).unwrap_or(&f64::INFINITY);
 
-                if current_g + h_fwd(u) >= mu {
+                if g > current_g || current_g + h_fwd(u) >= mu {
                     continue;
                 }
 
-                for &edge_idx in &graph.node(u).edges {
+                for &edge_idx in &graph.node(u).out_edges {
                     if let Some(allowed) = allowed_edges {
                         if !allowed.contains(&edge_idx) {
                             continue;
@@ -291,6 +299,7 @@ pub fn pathfind_with_context(
                         ctx.came_from_fwd.insert(v, (u, edge_idx));
                         ctx.open_fwd.push(State {
                             cost: tentative_g + h_fwd(v),
+                            g: tentative_g,
                             node: v,
                         });
 
@@ -306,14 +315,19 @@ pub fn pathfind_with_context(
                 }
             }
         } else {
-            if let Some(State { cost: _, node: u }) = ctx.open_bwd.pop() {
+            if let Some(State {
+                cost: _,
+                g,
+                node: u,
+            }) = ctx.open_bwd.pop()
+            {
                 let current_g = *ctx.g_bwd.get(&u).unwrap_or(&f64::INFINITY);
 
-                if current_g + h_bwd(u) >= mu {
+                if g > current_g || current_g + h_bwd(u) >= mu {
                     continue;
                 }
 
-                for &edge_idx in &graph.node(u).edges {
+                for &edge_idx in &graph.node(u).in_edges {
                     if let Some(allowed) = allowed_edges {
                         if !allowed.contains(&edge_idx) {
                             continue;
@@ -336,6 +350,7 @@ pub fn pathfind_with_context(
                         ctx.came_from_bwd.insert(v, (u, edge_idx));
                         ctx.open_bwd.push(State {
                             cost: tentative_g + h_bwd(v),
+                            g: tentative_g,
                             node: v,
                         });
 
@@ -389,9 +404,11 @@ mod tests {
     fn test_pathfind_modes() {
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(1.0, 0.0), // Far enough to have cost
         });
 
@@ -430,9 +447,11 @@ mod tests {
     fn test_pathfind_penalties() {
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.1),
         });
 
@@ -446,6 +465,7 @@ mod tests {
         // Edge 1: Long but LOW COST (normal rail)
         // We'll simulate a detour via n2
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.1, 0.05),
         });
 
@@ -476,9 +496,11 @@ mod tests {
     fn test_pathfind_preference() {
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.1),
         });
 
@@ -501,6 +523,7 @@ mod tests {
         // Cost = 7000 * 2 = 14000 (longer)
         // With preference ("MyOp"), cost becomes 14000 * 0.2 = 2800.
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.1, 0.05),
         });
 
@@ -597,10 +620,12 @@ pub fn pathfind_cost_with_context(
 
     ctx.open_fwd.push(State {
         cost: h_fwd(start),
+        g: 0.0,
         node: start,
     });
     ctx.open_bwd.push(State {
         cost: h_bwd(end),
+        g: 0.0,
         node: end,
     });
 
@@ -648,14 +673,19 @@ pub fn pathfind_cost_with_context(
         let expand_fwd = ctx.open_fwd.len() <= ctx.open_bwd.len();
 
         if expand_fwd {
-            if let Some(State { cost: _, node: u }) = ctx.open_fwd.pop() {
+            if let Some(State {
+                cost: _,
+                g,
+                node: u,
+            }) = ctx.open_fwd.pop()
+            {
                 let current_g = *ctx.g_fwd.get(&u).unwrap_or(&f64::INFINITY);
 
-                if current_g + h_fwd(u) >= mu {
+                if g > current_g || current_g + h_fwd(u) >= mu {
                     continue;
                 }
 
-                for &edge_idx in &graph.node(u).edges {
+                for &edge_idx in &graph.node(u).out_edges {
                     if let Some(allowed) = allowed_edges {
                         if !allowed.contains(&edge_idx) {
                             continue;
@@ -686,6 +716,7 @@ pub fn pathfind_cost_with_context(
                         ctx.g_fwd.insert(v, tentative_g);
                         ctx.open_fwd.push(State {
                             cost: tentative_g + h_fwd(v),
+                            g: tentative_g,
                             node: v,
                         });
 
@@ -699,14 +730,19 @@ pub fn pathfind_cost_with_context(
                 }
             }
         } else {
-            if let Some(State { cost: _, node: u }) = ctx.open_bwd.pop() {
+            if let Some(State {
+                cost: _,
+                g,
+                node: u,
+            }) = ctx.open_bwd.pop()
+            {
                 let current_g = *ctx.g_bwd.get(&u).unwrap_or(&f64::INFINITY);
 
-                if current_g + h_bwd(u) >= mu {
+                if g > current_g || current_g + h_bwd(u) >= mu {
                     continue;
                 }
 
-                for &edge_idx in &graph.node(u).edges {
+                for &edge_idx in &graph.node(u).in_edges {
                     if let Some(allowed) = allowed_edges {
                         if !allowed.contains(&edge_idx) {
                             continue;
@@ -737,6 +773,7 @@ pub fn pathfind_cost_with_context(
                         ctx.g_bwd.insert(v, tentative_g);
                         ctx.open_bwd.push(State {
                             cost: tentative_g + h_bwd(v),
+                            g: tentative_g,
                             node: v,
                         });
 
@@ -757,4 +794,165 @@ pub fn pathfind_cost_with_context(
     }
 
     None
+}
+
+#[derive(Copy, Clone, PartialEq)]
+struct MultiState {
+    cost: f64,
+    g: f64,
+    node: NodeIndex,
+    start_node: NodeIndex,
+}
+
+impl Eq for MultiState {}
+
+impl Ord for MultiState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .cost
+            .partial_cmp(&self.cost)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
+impl PartialOrd for MultiState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+pub fn multi_target_dijkstra(
+    graph: &Graph<NodePL, EdgePL>,
+    starts: &[(NodeIndex, f64)],
+    targets: &[NodeIndex],
+    allowed_modes: u8,
+    fallback_modes: u8,
+    allowed_edges: Option<&AHashSet<usize>>,
+    preferred_match: Option<&TransitMatch>,
+    bounding_box: Option<(f64, f64, f64, f64)>,
+    max_cost: f64,
+) -> AHashMap<NodeIndex, (f64, NodeIndex)> {
+    let mut open = BinaryHeap::new();
+    let mut g_score: AHashMap<NodeIndex, (f64, NodeIndex)> = AHashMap::new();
+
+    for &(start_node, init_cost) in starts {
+        if init_cost >= max_cost {
+            continue;
+        }
+        // Keep the best initial cost if there are duplicates
+        if let Some(&(best_g, _)) = g_score.get(&start_node) {
+            if init_cost >= best_g {
+                continue;
+            }
+        }
+        g_score.insert(start_node, (init_cost, start_node));
+        open.push(MultiState {
+            cost: init_cost,
+            g: init_cost,
+            node: start_node,
+            start_node,
+        });
+    }
+
+    let mut target_set: AHashSet<NodeIndex> = targets.iter().copied().collect();
+    let mut found_targets = 0;
+    let target_count = target_set.len();
+
+    let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
+        let mut cost = edge.payload.cost as f64;
+        if let Some(pm) = preferred_match {
+            for line in &edge.payload.lines {
+                let mut matches = false;
+                if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
+                    if contains_ignore_case(line_name, target)
+                        || target.contains(&line_name.to_lowercase())
+                    {
+                        matches = true;
+                    }
+                }
+                if !matches {
+                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
+                        if contains_ignore_case(line_op, target_op)
+                            || target_op.contains(&line_op.to_lowercase())
+                        {
+                            matches = true;
+                        }
+                    }
+                }
+                if matches {
+                    cost *= 0.2;
+                    break;
+                }
+            }
+        }
+        cost
+    };
+
+    while let Some(MultiState {
+        cost: _,
+        g,
+        node: u,
+        start_node,
+    }) = open.pop()
+    {
+        let current_g = g_score.get(&u).map(|&(c, _)| c).unwrap_or(f64::INFINITY);
+        if g > current_g || g >= max_cost {
+            continue;
+        }
+
+        if target_set.remove(&u) {
+            found_targets += 1;
+            if found_targets == target_count {
+                break;
+            }
+        }
+
+        for &edge_idx in &graph.node(u).out_edges {
+            if let Some(allowed) = allowed_edges {
+                if !allowed.contains(&edge_idx) {
+                    continue;
+                }
+            }
+            let edge = graph.edge(edge_idx);
+            if (edge.payload.allowed_modes & (allowed_modes | fallback_modes)) == 0 {
+                continue;
+            }
+
+            let v = if edge.from == u { edge.to } else { edge.from };
+
+            if let Some((min_lon, min_lat, max_lon, max_lat)) = bounding_box {
+                let p = graph.node(v).payload.point;
+                if p.x() < min_lon || p.x() > max_lon || p.y() < min_lat || p.y() > max_lat {
+                    continue;
+                }
+            }
+
+            let mut step_cost = get_edge_cost(edge);
+            if (edge.payload.allowed_modes & allowed_modes) == 0 {
+                step_cost *= 10.0;
+            }
+            let tentative_g = g + step_cost;
+
+            if tentative_g < max_cost {
+                let current_v_g = g_score.get(&v).map(|&(c, _)| c).unwrap_or(f64::INFINITY);
+                if tentative_g < current_v_g {
+                    g_score.insert(v, (tentative_g, start_node));
+                    open.push(MultiState {
+                        cost: tentative_g, // No heuristic for multi-target, so f = g
+                        g: tentative_g,
+                        node: v,
+                        start_node,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut result = AHashMap::new();
+    for &t in targets {
+        if let Some(&res) = g_score.get(&t) {
+            result.insert(t, res);
+        }
+    }
+    result
 }

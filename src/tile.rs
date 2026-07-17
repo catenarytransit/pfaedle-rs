@@ -357,6 +357,7 @@ impl TileCache {
             }
 
             let idx = graph.add_node(NodePL {
+                comp_id: 0,
                 point: Point::new(n.lon, n.lat),
             });
             osm_node_to_graph_idx.insert(n.id, idx);

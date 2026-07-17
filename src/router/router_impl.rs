@@ -206,7 +206,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             let u_to_node_idx = u_edge.to;
             let u_to_node = self.graph.node(u_to_node_idx);
 
-            for &v_idx in &u_to_node.edges {
+            for &v_idx in u_to_node.edges() {
                 let v_edge = self.graph.edge(v_idx);
                 if v_edge.from != u_to_node_idx {
                     continue;
@@ -295,7 +295,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             let u_to_node_idx = u_edge.to;
             let u_to_node = self.graph.node(u_to_node_idx);
 
-            for &v_idx in &u_to_node.edges {
+            for &v_idx in u_to_node.edges() {
                 let v_edge = self.graph.edge(v_idx);
                 if v_edge.from != u_to_node_idx {
                     continue;

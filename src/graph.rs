@@ -15,7 +15,14 @@ pub const MODE_GONDOLA: u8 = 32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node<N> {
     pub payload: N,
-    pub edges: Vec<EdgeIndex>,
+    pub out_edges: Vec<EdgeIndex>,
+    pub in_edges: Vec<EdgeIndex>,
+}
+
+impl<N> Node<N> {
+    pub fn edges(&self) -> impl Iterator<Item = &EdgeIndex> {
+        self.out_edges.iter().chain(self.in_edges.iter())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +50,8 @@ impl<N, E> Graph<N, E> {
         let index = self.nodes.len();
         self.nodes.push(Node {
             payload,
-            edges: Vec::new(),
+            out_edges: Vec::new(),
+            in_edges: Vec::new(),
         });
         index
     }
@@ -52,14 +60,8 @@ impl<N, E> Graph<N, E> {
         let index = self.edges.len();
         self.edges.push(Edge { payload, from, to });
 
-        self.nodes[from].edges.push(index);
-
-        // In the C++ generic implementation, edges are stored in adjacency lists.
-        // Our simplified graph model here stores 'incident' edges.
-        // If we want to distinguish in/out, we check edge.from/to.
-        if from != to {
-            self.nodes[to].edges.push(index);
-        }
+        self.nodes[from].out_edges.push(index);
+        self.nodes[to].in_edges.push(index);
 
         index
     }
@@ -78,6 +80,8 @@ impl<N, E> Graph<N, E> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodePL {
     pub point: Point<f64>,
+    #[serde(default)]
+    pub comp_id: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

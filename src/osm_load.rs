@@ -302,6 +302,7 @@ impl OsmBuilder {
                         }
 
                         let idx = graph.add_node(NodePL {
+                            comp_id: 0,
                             point: Point::new(lon, lat),
                         });
                         osm_node_to_graph_idx.insert(nid, idx);
@@ -763,6 +764,37 @@ impl OsmBuilder {
                 edge.payload.cost = edge.payload.cost.saturating_mul(100);
             }
         }
+
+        // Compute connected components
+        let mut comp_id = 0;
+        let mut visited = vec![false; graph.nodes.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..graph.nodes.len() {
+            if !visited[i] {
+                comp_id += 1;
+                queue.push_back(i);
+                visited[i] = true;
+
+                while let Some(u) = queue.pop_front() {
+                    graph.nodes[u].payload.comp_id = comp_id;
+
+                    for &edge_idx in &graph.nodes[u].out_edges {
+                        let v = graph.edges[edge_idx].to;
+                        if !visited[v] {
+                            visited[v] = true;
+                            queue.push_back(v);
+                        }
+                    }
+                    for &edge_idx in &graph.nodes[u].in_edges {
+                        let v = graph.edges[edge_idx].from;
+                        if !visited[v] {
+                            visited[v] = true;
+                            queue.push_back(v);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn has_tag(tags: &Tags, key: &str, val: &str) -> bool {
@@ -1137,9 +1169,11 @@ mod tests {
     fn test_preferred_direction_costs() {
         let mut graph = Graph::new();
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.1, 0.0),
         });
 
@@ -1173,9 +1207,11 @@ mod tests {
     fn test_preferred_direction_backward() {
         let mut graph = Graph::new();
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.1, 0.0),
         });
 
