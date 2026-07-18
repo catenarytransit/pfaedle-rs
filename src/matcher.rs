@@ -767,26 +767,115 @@ fn match_one_pattern(
     }
 
     if !relation_found {
-        // 4. Fallback to Backtracking Pathfinding to handle dead ends
-        // Limit search space for performance: take only top 5 candidates per stop
-        let limited_candidates: Vec<Vec<usize>> = stop_candidates
-            .iter()
-            .map(|c| c.iter().take(5).cloned().collect())
-            .collect();
+        // Use RouterImpl for routing
+        use crate::router::hop_cache::HopCache;
+        use crate::router::router_impl::RouterImpl;
+        use crate::router::trip_trie::TripTrie;
+        use crate::router::types::{EdgeCand, EdgeCandGroup, EdgeHop};
+        use crate::router::weights::{ExpoTransWeight, RoutingAttrs, RoutingOpts};
 
-        // println!("Pattern {} ({}): Relation matching failed or incomplete. Falling back to global A*", pattern.id, pattern.stop_ids.len());
-        if let Some(geometry) = match_sequence_globally_optimal(
-            &limited_candidates,
-            &osm.graph,
-            allowed_modes,
-            fallback_modes,
-            Some(&preferred_match),
-            ctx,
-        ) {
-            // println!("  Fallback successful!");
-            full_path_geometry = geometry;
-        } else {
-            // println!("  Fallback failed.");
+        // 1. Build TripTrie
+        let mut trie = TripTrie::new();
+        let r_attrs = RoutingAttrs::default(); // populate properly if needed
+        for trip_id in _trips {
+            if let Some(trip) = gtfs.gtfs.trips.get(trip_id) {
+                trie.add_trip(trip, &r_attrs, true, false);
+            }
+        }
+
+        // 2. Build EdgeCandMap
+        // ECM is a HashMap mapping TripTrieNd index to EdgeCandGroup
+        let mut ecm = ahash::AHashMap::new();
+
+        let nds = trie.get_nds();
+        for (nid, nd) in nds.iter().enumerate() {
+            // Map the trie node to the stop candidate list
+            // We match by stop_name and platform, or just sequence if possible.
+            // But since `match_one_pattern` works on a single pattern,
+            // the depth in the trie directly corresponds to the stop index!
+
+            // To find the stop index:
+            let mut depth = 0;
+            let mut curr = nd.parent;
+            while let Some(p) = curr {
+                depth += 1;
+                curr = trie.get_nd(p).parent;
+            }
+
+            let stop_idx = if depth > 0 { depth - 1 } else { 0 };
+
+            let mut cand_group: EdgeCandGroup = Vec::new();
+            if stop_idx < stop_candidates.len() && nid > 0 {
+                // limit to top 5 candidates
+                for &node_idx in stop_candidates[stop_idx].iter().take(5) {
+                    let graph_node = osm.graph.node(node_idx);
+                    for &edge_idx in graph_node.edges() {
+                        let e = osm.graph.edge(edge_idx);
+                        if e.from == node_idx {
+                            // Outgoing edge
+                            cand_group.push(EdgeCand {
+                                edge: Some(edge_idx),
+                                point: Some(graph_node.payload.point),
+                                pen: 0.0,
+                                time: nd.time as f64,
+                                progr: 0.0,
+                                dep_prede: (0..cand_group.len()).collect(), // Simplified
+                            });
+                        }
+                    }
+                    if cand_group.is_empty() {
+                        // Fallback: candidate with no valid edges but keep point
+                        cand_group.push(EdgeCand {
+                            edge: None,
+                            point: Some(graph_node.payload.point),
+                            pen: 1000.0,
+                            time: nd.time as f64,
+                            progr: 0.0,
+                            dep_prede: vec![],
+                        });
+                    }
+                }
+            }
+            if cand_group.is_empty() {
+                cand_group.push(EdgeCand {
+                    edge: None,
+                    point: Some(nd.pos),
+                    pen: 10000.0,
+                    time: nd.time as f64,
+                    progr: 0.0,
+                    dep_prede: vec![],
+                });
+            }
+            ecm.insert(nid, cand_group);
+        }
+
+        // 3. Route
+        let router: RouterImpl<ExpoTransWeight> = RouterImpl::new(&osm.graph);
+        let r_opts = RoutingOpts::default();
+        let mut hop_cache = HopCache::new();
+
+        let routes = router.route(&trie, &ecm, &r_opts, Some(&mut hop_cache), false);
+
+        // Extract geometry for the first found leaf
+        let mut best_hops = None;
+        for (leaf_nid, hops) in routes {
+            best_hops = Some(hops);
+            break;
+        }
+
+        if let Some(hops) = best_hops {
+            let mut geometry = Vec::new();
+            for hop in hops {
+                for edge_idx in hop.edges {
+                    let edge = osm.graph.edge(edge_idx);
+                    for dp in edge.payload.geometry.coords().skip(1) {
+                        geometry.push((dp.y, dp.x));
+                    }
+                }
+            }
+            if !geometry.is_empty() {
+                full_path_geometry = geometry;
+            }
         }
     }
 
