@@ -769,7 +769,7 @@ fn match_one_pattern(
     if !relation_found {
         // Use RouterImpl for routing
         use crate::router::hop_cache::HopCache;
-        use crate::router::router_impl::RouterImpl;
+        use crate::router::router_impl::{RouterImpl, Restrictor};
         use crate::router::trip_trie::TripTrie;
         use crate::router::types::{EdgeCand, EdgeCandGroup, EdgeHop};
         use crate::router::weights::{ExpoTransWeight, RoutingAttrs, RoutingOpts};
@@ -901,7 +901,7 @@ fn match_one_pattern(
         let r_opts = RoutingOpts::default();
         let mut hop_cache = HopCache::new();
 
-        let routes = router.route(&trie, &ecm, &r_opts, Some(&mut hop_cache), false);
+        let routes = router.route(&trie, &ecm, &r_opts, &Restrictor::new(), Some(&mut hop_cache), false);
 
         // Extract geometry for the first found leaf
         let mut best_hops = None;

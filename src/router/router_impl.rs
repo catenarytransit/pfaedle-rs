@@ -1,4 +1,4 @@
-use crate::graph::{EdgeIndex, EdgePL, Graph, NodePL};
+use crate::graph::{EdgeIndex, EdgePL, Graph, NodeIndex, NodePL};
 use crate::router::hop_cache::HopCache;
 use crate::router::types::{EdgeCandGroup, EdgeListHops};
 use crate::router::weights::{RoutingAttrs, RoutingOpts, TransWeight};
@@ -8,31 +8,143 @@ use std::collections::BinaryHeap;
 use std::marker::PhantomData;
 
 const ROUTE_INF: u32 = 2_000_000_000;
-// const DBL_INF: f64 = 1e18;
+
+#[derive(Debug, Clone, Default)]
+pub struct Restrictor {
+    pub pos: AHashMap<NodeIndex, Vec<(EdgeIndex, EdgeIndex)>>,
+    pub neg: AHashMap<NodeIndex, Vec<(EdgeIndex, EdgeIndex)>>,
+}
+
+impl Restrictor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn may(&self, from: EdgeIndex, to: EdgeIndex, via: NodeIndex) -> bool {
+        if let Some(rules) = self.pos.get(&via) {
+            for &(r_from, r_to) in rules {
+                if r_from == from && r_to != to {
+                    return false;
+                } else if r_from == from && r_to == to {
+                    return true;
+                }
+            }
+        }
+        if let Some(rules) = self.neg.get(&via) {
+            for &(r_from, r_to) in rules {
+                if r_from == from && r_to == to {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+struct DistHeur {
+    max_v: f64,
+    center: geo::Point<f64>,
+    max_cent_d: f64,
+    has_targets: bool,
+}
+
+impl DistHeur {
+    fn new(graph: &Graph<NodePL, EdgePL>, max_v: f64, tos: &AHashSet<EdgeIndex>) -> Self {
+        if tos.is_empty() {
+            return Self {
+                max_v,
+                center: geo::Point::new(0.0, 0.0),
+                max_cent_d: 0.0,
+                has_targets: false,
+            };
+        }
+
+        let mut x = 0.0;
+        let mut y = 0.0;
+        let c = tos.len() as f64;
+
+        for &to_idx in tos {
+            let to_edge = graph.edge(to_idx);
+            let from_node = graph.node(to_edge.from);
+            x += from_node.payload.point.x();
+            y += from_node.payload.point.y();
+        }
+
+        x /= c;
+        y /= c;
+        let center = geo::Point::new(x, y);
+
+        let mut max_cent_d = 0.0;
+        for &to_idx in tos {
+            let to_edge = graph.edge(to_idx);
+            let from_node = graph.node(to_edge.from);
+            use geo::algorithm::HaversineDistance;
+            let cur = from_node.payload.point.haversine_distance(&center);
+            if cur > max_cent_d {
+                max_cent_d = cur;
+            }
+        }
+
+        max_cent_d /= max_v;
+
+        Self {
+            max_v,
+            center,
+            max_cent_d,
+            has_targets: true,
+        }
+    }
+
+    fn eval(&self, graph: &Graph<NodePL, EdgePL>, edge_idx: EdgeIndex) -> u32 {
+        if !self.has_targets {
+            return 0;
+        }
+        let edge = graph.edge(edge_idx);
+        let from_node = graph.node(edge.from);
+        use geo::algorithm::HaversineDistance;
+        let d = from_node.payload.point.haversine_distance(&self.center);
+        let heur = (d / self.max_v - self.max_cent_d).max(0.0) * 10.0;
+        if heur > u32::MAX as f64 {
+            u32::MAX
+        } else {
+            heur as u32
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PQState {
+    priority: u32,
+    cost: u32,
+    dwi: u32,
+    edge: EdgeIndex,
+    parent: Option<EdgeIndex>,
+    via_node: Option<NodeIndex>,
+    source: EdgeIndex,
+}
+
+impl Ord for PQState {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.priority.cmp(&self.priority)
+    }
+}
+
+impl PartialOrd for PQState {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+struct RouteEdge {
+    parent: Option<EdgeIndex>,
+    cost: u32,
+    via_node: Option<NodeIndex>,
+    source: EdgeIndex,
+}
 
 pub struct RouterImpl<'a, TW: TransWeight> {
     graph: &'a Graph<NodePL, EdgePL>,
     _phantom: PhantomData<TW>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-struct State {
-    cost: u32,
-    edge: EdgeIndex,
-}
-
-impl Eq for State {}
-
-impl Ord for State {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other.cost.cmp(&self.cost)
-    }
-}
-
-impl PartialOrd for State {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
@@ -48,6 +160,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         trie: &crate::router::trip_trie::TripTrie,
         ecm: &AHashMap<usize, EdgeCandGroup>,
         r_opts: &RoutingOpts,
+        restrict: &Restrictor,
         mut hop_cache: Option<&mut HopCache>,
         no_fast_hops: bool,
     ) -> AHashMap<usize, EdgeListHops> {
@@ -177,6 +290,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                                 &mut dists,
                                 &to_tr_nd.r_attrs,
                                 r_opts,
+                                restrict,
                                 cache_mut,
                                 max_cost_val,
                             );
@@ -193,6 +307,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                                 &mut cost_m,
                                 &to_tr_nd.r_attrs,
                                 r_opts,
+                                restrict,
                                 cache_mut,
                                 max_cost_val,
                             );
@@ -323,7 +438,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                         for cand in fr_cands {
                             if let Some(cand_e) = cand.edge {
                                 let progr_start = if cand.progr > 0.0 {
-                                    self.get_edge_cost(cand_e, None, &to_tr_nd.r_attrs, r_opts)
+                                    self.get_edge_cost(Some(cand_e), None, None, &to_tr_nd.r_attrs, r_opts, restrict)
                                         as f64
                                         * cand.progr
                                 } else {
@@ -341,17 +456,20 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                             max_cost_rt_int = u32::MAX;
                         }
 
-                        let path_costs = self.run_dijkstra_1_to_n(
-                            fr_e,
-                            &vec![to_e].into_iter().collect(),
+                        let mut starts_map = AHashMap::new();
+                        starts_map.insert(fr_e, 0);
+                        let targets_set = vec![to_e].into_iter().collect();
+                        let (path_costs, _, path) = self.search_dijkstra(
+                            &starts_map,
+                            &targets_set,
                             max_cost_rt_int,
                             &to_tr_nd.r_attrs,
                             r_opts,
+                            restrict,
+                            Some(to_e),
                         );
-                        let cost = path_costs.get(&to_e).cloned().unwrap_or(ROUTE_INF);
 
-                        if cost < max_cost_rt_int {
-                            edgs = self.reconstruct_path(fr_e, to_e, &to_tr_nd.r_attrs, r_opts);
+                        if let Some(edgs) = path {
                             ret.entry(leaf_nid).or_insert(Vec::new()).push(
                                 crate::router::types::EdgeHop {
                                     edges: edgs,
@@ -429,71 +547,6 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         ret
     }
 
-    fn reconstruct_path(
-        &self,
-        start: EdgeIndex,
-        target: EdgeIndex,
-        r_attrs: &RoutingAttrs,
-        r_opts: &RoutingOpts,
-    ) -> Vec<EdgeIndex> {
-        let mut dists = AHashMap::new();
-        let mut parents = AHashMap::new();
-        let mut pq = std::collections::BinaryHeap::new();
-
-        dists.insert(start, 0);
-        pq.push(State {
-            cost: 0,
-            edge: start,
-        });
-
-        while let Some(State { cost, edge: u }) = pq.pop() {
-            if u == target {
-                break;
-            }
-
-            if cost > *dists.get(&u).unwrap_or(&ROUTE_INF) {
-                continue;
-            }
-
-            let u_edge = self.graph.edge(u);
-            let u_to_node_idx = u_edge.to;
-            let u_to_node = self.graph.node(u_to_node_idx);
-
-            for &v_idx in u_to_node.edges() {
-                let v_edge = self.graph.edge(v_idx);
-                if v_edge.from != u_to_node_idx {
-                    continue;
-                }
-
-                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
-                let next_cost = cost.saturating_add(weight);
-
-                if next_cost < *dists.get(&v_idx).unwrap_or(&ROUTE_INF) {
-                    dists.insert(v_idx, next_cost);
-                    parents.insert(v_idx, u);
-                    pq.push(State {
-                        cost: next_cost,
-                        edge: v_idx,
-                    });
-                }
-            }
-        }
-
-        let mut path = Vec::new();
-        let mut curr = target;
-        while curr != start {
-            path.push(curr);
-            if let Some(&p) = parents.get(&curr) {
-                curr = p;
-            } else {
-                return vec![]; // no path
-            }
-        }
-        path.push(start);
-        path.reverse();
-        path
-    }
-
     fn transit_line_simi(
         edge: &EdgePL,
         r_attrs: &RoutingAttrs,
@@ -546,12 +599,19 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
     fn get_edge_cost(
         &self,
-        edge_idx: EdgeIndex,
-        prev_edge: Option<EdgeIndex>,
+        from_edge: Option<EdgeIndex>,
+        via_node: Option<NodeIndex>,
+        to_edge: Option<EdgeIndex>,
         r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
+        restrict: &Restrictor,
     ) -> u32 {
-        let edge = self.graph.edge(edge_idx);
+        let from_idx = match from_edge {
+            Some(idx) => idx,
+            None => return 0,
+        };
+
+        let edge = self.graph.edge(from_idx);
         let mut c = edge.payload.cost;
 
         if c == u32::MAX {
@@ -603,19 +663,18 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             }
         }
 
-        if let Some(prev_idx) = prev_edge {
-            let prev = self.graph.edge(prev_idx);
-            let n_idx = prev.to; // node traversed via
+        if let (Some(n_idx), Some(to_idx)) = (via_node, to_edge) {
+            let to_edge_data = self.graph.edge(to_idx);
 
             if r_opts.full_turn_punish_fac != 0 {
-                if prev.from == edge.to && prev.to == edge.from {
+                if edge.from == to_edge_data.to && edge.to == to_edge_data.from {
                     c = c.saturating_add(r_opts.full_turn_punish_fac);
                 } else {
                     let deg = self.graph.node(n_idx).edges().count();
                     if deg > 2 {
                         let p = self.graph.node(n_idx).payload.point;
-                        let a = prev.payload.back_hop();
-                        let b = edge.payload.front_hop();
+                        let a = edge.payload.back_hop();
+                        let b = to_edge_data.payload.front_hop();
                         let ang = self.inner_product(p, a, b);
                         if ang < r_opts.full_turn_angle {
                             c = c.saturating_add(r_opts.full_turn_punish_fac);
@@ -623,9 +682,187 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     }
                 }
             }
+
+            if r_opts.turn_restr_cost > 0 && edge.payload.restriction && !restrict.may(from_idx, to_idx, n_idx) {
+                c = c.saturating_add(r_opts.turn_restr_cost);
+            }
         }
 
         c
+    }
+
+    fn search_dijkstra(
+        &self,
+        starts: &AHashMap<EdgeIndex, u32>,
+        targets: &AHashSet<EdgeIndex>,
+        max_cost: u32,
+        r_attrs: &RoutingAttrs,
+        r_opts: &RoutingOpts,
+        restrict: &Restrictor,
+        reconstruct_target: Option<EdgeIndex>,
+    ) -> (AHashMap<EdgeIndex, (u32, EdgeIndex)>, AHashMap<EdgeIndex, RouteEdge>, Option<Vec<EdgeIndex>>) {
+        let mut dists: AHashMap<EdgeIndex, (u32, EdgeIndex)> = AHashMap::new();
+        let mut settled: AHashMap<EdgeIndex, RouteEdge> = AHashMap::new();
+        let mut pq = BinaryHeap::new();
+
+        let max_speed = 36.11;
+        let heuristic = DistHeur::new(self.graph, max_speed, targets);
+
+        for (&start, &init_cost) in starts {
+            if init_cost < u32::MAX {
+                let h = heuristic.eval(self.graph, start);
+                let priority = init_cost.saturating_add(h);
+                pq.push(PQState {
+                    priority,
+                    cost: init_cost,
+                    dwi: 0,
+                    edge: start,
+                    parent: None,
+                    via_node: None,
+                    source: start,
+                });
+                dists.insert(start, (init_cost, start));
+            }
+        }
+
+        let mut found_reconstruct = false;
+
+        while let Some(PQState {
+            priority: _,
+            cost,
+            dwi,
+            edge: u,
+            parent,
+            via_node,
+            source,
+        }) = pq.pop()
+        {
+            if dwi > max_cost {
+                break;
+            }
+
+            if let Some(se) = settled.get(&u) {
+                if se.cost <= cost {
+                    continue;
+                }
+            }
+
+            settled.insert(
+                u,
+                RouteEdge {
+                    parent,
+                    cost,
+                    via_node,
+                    source,
+                },
+            );
+
+            dists.insert(u, (cost, source));
+
+            if reconstruct_target == Some(u) {
+                found_reconstruct = true;
+                break;
+            }
+
+            let u_edge = self.graph.edge(u);
+            let u_to_node_idx = u_edge.to;
+            let u_to_node = self.graph.node(u_to_node_idx);
+
+            for &v_idx in u_to_node.edges() {
+                let v_edge = self.graph.edge(v_idx);
+                if v_edge.from != u_to_node_idx {
+                    continue;
+                }
+
+                let weight = self.get_edge_cost(
+                    Some(u),
+                    Some(u_to_node_idx),
+                    Some(v_idx),
+                    r_attrs,
+                    r_opts,
+                    restrict,
+                );
+                if weight == u32::MAX {
+                    continue;
+                }
+
+                let next_cost = cost.saturating_add(weight);
+                let next_dwi = dwi.saturating_add(weight);
+
+                if next_dwi > max_cost {
+                    continue;
+                }
+
+                let prev_best = dists.get(&v_idx).map(|d| d.0).unwrap_or(u32::MAX);
+                if next_cost < prev_best {
+                    dists.insert(v_idx, (next_cost, source));
+                    let h = heuristic.eval(self.graph, v_idx);
+                    let next_priority = next_cost.saturating_add(h);
+
+                    pq.push(PQState {
+                        priority: next_priority,
+                        cost: next_cost,
+                        dwi: next_dwi,
+                        edge: v_idx,
+                        parent: Some(u),
+                        via_node: Some(u_to_node_idx),
+                        source,
+                    });
+                }
+            }
+        }
+
+        let path = if found_reconstruct {
+            let target = reconstruct_target.unwrap();
+            let mut p = Vec::new();
+            let mut curr = target;
+            let mut visited = AHashSet::new();
+            while let Some(se) = settled.get(&curr) {
+                if !visited.insert(curr) {
+                    break;
+                }
+                p.push(curr);
+                if let Some(parent_edge) = se.parent {
+                    curr = parent_edge;
+                } else {
+                    break;
+                }
+            }
+            p.reverse();
+            Some(p)
+        } else {
+            None
+        };
+
+        (dists, settled, path)
+    }
+
+    fn reconstruct_path_from_settled(
+        &self,
+        settled: &AHashMap<EdgeIndex, RouteEdge>,
+        start: EdgeIndex,
+        mut curr: EdgeIndex,
+    ) -> Vec<EdgeIndex> {
+        let mut path = Vec::new();
+        let mut visited = AHashSet::new();
+        while curr != start {
+            if !visited.insert(curr) {
+                return vec![];
+            }
+            path.push(curr);
+            if let Some(se) = settled.get(&curr) {
+                if let Some(parent_edge) = se.parent {
+                    curr = parent_edge;
+                } else {
+                    break;
+                }
+            } else {
+                return vec![];
+            }
+        }
+        path.push(start);
+        path.reverse();
+        path
     }
 
     fn hops(
@@ -633,9 +870,10 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         froms: &EdgeCandGroup,
         tos: &EdgeCandGroup,
         r_costs: &mut Vec<((usize, usize), u32)>,
-        _dists: &mut Vec<((usize, usize), u32)>,
+        dists: &mut Vec<((usize, usize), u32)>,
         r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
+        restrict: &Restrictor,
         mut hop_cache: Option<&mut HopCache>,
         max_cost: u32,
     ) {
@@ -657,7 +895,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         for fr in froms {
             if let Some(e) = fr.edge {
                 let progr_start = if fr.progr > 0.0 {
-                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
+                    let cost_e = self.get_edge_cost(Some(e), None, None, r_attrs, r_opts, restrict);
                     (cost_e as f64) * fr.progr
                 } else {
                     0.0
@@ -671,6 +909,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         let mut max_cost = self.add_non_overflow(max_cost, max_progr_start as u32);
 
         let mut ecm_cost: AHashMap<(EdgeIndex, EdgeIndex), u32> = AHashMap::new();
+        let mut ecm_dist: AHashMap<(EdgeIndex, EdgeIndex), f64> = AHashMap::new();
 
         for &e_from in &e_frs {
             let mut rem_tos = AHashSet::new();
@@ -701,10 +940,34 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             }
 
             if !rem_tos.is_empty() {
-                let costs = self.run_dijkstra_1_to_n(e_from, &rem_tos, max_cost, r_attrs, r_opts);
+                let mut starts_map = AHashMap::new();
+                starts_map.insert(e_from, 0);
 
-                for (to_e, cost) in costs {
+                let (costs, settled, _) = self.search_dijkstra(
+                    &starts_map,
+                    &rem_tos,
+                    max_cost,
+                    r_attrs,
+                    r_opts,
+                    restrict,
+                    None,
+                );
+
+                for &to_e in &rem_tos {
+                    let cost = costs.get(&to_e).map(|d| d.0).unwrap_or(ROUTE_INF);
                     ecm_cost.insert((e_from, to_e), cost);
+
+                    if cost < ROUTE_INF && TW::need_dist() {
+                        let path = self.reconstruct_path_from_settled(&settled, e_from, to_e);
+                        let mut dist = 0.0;
+                        if path.len() > 1 {
+                            for i in 0..path.len() - 1 {
+                                dist += self.graph.edge(path[i]).payload.length();
+                            }
+                        }
+                        ecm_dist.insert((e_from, to_e), dist);
+                    }
+
                     if let Some(cache) = hop_cache.as_deref_mut() {
                         if cost == ROUTE_INF {
                             cache.set_min(e_from, to_e, max_cost);
@@ -722,7 +985,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                 None => continue,
             };
 
-            let cost_fr = self.get_edge_cost(e_fr, None, r_attrs, r_opts);
+            let cost_fr = self.get_edge_cost(Some(e_fr), None, None, r_attrs, r_opts, restrict);
 
             for (to_id, to) in tos.iter().enumerate() {
                 let e_to = match to.edge {
@@ -730,17 +993,21 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     None => continue,
                 };
 
-                // Retrieve base cost
                 let val = ecm_cost.get(&(e_fr, e_to)).cloned().unwrap_or(ROUTE_INF);
                 if val >= max_cost {
                     continue;
                 }
 
                 let mut c = val;
+                let mut dist = if TW::need_dist() {
+                    ecm_dist.get(&(e_fr, e_to)).cloned().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
 
                 if e_fr == e_to {
                     if fr.progr <= to.progr {
-                        let cost_to = self.get_edge_cost(e_to, None, r_attrs, r_opts);
+                        let cost_to = self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
                         let progr_c_fr = (cost_fr as f64 * fr.progr) as u32;
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c += progr_c_to - progr_c_fr;
@@ -751,79 +1018,28 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     if fr.progr > 0.0 {
                         let progr_c_fr = (cost_fr as f64 * fr.progr) as u32;
                         c = c.saturating_sub(progr_c_fr);
+                        if TW::need_dist() {
+                            dist -= self.graph.edge(e_fr).payload.length() * fr.progr;
+                        }
                     }
                     if to.progr > 0.0 {
-                        let cost_to = self.get_edge_cost(e_to, None, r_attrs, r_opts);
+                        let cost_to = self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c = c.saturating_add(progr_c_to);
+                        if TW::need_dist() {
+                            dist += self.graph.edge(e_to).payload.length() * to.progr;
+                        }
                     }
                 }
 
                 if c < max_cost.saturating_sub(max_progr_start as u32) {
                     r_costs.push(((fr_id, to_id), c));
+                    if TW::need_dist() {
+                        dists.push(((fr_id, to_id), dist as u32));
+                    }
                 }
             }
         }
-    }
-
-    fn run_dijkstra_1_to_n(
-        &self,
-        start: EdgeIndex,
-        targets: &AHashSet<EdgeIndex>,
-        max_cost: u32,
-        r_attrs: &RoutingAttrs,
-        r_opts: &RoutingOpts,
-    ) -> AHashMap<EdgeIndex, u32> {
-        let mut dists = AHashMap::new();
-        let mut pq = BinaryHeap::new();
-
-        dists.insert(start, 0);
-        pq.push(State {
-            cost: 0,
-            edge: start,
-        });
-
-        while let Some(State { cost, edge: u }) = pq.pop() {
-            if cost > max_cost {
-                break;
-            }
-
-            if cost > *dists.get(&u).unwrap_or(&ROUTE_INF) {
-                continue;
-            }
-
-            let u_edge = self.graph.edge(u);
-            let u_to_node_idx = u_edge.to;
-            let u_to_node = self.graph.node(u_to_node_idx);
-
-            for &v_idx in u_to_node.edges() {
-                let v_edge = self.graph.edge(v_idx);
-                if v_edge.from != u_to_node_idx {
-                    continue;
-                }
-
-                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
-                let next_cost = cost.saturating_add(weight);
-
-                if next_cost < *dists.get(&v_idx).unwrap_or(&ROUTE_INF) {
-                    dists.insert(v_idx, next_cost);
-                    pq.push(State {
-                        cost: next_cost,
-                        edge: v_idx,
-                    });
-                }
-            }
-        }
-
-        let mut res = AHashMap::new();
-        for &t in targets {
-            if let Some(&c) = dists.get(&t) {
-                res.insert(t, c);
-            } else {
-                res.insert(t, ROUTE_INF);
-            }
-        }
-        res
     }
 
     fn hops_fast(
@@ -834,6 +1050,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         r_costs: &mut Vec<((usize, usize), u32)>,
         r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
+        restrict: &Restrictor,
         mut hop_cache: Option<&mut HopCache>,
         mut max_cost: u32,
     ) {
@@ -875,7 +1092,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         for fr in froms {
             if let Some(e) = fr.edge {
                 let progr_start = if fr.progr > 0.0 {
-                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
+                    let cost_e = self.get_edge_cost(Some(e), None, None, r_attrs, r_opts, restrict);
                     (cost_e as f64) * fr.progr
                 } else {
                     0.0
@@ -896,7 +1113,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         for (fr_id, fr) in froms.iter().enumerate() {
             if let Some(e) = fr.edge {
                 if init_costs_vec[fr_id] < 1e18 {
-                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
+                    let cost_e = self.get_edge_cost(Some(e), None, None, r_attrs, r_opts, restrict);
                     let progr_start = if fr.progr > 0.0 {
                         (cost_e as f64) * fr.progr
                     } else {
@@ -935,58 +1152,17 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         }
 
         max_cost = self.add_non_overflow(max_cost, max_progr_start as u32);
-        let max_cost_search = max_cost.saturating_add(max_init.saturating_sub(min_init));
 
-        // run_dijkstra_n_to_n
-        let mut dists: AHashMap<EdgeIndex, (u32, EdgeIndex)> = AHashMap::new();
-        let mut pq = std::collections::BinaryHeap::new();
+        let (dists, settled, _) = self.search_dijkstra(
+            &init_costs_map,
+            &e_tos,
+            max_cost,
+            r_attrs,
+            r_opts,
+            restrict,
+            None,
+        );
 
-        for &start in &e_frs {
-            let start_init_cost = *init_costs_map.get(&start).unwrap_or(&0);
-            if start_init_cost < ROUTE_INF {
-                dists.insert(start, (start_init_cost, start));
-                pq.push(State {
-                    cost: start_init_cost,
-                    edge: start,
-                });
-            }
-        }
-
-        while let Some(State { cost, edge: u }) = pq.pop() {
-            if cost > max_cost_search {
-                break;
-            }
-
-            if cost > dists.get(&u).map(|d| d.0).unwrap_or(ROUTE_INF) {
-                continue;
-            }
-
-            let (_, u_source) = *dists.get(&u).unwrap();
-
-            let u_edge = self.graph.edge(u);
-            let u_to_node_idx = u_edge.to;
-            let u_to_node = self.graph.node(u_to_node_idx);
-
-            for &v_idx in u_to_node.edges() {
-                let v_edge = self.graph.edge(v_idx);
-                if v_edge.from != u_to_node_idx {
-                    continue;
-                }
-
-                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
-                let next_cost = cost.saturating_add(weight);
-
-                if next_cost < dists.get(&v_idx).map(|d| d.0).unwrap_or(ROUTE_INF) {
-                    dists.insert(v_idx, (next_cost, u_source));
-                    pq.push(State {
-                        cost: next_cost,
-                        edge: v_idx,
-                    });
-                }
-            }
-        }
-
-        // Collect results
         for &to_edg in &e_tos {
             let reached = dists.get(&to_edg);
             if reached.is_none() || reached.unwrap().0 >= ROUTE_INF {
@@ -1008,7 +1184,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             if let Some(fr_cands) = e_fr_cands.get(&from_edg) {
                 for &fr_id in fr_cands {
                     let fr = &froms[fr_id];
-                    let cost_fr = self.get_edge_cost(from_edg, None, r_attrs, r_opts);
+                    let cost_fr = self.get_edge_cost(Some(from_edg), None, None, r_attrs, r_opts, restrict);
 
                     if let Some(to_cands) = e_to_cands.get(&to_edg) {
                         for &to_id in to_cands {
@@ -1017,7 +1193,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
                             if from_edg == to_edg {
                                 if fr.progr <= to.progr {
-                                    let cost_to = self.get_edge_cost(to_edg, None, r_attrs, r_opts);
+                                    let cost_to = self.get_edge_cost(Some(to_edg), None, None, r_attrs, r_opts, restrict);
                                     let progr_c_fr = ((cost_fr as f64) * fr.progr) as u32;
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost
@@ -1031,7 +1207,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                                     wr_cost = wr_cost.saturating_sub(progr_c_fr);
                                 }
                                 if to.progr > 0.0 {
-                                    let cost_to = self.get_edge_cost(to_edg, None, r_attrs, r_opts);
+                                    let cost_to = self.get_edge_cost(Some(to_edg), None, None, r_attrs, r_opts, restrict);
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost.saturating_add(progr_c_to);
                                 }
