@@ -146,6 +146,32 @@ impl EdgePL {
         self.geometry.haversine_length()
     }
 
+    pub fn back_hop(&self) -> Point<f64> {
+        let coords = &self.geometry.0;
+        if coords.len() < 2 {
+            return Point::new(0.0, 0.0);
+        }
+        let coord = if self.is_reverse {
+            coords[1]
+        } else {
+            coords[coords.len() - 2]
+        };
+        Point::new(coord.x, coord.y)
+    }
+
+    pub fn front_hop(&self) -> Point<f64> {
+        let coords = &self.geometry.0;
+        if coords.len() < 2 {
+            return Point::new(0.0, 0.0);
+        }
+        let coord = if self.is_reverse {
+            coords[coords.len() - 2]
+        } else {
+            coords[1]
+        };
+        Point::new(coord.x, coord.y)
+    }
+
     pub fn add_line(&mut self, info: TransitInfo) {
         // C++:
         // auto lb = std::lower_bound(_lines.begin(), _lines.end(), l);

@@ -1464,8 +1464,8 @@ mod tests {
     #[test]
     fn test_trie_depth_ecm_invariants() {
         use crate::router::trip_trie::{TripTrie, TripTrieNd};
-        use crate::router::weights::RoutingAttrs;
         use crate::router::types::{EdgeCand, EdgeCandGroup};
+        use crate::router::weights::RoutingAttrs;
 
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {

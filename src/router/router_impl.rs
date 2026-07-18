@@ -323,7 +323,9 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                         for cand in fr_cands {
                             if let Some(cand_e) = cand.edge {
                                 let progr_start = if cand.progr > 0.0 {
-                                    self.get_edge_cost(cand_e, None, r_opts) as f64 * cand.progr
+                                    self.get_edge_cost(cand_e, None, &to_tr_nd.r_attrs, r_opts)
+                                        as f64
+                                        * cand.progr
                                 } else {
                                     0.0
                                 };
@@ -343,12 +345,13 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                             fr_e,
                             &vec![to_e].into_iter().collect(),
                             max_cost_rt_int,
+                            &to_tr_nd.r_attrs,
                             r_opts,
                         );
                         let cost = path_costs.get(&to_e).cloned().unwrap_or(ROUTE_INF);
 
                         if cost < max_cost_rt_int {
-                            edgs = self.reconstruct_path(fr_e, to_e, r_opts);
+                            edgs = self.reconstruct_path(fr_e, to_e, &to_tr_nd.r_attrs, r_opts);
                             ret.entry(leaf_nid).or_insert(Vec::new()).push(
                                 crate::router::types::EdgeHop {
                                     edges: edgs,
@@ -430,6 +433,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         &self,
         start: EdgeIndex,
         target: EdgeIndex,
+        r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
     ) -> Vec<EdgeIndex> {
         let mut dists = AHashMap::new();
@@ -461,7 +465,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     continue;
                 }
 
-                let weight = self.get_edge_cost(v_idx, Some(u), r_opts);
+                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
                 let next_cost = cost.saturating_add(weight);
 
                 if next_cost < *dists.get(&v_idx).unwrap_or(&ROUTE_INF) {
@@ -490,14 +494,138 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         path
     }
 
+    fn transit_line_simi(
+        edge: &EdgePL,
+        r_attrs: &RoutingAttrs,
+    ) -> crate::router::weights::LineSimilarity {
+        if r_attrs.short_name.is_empty()
+            && r_attrs.line_from.is_empty()
+            && r_attrs.line_to.is_empty()
+        {
+            return crate::router::weights::LineSimilarity {
+                name_similar: true,
+                from_similar: true,
+                to_similar: true,
+            };
+        }
+
+        let mut best = crate::router::weights::LineSimilarity {
+            name_similar: false,
+            from_similar: false,
+            to_similar: false,
+        };
+
+        for line in &edge.lines {
+            let simi = r_attrs.simi(line);
+            if simi.name_similar && simi.to_similar && simi.from_similar {
+                return simi;
+            }
+            if best < simi {
+                best = simi;
+            }
+        }
+
+        best
+    }
+
+    fn inner_product(&self, p: geo::Point<f64>, a: geo::Point<f64>, b: geo::Point<f64>) -> f64 {
+        let dx21 = a.x() - p.x();
+        let dx31 = b.x() - p.x();
+        let dy21 = a.y() - p.y();
+        let dy31 = b.y() - p.y();
+        let m12 = (dx21 * dx21 + dy21 * dy21).sqrt();
+        let m13 = (dx31 * dx31 + dy31 * dy31).sqrt();
+        if m12 == 0.0 || m13 == 0.0 {
+            return 0.0;
+        }
+        let cos_theta = (dx21 * dx31 + dy21 * dy31) / (m12 * m13);
+        let cos_theta_clamped = cos_theta.max(-1.0).min(1.0);
+        let theta = cos_theta_clamped.acos();
+        theta.to_degrees()
+    }
+
     fn get_edge_cost(
         &self,
         edge_idx: EdgeIndex,
-        _prev_edge: Option<EdgeIndex>,
-        _r_opts: &RoutingOpts,
+        prev_edge: Option<EdgeIndex>,
+        r_attrs: &RoutingAttrs,
+        r_opts: &RoutingOpts,
     ) -> u32 {
         let edge = self.graph.edge(edge_idx);
-        edge.payload.cost
+        let mut c = edge.payload.cost;
+
+        if c == u32::MAX {
+            return c;
+        }
+
+        let no_line_simi_pen = r_opts.line_unmatched_punish_fact == 1.0
+            || (r_attrs.short_name.is_empty()
+                && r_attrs.line_from.is_empty()
+                && r_attrs.line_to.is_empty());
+
+        if !no_line_simi_pen {
+            let simi = Self::transit_line_simi(&edge.payload, r_attrs);
+
+            if !simi.name_similar {
+                if r_opts.line_unmatched_punish_fact < 1.0 {
+                    c = ((c as f64) * r_opts.line_unmatched_punish_fact).ceil() as u32;
+                } else if r_opts.line_unmatched_punish_fact > 1.0 {
+                    let a = ((c as f64) * r_opts.line_unmatched_punish_fact).round();
+                    if a > u32::MAX as f64 {
+                        return u32::MAX;
+                    }
+                    c = a as u32;
+                }
+            }
+
+            if !simi.from_similar {
+                if r_opts.line_name_from_unmatched_punish_fact < 1.0 {
+                    c = ((c as f64) * r_opts.line_name_from_unmatched_punish_fact).ceil() as u32;
+                } else if r_opts.line_name_from_unmatched_punish_fact > 1.0 {
+                    let a = ((c as f64) * r_opts.line_name_from_unmatched_punish_fact).round();
+                    if a > u32::MAX as f64 {
+                        return u32::MAX;
+                    }
+                    c = a as u32;
+                }
+            }
+
+            if !simi.to_similar {
+                if r_opts.line_name_to_unmatched_punish_fact < 1.0 {
+                    c = ((c as f64) * r_opts.line_name_to_unmatched_punish_fact).ceil() as u32;
+                } else if r_opts.line_name_to_unmatched_punish_fact > 1.0 {
+                    let a = ((c as f64) * r_opts.line_name_to_unmatched_punish_fact).round();
+                    if a > u32::MAX as f64 {
+                        return u32::MAX;
+                    }
+                    c = a as u32;
+                }
+            }
+        }
+
+        if let Some(prev_idx) = prev_edge {
+            let prev = self.graph.edge(prev_idx);
+            let n_idx = prev.to; // node traversed via
+
+            if r_opts.full_turn_punish_fac != 0 {
+                if prev.from == edge.to && prev.to == edge.from {
+                    c = c.saturating_add(r_opts.full_turn_punish_fac);
+                } else {
+                    let deg = self.graph.node(n_idx).edges().count();
+                    if deg > 2 {
+                        let p = self.graph.node(n_idx).payload.point;
+                        let a = prev.payload.back_hop();
+                        let b = edge.payload.front_hop();
+                        let ang = self.inner_product(p, a, b);
+                        if ang < r_opts.full_turn_angle {
+                            c = c.saturating_add(r_opts.full_turn_punish_fac);
+                        }
+                    }
+                }
+            }
+        }
+
+        c
     }
 
     fn hops(
@@ -506,7 +634,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         tos: &EdgeCandGroup,
         r_costs: &mut Vec<((usize, usize), u32)>,
         _dists: &mut Vec<((usize, usize), u32)>,
-        _r_attrs: &RoutingAttrs,
+        r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
         mut hop_cache: Option<&mut HopCache>,
         max_cost: u32,
@@ -525,6 +653,23 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             }
         }
 
+        let mut max_progr_start = 0.0;
+        for fr in froms {
+            if let Some(e) = fr.edge {
+                let progr_start = if fr.progr > 0.0 {
+                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
+                    (cost_e as f64) * fr.progr
+                } else {
+                    0.0
+                };
+                if progr_start > max_progr_start {
+                    max_progr_start = progr_start;
+                }
+            }
+        }
+
+        let mut max_cost = self.add_non_overflow(max_cost, max_progr_start as u32);
+
         let mut ecm_cost: AHashMap<(EdgeIndex, EdgeIndex), u32> = AHashMap::new();
 
         for &e_from in &e_frs {
@@ -537,7 +682,16 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     (0, false)
                 };
 
-                if cached.1 && cached.0 >= ROUTE_INF {
+                let from_comp = self
+                    .graph
+                    .node(self.graph.edge(e_from).from)
+                    .payload
+                    .comp_id;
+                let to_comp = self.graph.node(self.graph.edge(e_to).to).payload.comp_id;
+
+                if from_comp != to_comp {
+                    ecm_cost.insert((e_from, e_to), ROUTE_INF);
+                } else if cached.1 && cached.0 >= ROUTE_INF {
                     ecm_cost.insert((e_from, e_to), ROUTE_INF);
                 } else if !TW::need_dist() && cached.1 {
                     ecm_cost.insert((e_from, e_to), cached.0);
@@ -547,7 +701,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             }
 
             if !rem_tos.is_empty() {
-                let costs = self.run_dijkstra_1_to_n(e_from, &rem_tos, max_cost, r_opts);
+                let costs = self.run_dijkstra_1_to_n(e_from, &rem_tos, max_cost, r_attrs, r_opts);
 
                 for (to_e, cost) in costs {
                     ecm_cost.insert((e_from, to_e), cost);
@@ -568,7 +722,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                 None => continue,
             };
 
-            let cost_fr = self.get_edge_cost(e_fr, None, r_opts);
+            let cost_fr = self.get_edge_cost(e_fr, None, r_attrs, r_opts);
 
             for (to_id, to) in tos.iter().enumerate() {
                 let e_to = match to.edge {
@@ -586,7 +740,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
                 if e_fr == e_to {
                     if fr.progr <= to.progr {
-                        let cost_to = self.get_edge_cost(e_to, None, r_opts);
+                        let cost_to = self.get_edge_cost(e_to, None, r_attrs, r_opts);
                         let progr_c_fr = (cost_fr as f64 * fr.progr) as u32;
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c += progr_c_to - progr_c_fr;
@@ -599,13 +753,13 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                         c = c.saturating_sub(progr_c_fr);
                     }
                     if to.progr > 0.0 {
-                        let cost_to = self.get_edge_cost(e_to, None, r_opts);
+                        let cost_to = self.get_edge_cost(e_to, None, r_attrs, r_opts);
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c = c.saturating_add(progr_c_to);
                     }
                 }
 
-                if c < max_cost {
+                if c < max_cost.saturating_sub(max_progr_start as u32) {
                     r_costs.push(((fr_id, to_id), c));
                 }
             }
@@ -617,6 +771,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         start: EdgeIndex,
         targets: &AHashSet<EdgeIndex>,
         max_cost: u32,
+        r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
     ) -> AHashMap<EdgeIndex, u32> {
         let mut dists = AHashMap::new();
@@ -647,7 +802,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     continue;
                 }
 
-                let weight = self.get_edge_cost(v_idx, Some(u), r_opts);
+                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
                 let next_cost = cost.saturating_add(weight);
 
                 if next_cost < *dists.get(&v_idx).unwrap_or(&ROUTE_INF) {
@@ -677,7 +832,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         tos: &EdgeCandGroup,
         init_costs_vec: &Vec<f64>,
         r_costs: &mut Vec<((usize, usize), u32)>,
-        _r_attrs: &RoutingAttrs,
+        r_attrs: &RoutingAttrs,
         r_opts: &RoutingOpts,
         mut hop_cache: Option<&mut HopCache>,
         mut max_cost: u32,
@@ -720,7 +875,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         for fr in froms {
             if let Some(e) = fr.edge {
                 let progr_start = if fr.progr > 0.0 {
-                    let cost_e = self.get_edge_cost(e, None, r_opts);
+                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
                     (cost_e as f64) * fr.progr
                 } else {
                     0.0
@@ -741,7 +896,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         for (fr_id, fr) in froms.iter().enumerate() {
             if let Some(e) = fr.edge {
                 if init_costs_vec[fr_id] < 1e18 {
-                    let cost_e = self.get_edge_cost(e, None, r_opts);
+                    let cost_e = self.get_edge_cost(e, None, r_attrs, r_opts);
                     let progr_start = if fr.progr > 0.0 {
                         (cost_e as f64) * fr.progr
                     } else {
@@ -818,7 +973,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     continue;
                 }
 
-                let weight = self.get_edge_cost(v_idx, Some(u), r_opts);
+                let weight = self.get_edge_cost(v_idx, Some(u), r_attrs, r_opts);
                 let next_cost = cost.saturating_add(weight);
 
                 if next_cost < dists.get(&v_idx).map(|d| d.0).unwrap_or(ROUTE_INF) {
@@ -853,7 +1008,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             if let Some(fr_cands) = e_fr_cands.get(&from_edg) {
                 for &fr_id in fr_cands {
                     let fr = &froms[fr_id];
-                    let cost_fr = self.get_edge_cost(from_edg, None, r_opts);
+                    let cost_fr = self.get_edge_cost(from_edg, None, r_attrs, r_opts);
 
                     if let Some(to_cands) = e_to_cands.get(&to_edg) {
                         for &to_id in to_cands {
@@ -862,7 +1017,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
                             if from_edg == to_edg {
                                 if fr.progr <= to.progr {
-                                    let cost_to = self.get_edge_cost(to_edg, None, r_opts);
+                                    let cost_to = self.get_edge_cost(to_edg, None, r_attrs, r_opts);
                                     let progr_c_fr = ((cost_fr as f64) * fr.progr) as u32;
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost
@@ -876,7 +1031,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                                     wr_cost = wr_cost.saturating_sub(progr_c_fr);
                                 }
                                 if to.progr > 0.0 {
-                                    let cost_to = self.get_edge_cost(to_edg, None, r_opts);
+                                    let cost_to = self.get_edge_cost(to_edg, None, r_attrs, r_opts);
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost.saturating_add(progr_c_to);
                                 }

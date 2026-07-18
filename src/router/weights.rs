@@ -29,11 +29,26 @@ impl Default for RoutingOpts {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineSimilarity {
     pub name_similar: bool,
     pub from_similar: bool,
     pub to_similar: bool,
+}
+
+impl Ord for LineSimilarity {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let self_sum = self.name_similar as u8 + self.from_similar as u8 + self.to_similar as u8;
+        let other_sum =
+            other.name_similar as u8 + other.from_similar as u8 + other.to_similar as u8;
+        self_sum.cmp(&other_sum)
+    }
+}
+
+impl PartialOrd for LineSimilarity {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
