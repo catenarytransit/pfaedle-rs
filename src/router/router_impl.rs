@@ -106,6 +106,16 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                     if let Some(to_cands) = ecm.get(&to_tr_nid) {
                         for (to_id, to_cand) in to_cands.iter().enumerate() {
                             for &fr_id in &to_cand.dep_prede {
+                                assert!(
+                                    fr_id < costs_dag[fr_tr_nid].len(),
+                                    "invalid dep_prede: parent trie node {}, child trie node {}, \
+                                     predecessor {}, parent candidates {}, child candidates {}",
+                                    fr_tr_nid,
+                                    to_tr_nid,
+                                    fr_id,
+                                    costs_dag[fr_tr_nid].len(),
+                                    costs_dag[to_tr_nid].len(),
+                                );
                                 let new_c = costs_dag[fr_tr_nid][fr_id] + to_cand.pen;
                                 if new_c < costs_dag[to_tr_nid][to_id] {
                                     costs_dag[to_tr_nid][to_id] = new_c;

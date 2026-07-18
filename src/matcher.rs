@@ -784,51 +784,34 @@ fn match_one_pattern(
         }
 
         // 2. Build EdgeCandMap
-        // ECM is a HashMap mapping TripTrieNd index to EdgeCandGroup
         let mut ecm = ahash::AHashMap::new();
 
-        let nds = trie.get_nds();
-        for (nid, nd) in nds.iter().enumerate() {
-            // Map the trie node to the stop candidate list
-            // We match by stop_name and platform, or just sequence if possible.
-            // But since `match_one_pattern` works on a single pattern,
-            // the depth in the trie directly corresponds to the stop index!
+        fn build_candidate_group(
+            stop_cands: &[crate::graph::NodeIndex],
+            nd: &crate::router::trip_trie::TripTrieNd,
+            graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+        ) -> EdgeCandGroup {
+            let mut cand_group = Vec::new();
 
-            // To find the stop index:
-            let mut depth = 0;
-            let mut curr = nd.parent;
-            while let Some(p) = curr {
-                depth += 1;
-                curr = trie.get_nd(p).parent;
-            }
+            // Null candidate at index 0 as fallback
+            cand_group.push(EdgeCand {
+                edge: None,
+                point: Some(nd.pos),
+                pen: 0.0,
+                time: nd.time as f64,
+                progr: 0.0,
+                dep_prede: vec![],
+            });
 
-            let stop_idx = if depth > 0 { depth - 1 } else { 0 };
-
-            let mut cand_group: EdgeCandGroup = Vec::new();
-            if stop_idx < stop_candidates.len() && nid > 0 {
-                // limit to top 5 candidates
-                for &node_idx in stop_candidates[stop_idx].iter().take(5) {
-                    let graph_node = osm.graph.node(node_idx);
-                    for &edge_idx in graph_node.edges() {
-                        let e = osm.graph.edge(edge_idx);
-                        if e.from == node_idx {
-                            // Outgoing edge
-                            cand_group.push(EdgeCand {
-                                edge: Some(edge_idx),
-                                point: Some(graph_node.payload.point),
-                                pen: 0.0,
-                                time: nd.time as f64,
-                                progr: 0.0,
-                                dep_prede: (0..cand_group.len()).collect(), // Simplified
-                            });
-                        }
-                    }
-                    if cand_group.is_empty() {
-                        // Fallback: candidate with no valid edges but keep point
+            for &node_idx in stop_cands.iter().take(5) {
+                let graph_node = graph.node(node_idx);
+                for &edge_idx in graph_node.edges() {
+                    let e = graph.edge(edge_idx);
+                    if e.from == node_idx {
                         cand_group.push(EdgeCand {
-                            edge: None,
+                            edge: Some(edge_idx),
                             point: Some(graph_node.payload.point),
-                            pen: 1000.0,
+                            pen: 0.0,
                             time: nd.time as f64,
                             progr: 0.0,
                             dep_prede: vec![],
@@ -836,17 +819,81 @@ fn match_one_pattern(
                     }
                 }
             }
-            if cand_group.is_empty() {
-                cand_group.push(EdgeCand {
-                    edge: None,
-                    point: Some(nd.pos),
-                    pen: 10000.0,
-                    time: nd.time as f64,
-                    progr: 0.0,
-                    dep_prede: vec![],
-                });
+
+            cand_group
+        }
+
+        fn average_time(nd: &crate::router::trip_trie::TripTrieNd) -> f64 {
+            if nd.trips > 0 {
+                nd.acc_time as f64 / nd.trips as f64
+            } else {
+                nd.time as f64
             }
-            ecm.insert(nid, cand_group);
+        }
+
+        let nds = trie.get_nds();
+        for (nid, nd) in nds.iter().enumerate().skip(1) {
+            let is_initial_departure = nd.parent == Some(0);
+
+            if !is_initial_departure && !nd.arr {
+                continue;
+            }
+
+            let mut depth = 0;
+            let mut current = Some(nid);
+
+            while let Some(current_nid) = current {
+                current = nds[current_nid].parent;
+                if current.is_some() {
+                    depth += 1;
+                }
+            }
+
+            let stop_idx = depth / 2;
+            let stop_cands = if stop_idx < stop_candidates.len() {
+                stop_candidates[stop_idx].as_slice()
+            } else {
+                &[]
+            };
+
+            let mut group = build_candidate_group(stop_cands, nd, &osm.graph);
+
+            let arrival_time = average_time(nd);
+
+            for candidate in &mut group {
+                candidate.time = arrival_time;
+                candidate.dep_prede.clear();
+            }
+
+            ecm.insert(nid, group.clone());
+
+            if nd.arr {
+                for &departure_nid in &nd.childs {
+                    let departure_nd = &nds[departure_nid];
+                    debug_assert!(!departure_nd.arr);
+
+                    let departure_time = average_time(departure_nd);
+
+                    let departure_group: EdgeCandGroup = group
+                        .iter()
+                        .enumerate()
+                        .map(|(arrival_candidate_id, candidate)| {
+                            let mut departure_candidate = candidate.clone();
+
+                            departure_candidate.time = departure_time;
+                            departure_candidate.dep_prede = if arrival_time <= departure_time {
+                                vec![arrival_candidate_id]
+                            } else {
+                                Vec::new()
+                            };
+
+                            departure_candidate
+                        })
+                        .collect();
+
+                    ecm.insert(departure_nid, departure_group);
+                }
+            }
         }
 
         // 3. Route
@@ -1412,5 +1459,225 @@ mod tests {
 
         // For test purposes, we rely on the fact that `pathfind` returns edges
         // and we just need to verify it returns *some* path.
+    }
+
+    #[test]
+    fn test_trie_depth_ecm_invariants() {
+        use crate::router::trip_trie::{TripTrie, TripTrieNd};
+        use crate::router::weights::RoutingAttrs;
+        use crate::router::types::{EdgeCand, EdgeCandGroup};
+
+        let mut graph = Graph::new();
+        let n0 = graph.add_node(NodePL {
+            comp_id: 0,
+            point: Point::new(0.0, 0.0),
+        });
+
+        let stop_candidates = vec![vec![n0], vec![n0], vec![n0]];
+
+        let nds = vec![
+            TripTrieNd {
+                stop_name: "ROOT".to_string(),
+                platform: "".to_string(),
+                pos: Point::new(0.0, 0.0),
+                lat: 0.0,
+                lng: 0.0,
+                time: 0,
+                arr: false,
+                trip_time: 0,
+                trips: 0,
+                parent: None,
+                childs: vec![1],
+                r_attrs: RoutingAttrs::default(),
+                acc_time: 0,
+            },
+            TripTrieNd {
+                stop_name: "Stop 0".to_string(),
+                platform: "".to_string(),
+                pos: Point::new(0.0, 0.0),
+                lat: 0.0,
+                lng: 0.0,
+                time: 100,
+                arr: false,
+                trip_time: 100,
+                trips: 1,
+                parent: Some(0),
+                childs: vec![2],
+                r_attrs: RoutingAttrs::default(),
+                acc_time: 100,
+            },
+            TripTrieNd {
+                stop_name: "Stop 1".to_string(),
+                platform: "".to_string(),
+                pos: Point::new(0.0, 0.0),
+                lat: 0.0,
+                lng: 0.0,
+                time: 200,
+                arr: true,
+                trip_time: 200,
+                trips: 1,
+                parent: Some(1),
+                childs: vec![3],
+                r_attrs: RoutingAttrs::default(),
+                acc_time: 200,
+            },
+            TripTrieNd {
+                stop_name: "Stop 1".to_string(),
+                platform: "".to_string(),
+                pos: Point::new(0.0, 0.0),
+                lat: 0.0,
+                lng: 0.0,
+                time: 210,
+                arr: false,
+                trip_time: 210,
+                trips: 1,
+                parent: Some(2),
+                childs: vec![4],
+                r_attrs: RoutingAttrs::default(),
+                acc_time: 210,
+            },
+            TripTrieNd {
+                stop_name: "Stop 2".to_string(),
+                platform: "".to_string(),
+                pos: Point::new(0.0, 0.0),
+                lat: 0.0,
+                lng: 0.0,
+                time: 300,
+                arr: true,
+                trip_time: 300,
+                trips: 1,
+                parent: Some(3),
+                childs: vec![],
+                r_attrs: RoutingAttrs::default(),
+                acc_time: 300,
+            },
+        ];
+
+        let trie = TripTrie::new_dummy(nds);
+
+        fn build_candidate_group(
+            stop_cands: &[crate::graph::NodeIndex],
+            nd: &crate::router::trip_trie::TripTrieNd,
+            graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+        ) -> EdgeCandGroup {
+            let mut cand_group = Vec::new();
+            cand_group.push(EdgeCand {
+                edge: None,
+                point: Some(nd.pos),
+                pen: 0.0,
+                time: nd.time as f64,
+                progr: 0.0,
+                dep_prede: vec![],
+            });
+            for &node_idx in stop_cands.iter().take(5) {
+                let graph_node = graph.node(node_idx);
+                for &edge_idx in graph_node.edges() {
+                    let e = graph.edge(edge_idx);
+                    if e.from == node_idx {
+                        cand_group.push(EdgeCand {
+                            edge: Some(edge_idx),
+                            point: Some(graph_node.payload.point),
+                            pen: 0.0,
+                            time: nd.time as f64,
+                            progr: 0.0,
+                            dep_prede: vec![],
+                        });
+                    }
+                }
+            }
+            cand_group
+        }
+
+        fn average_time(nd: &crate::router::trip_trie::TripTrieNd) -> f64 {
+            if nd.trips > 0 {
+                nd.acc_time as f64 / nd.trips as f64
+            } else {
+                nd.time as f64
+            }
+        }
+
+        let mut ecm = ahash::AHashMap::new();
+        let nds = trie.get_nds();
+
+        for (nid, nd) in nds.iter().enumerate().skip(1) {
+            let is_initial_departure = nd.parent == Some(0);
+
+            if !is_initial_departure && !nd.arr {
+                continue;
+            }
+
+            let mut depth = 0;
+            let mut current = Some(nid);
+
+            while let Some(current_nid) = current {
+                current = nds[current_nid].parent;
+                if current.is_some() {
+                    depth += 1;
+                }
+            }
+
+            let stop_idx = depth / 2;
+            let stop_cands = if stop_idx < stop_candidates.len() {
+                stop_candidates[stop_idx].as_slice()
+            } else {
+                &[]
+            };
+
+            let mut group = build_candidate_group(stop_cands, nd, &graph);
+
+            let arrival_time = average_time(nd);
+
+            for candidate in &mut group {
+                candidate.time = arrival_time;
+                candidate.dep_prede.clear();
+            }
+
+            ecm.insert(nid, group.clone());
+
+            if nd.arr {
+                for &departure_nid in &nd.childs {
+                    let departure_nd = &nds[departure_nid];
+                    debug_assert!(!departure_nd.arr);
+
+                    let departure_time = average_time(departure_nd);
+
+                    let departure_group: EdgeCandGroup = group
+                        .iter()
+                        .enumerate()
+                        .map(|(arrival_candidate_id, candidate)| {
+                            let mut departure_candidate = candidate.clone();
+
+                            departure_candidate.time = departure_time;
+                            departure_candidate.dep_prede = if arrival_time <= departure_time {
+                                vec![arrival_candidate_id]
+                            } else {
+                                Vec::new()
+                            };
+
+                            departure_candidate
+                        })
+                        .collect();
+
+                    ecm.insert(departure_nid, departure_group);
+                }
+            }
+        }
+
+        for (nid, group) in &ecm {
+            assert!(!group.is_empty(), "group {} should not be empty", nid);
+            assert!(
+                group[0].edge.is_none(),
+                "candidate 0 at node {} must be null candidate",
+                nid
+            );
+            assert_eq!(group[0].pen, 0.0);
+        }
+
+        let dep_group = &ecm[&3];
+        let arr_group = &ecm[&2];
+        assert_eq!(dep_group.len(), arr_group.len());
+        for (i, cand) in dep_group.iter().enumerate() {
+            assert_eq!(cand.dep_prede, vec![i]);
+        }
     }
 }

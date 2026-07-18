@@ -264,4 +264,13 @@ impl TripTrie {
         self.nds[parent].childs.push(idx);
         idx
     }
+
+    #[cfg(test)]
+    pub fn new_dummy(nds: Vec<TripTrieNd>) -> Self {
+        Self {
+            nds,
+            nd_trips: AHashMap::new(),
+            trip_nds: AHashMap::new(),
+        }
+    }
 }
