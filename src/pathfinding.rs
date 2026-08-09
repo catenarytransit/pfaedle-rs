@@ -231,6 +231,17 @@ pub fn pathfind_with_context(
                         matches = true;
                     }
                 }
+                // Check long name
+                if !matches {
+                    if let Some(target) = &pm.long_name {
+                        let line_name = &line.short_name;
+                        if contains_ignore_case(line_name, target)
+                            || target.contains(&line_name.to_lowercase())
+                        {
+                            matches = true;
+                        }
+                    }
+                }
                 // Check operator
                 if !matches {
                     if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
@@ -567,6 +578,85 @@ mod tests {
 
         assert!(!path.contains(&idx_wrong));
     }
+
+    #[test]
+    fn test_pathfind_preference_by_long_name() {
+        let mut graph = Graph::new();
+        let n0 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.0),
+        });
+        let n1 = graph.add_node(NodePL {
+            point: Point::new(0.0, 0.1),
+        });
+        let n2 = graph.add_node(NodePL {
+            point: Point::new(0.1, 0.05),
+        });
+
+        use crate::graph::TransitInfo;
+
+        // Direct route is cheaper without a preference.
+        let mut e_other = EdgePL::new();
+        e_other.allowed_modes = MODE_RAIL;
+        e_other.cost = 12000;
+        e_other.add_line(TransitInfo {
+            short_name: "Blue".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: None,
+        });
+        let idx_other = graph.add_edge(n0, n1, e_other);
+
+        // The Red route is longer, but should win when "Red" matches
+        // GTFS route_long_name="Red Line".
+        let mut e_red1 = EdgePL::new();
+        e_red1.allowed_modes = MODE_RAIL;
+        e_red1.cost = 7000;
+        e_red1.add_line(TransitInfo {
+            short_name: "Red".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: None,
+        });
+        let idx_red1 = graph.add_edge(n0, n2, e_red1);
+
+        let mut e_red2 = EdgePL::new();
+        e_red2.allowed_modes = MODE_RAIL;
+        e_red2.cost = 7000;
+        e_red2.add_line(TransitInfo {
+            short_name: "Red".into(),
+            from_str: "".into(),
+            to_str: "".into(),
+            operator: None,
+        });
+        let idx_red2 = graph.add_edge(n2, n1, e_red2);
+
+        let match_pref = TransitMatch {
+            short_name: None,
+            long_name: Some("red line".to_string()),
+            operator: None,
+        };
+
+        let (_, path) = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref))
+            .expect("Should find path");
+        assert_eq!(path, vec![idx_red1, idx_red2]);
+        assert!(!path.contains(&idx_other));
+
+        let mut ctx = PathfinderContext::new();
+        let cost = pathfind_cost_with_context(
+            &mut ctx,
+            &graph,
+            n0,
+            n1,
+            MODE_RAIL,
+            0,
+            None,
+            Some(&match_pref),
+            None,
+        )
+        .expect("Should find path cost");
+        assert_eq!(cost, 2800.0);
+    }
+
 }
 
 pub fn pathfind_cost_with_context(
@@ -642,6 +732,17 @@ pub fn pathfind_cost_with_context(
                         || target.contains(&line_name.to_lowercase())
                     {
                         matches = true;
+                    }
+                }
+                // Check long name
+                if !matches {
+                    if let Some(target) = &pm.long_name {
+                        let line_name = &line.short_name;
+                        if contains_ignore_case(line_name, target)
+                            || target.contains(&line_name.to_lowercase())
+                        {
+                            matches = true;
+                        }
                     }
                 }
                 if !matches {
