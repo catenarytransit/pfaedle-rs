@@ -5,9 +5,10 @@ use gtfs_structures::RouteType;
 
 use crate::graph::{
     EdgePL, Graph, MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY, MODE_TRAM, NodePL,
+    NodeIndex,
 };
 use crate::gtfs_load::{GtfsData, StopPattern};
-use crate::osm_load::OsmData;
+use crate::osm_load::{OsmData, OsmRelation};
 use crate::pathfinding::{self, TransitMatch};
 
 #[derive(Debug, Clone)]
@@ -281,6 +282,337 @@ fn match_patterns_full_graph(
     Ok(results)
 }
 
+const EXACT_RELATION_STOP_RADIUS_M: f64 = 120.0;
+const EXACT_RELATION_ENDPOINT_RADIUS_M: f64 = 300.0;
+const EXACT_RELATION_MAX_JOIN_GAP_M: f64 = 30.0;
+
+fn shape_id_for_pattern(pattern: &StopPattern) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    pattern.hash(&mut hasher);
+    format!("shape_{}", hasher.finish())
+}
+
+fn relation_mode_matches(route_type: Option<RouteType>, rel: &OsmRelation) -> bool {
+    let Some(osm_route) = rel.tags.get("route").map(|s| s.as_str()) else {
+        return false;
+    };
+
+    match route_type {
+        Some(RouteType::Subway) => matches!(osm_route, "subway" | "light_rail" | "train"),
+        Some(RouteType::Rail) => matches!(osm_route, "train" | "rail" | "railway"),
+        Some(RouteType::Tramway) => matches!(osm_route, "tram" | "light_rail"),
+        Some(RouteType::Ferry) => osm_route == "ferry",
+        Some(RouteType::Gondola) | Some(RouteType::Funicular) | Some(RouteType::CableCar) => {
+            matches!(osm_route, "aerialway" | "funicular")
+        }
+        _ => true,
+    }
+}
+
+fn relation_has_edge(osm: &OsmData, rel: &OsmRelation, a: NodeIndex, b: NodeIndex) -> bool {
+    if a == b {
+        return true;
+    }
+
+    osm.graph.node(a).edges().any(|&edge_idx| {
+        if !rel.edges.contains(&edge_idx) {
+            return false;
+        }
+        let edge = osm.graph.edge(edge_idx);
+        (edge.from == a && edge.to == b) || (edge.from == b && edge.to == a)
+    })
+}
+
+fn relation_node_distance_m(osm: &OsmData, a: NodeIndex, b: NodeIndex) -> f64 {
+    osm.graph
+        .node(a)
+        .payload
+        .point
+        .haversine_distance(&osm.graph.node(b).payload.point)
+}
+
+/// Rebuild the relation's exact OSM-node geometry in member order.
+///
+/// Route relation members are ordered, but the underlying ways can be stored in
+/// either direction. `OsmRelation::nodes` preserves member order, so split it
+/// into contiguous runs and orient each run to minimize the gap to its neighbor.
+fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIndex>> {
+    let first = *rel.nodes.first()?;
+    let mut runs: Vec<Vec<NodeIndex>> = Vec::new();
+    let mut current = vec![first];
+
+    for &node in rel.nodes.iter().skip(1) {
+        let previous = *current.last().unwrap();
+        if node == previous {
+            continue;
+        }
+
+        if relation_has_edge(osm, rel, previous, node) {
+            current.push(node);
+        } else {
+            if current.len() >= 2 {
+                runs.push(current);
+            }
+            current = vec![node];
+        }
+    }
+    if current.len() >= 2 {
+        runs.push(current);
+    }
+    if runs.is_empty() {
+        return None;
+    }
+
+    // Dynamic programming over forward/reverse orientation of every run.
+    let mut costs = vec![[f64::INFINITY; 2]; runs.len()];
+    let mut parents = vec![[0usize; 2]; runs.len()];
+    costs[0] = [0.0, 0.0];
+
+    for i in 1..runs.len() {
+        for orientation in 0..2 {
+            let start = if orientation == 0 {
+                runs[i][0]
+            } else {
+                *runs[i].last().unwrap()
+            };
+
+            for previous_orientation in 0..2 {
+                let previous_end = if previous_orientation == 0 {
+                    *runs[i - 1].last().unwrap()
+                } else {
+                    runs[i - 1][0]
+                };
+                let candidate = costs[i - 1][previous_orientation]
+                    + relation_node_distance_m(osm, previous_end, start);
+                if candidate < costs[i][orientation] {
+                    costs[i][orientation] = candidate;
+                    parents[i][orientation] = previous_orientation;
+                }
+            }
+        }
+    }
+
+    let mut orientations = vec![0usize; runs.len()];
+    let mut state = if costs.last().unwrap()[0] <= costs.last().unwrap()[1] {
+        0
+    } else {
+        1
+    };
+    for i in (1..runs.len()).rev() {
+        orientations[i] = state;
+        state = parents[i][state];
+    }
+    orientations[0] = state;
+
+    let mut ordered = Vec::new();
+    for (run, &orientation) in runs.iter().zip(&orientations) {
+        let start = if orientation == 0 {
+            run[0]
+        } else {
+            *run.last().unwrap()
+        };
+        if let Some(&previous_end) = ordered.last() {
+            if previous_end != start
+                && relation_node_distance_m(osm, previous_end, start)
+                    > EXACT_RELATION_MAX_JOIN_GAP_M
+            {
+                return None;
+            }
+        }
+
+        if orientation == 0 {
+            for &node in run {
+                if ordered.last().copied() != Some(node) {
+                    ordered.push(node);
+                }
+            }
+        } else {
+            for &node in run.iter().rev() {
+                if ordered.last().copied() != Some(node) {
+                    ordered.push(node);
+                }
+            }
+        }
+    }
+
+    (ordered.len() >= 2).then_some(ordered)
+}
+
+/// Distance from a WGS84 point to a very short WGS84 segment, using a local
+/// equirectangular projection. Also returns the fractional progress on segment.
+fn point_segment_distance_m(point: Point<f64>, a: Point<f64>, b: Point<f64>) -> (f64, f64) {
+    const METERS_PER_DEGREE_LAT: f64 = 111_320.0;
+
+    let lon_scale = METERS_PER_DEGREE_LAT * point.y().to_radians().cos();
+    let ax = (a.x() - point.x()) * lon_scale;
+    let ay = (a.y() - point.y()) * METERS_PER_DEGREE_LAT;
+    let bx = (b.x() - point.x()) * lon_scale;
+    let by = (b.y() - point.y()) * METERS_PER_DEGREE_LAT;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let denom = dx * dx + dy * dy;
+    let t = if denom == 0.0 {
+        0.0
+    } else {
+        (-(ax * dx + ay * dy) / denom).clamp(0.0, 1.0)
+    };
+    let px = ax + t * dx;
+    let py = ay + t * dy;
+    ((px * px + py * py).sqrt(), t)
+}
+
+/// Returns average stop-to-relation distance when every stop is close to the
+/// relation and the stops occur in the same direction as the relation members.
+fn exact_relation_coverage(
+    osm: &OsmData,
+    ordered_nodes: &[NodeIndex],
+    stop_coords: &[Point<f64>],
+) -> Option<f64> {
+    let first_point = osm.graph.node(*ordered_nodes.first()?).payload.point;
+    let last_point = osm.graph.node(*ordered_nodes.last()?).payload.point;
+
+    // Avoid stealing a longer relation for a short-turn pattern just because
+    // every short-turn stop lies somewhere on it.
+    if stop_coords.first()?.haversine_distance(&first_point) > EXACT_RELATION_ENDPOINT_RADIUS_M
+        || stop_coords.last()?.haversine_distance(&last_point)
+            > EXACT_RELATION_ENDPOINT_RADIUS_M
+    {
+        return None;
+    }
+
+    let mut previous_progress = 0.0;
+    let mut total_distance = 0.0;
+
+    for stop in stop_coords {
+        let mut best: Option<(f64, f64)> = None;
+
+        for (segment_index, pair) in ordered_nodes.windows(2).enumerate() {
+            let a = osm.graph.node(pair[0]).payload.point;
+            let b = osm.graph.node(pair[1]).payload.point;
+            let (distance, fraction) = point_segment_distance_m(*stop, a, b);
+            let progress = segment_index as f64 + fraction;
+
+            if progress + 1e-6 < previous_progress {
+                continue;
+            }
+            if best.map_or(true, |(best_distance, _)| distance < best_distance) {
+                best = Some((distance, progress));
+            }
+        }
+
+        let (distance, progress) = best?;
+        if distance > EXACT_RELATION_STOP_RADIUS_M {
+            return None;
+        }
+        previous_progress = progress;
+        total_distance += distance;
+    }
+
+    Some(total_distance / stop_coords.len() as f64)
+}
+
+fn relation_identity_score(
+    rel: &OsmRelation,
+    route_short_name: Option<&str>,
+    route_long_name: Option<&str>,
+    agency_name: Option<&str>,
+) -> u8 {
+    fn matches_nonempty(a: &str, b: &str) -> bool {
+        let a = a.trim().to_lowercase();
+        let b = b.trim().to_lowercase();
+        !a.is_empty() && !b.is_empty() && (a.contains(&b) || b.contains(&a))
+    }
+
+    let mut score = 0;
+    for key in ["ref", "name", "official_name", "alt_name"] {
+        if let Some(osm_name) = rel.tags.get(key) {
+            if route_short_name.map_or(false, |name| matches_nonempty(osm_name, name))
+                || route_long_name.map_or(false, |name| matches_nonempty(osm_name, name))
+            {
+                score += 2;
+                break;
+            }
+        }
+    }
+
+    if let (Some(osm_operator), Some(gtfs_operator)) = (rel.tags.get("operator"), agency_name) {
+        if matches_nonempty(osm_operator, gtfs_operator) {
+            score += 1;
+        }
+    }
+
+    score
+}
+
+/// Prefer a complete OSM route relation over graph routing when it is an
+/// extremely strong spatial + identity match for the entire GTFS stop pattern.
+/// The returned geometry is made only from original OSM relation node coords.
+fn find_exact_relation_match(
+    osm: &OsmData,
+    stop_coords: &[Point<f64>],
+    route_type: Option<RouteType>,
+    route_short_name: Option<&str>,
+    route_long_name: Option<&str>,
+    agency_name: Option<&str>,
+) -> Option<(Vec<(f64, f64)>, Option<String>)> {
+    let mut best: Option<(u8, f64, usize, Vec<NodeIndex>)> = None;
+
+    for (relation_index, rel) in osm.relations.iter().enumerate() {
+        if !relation_mode_matches(route_type, rel) {
+            continue;
+        }
+
+        let identity_score =
+            relation_identity_score(rel, route_short_name, route_long_name, agency_name);
+        // Require route/ref/name agreement. Operator-only matches are too broad for
+        // this fast path; the existing matcher remains the fallback for those.
+        if identity_score < 2 {
+            continue;
+        }
+
+        let Some(ordered_nodes) = ordered_relation_nodes(osm, rel) else {
+            continue;
+        };
+        let Some(average_distance) = exact_relation_coverage(osm, &ordered_nodes, stop_coords)
+        else {
+            continue;
+        };
+
+        let replace = best
+            .as_ref()
+            .map_or(true, |(best_score, best_distance, _, _)| {
+                identity_score > *best_score
+                    || (identity_score == *best_score && average_distance < *best_distance)
+            });
+        if replace {
+            best = Some((
+                identity_score,
+                average_distance,
+                relation_index,
+                ordered_nodes,
+            ));
+        }
+    }
+
+    let (_, _, relation_index, ordered_nodes) = best?;
+    let rel = &osm.relations[relation_index];
+    let geometry = ordered_nodes
+        .into_iter()
+        .map(|node_index| {
+            let point = osm.graph.node(node_index).payload.point;
+            (point.y(), point.x())
+        })
+        .collect();
+
+    Some((
+        geometry,
+        rel.tags.get("colour").map(|colour| colour.to_string()),
+    ))
+}
+
 fn match_one_pattern(
     gtfs: &GtfsData,
     osm: &OsmData,
@@ -326,6 +658,32 @@ fn match_one_pattern(
 
     if stop_coords.len() < 2 {
         return None;
+    }
+
+    // Before snapping/pathfinding, treat a complete OSM route relation as the
+    // ground truth when every GTFS stop hugs that relation, the stop order agrees
+    // with the relation direction, and route/operator identity also agrees.
+    // This is intentionally strict; failures simply fall through to the current
+    // relation-constrained/pathfinding behavior below.
+    if stop_coords.len() == pattern.stop_ids.len() {
+        if let Some((geometry, matched_route_color)) = find_exact_relation_match(
+            osm,
+            &stop_coords,
+            pattern.route_type,
+            route_short_name.as_deref(),
+            route_long_name.as_deref(),
+            agency_name.as_deref(),
+        ) {
+            return Some((
+                (*pattern).clone(),
+                ShapeResult {
+                    shape_id: shape_id_for_pattern(pattern),
+                    empty_geometry: false,
+                    matched_route_color,
+                },
+                geometry,
+            ));
+        }
     }
 
     let allowed_modes = match pattern.route_type {
@@ -927,11 +1285,7 @@ fn match_one_pattern(
     }
 
     // Create Shape ID
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    pattern.hash(&mut hasher);
-    let shape_id = format!("shape_{}", hasher.finish());
+    let shape_id = shape_id_for_pattern(pattern);
 
     let empty_geometry = full_path_geometry.is_empty();
 
