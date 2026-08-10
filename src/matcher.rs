@@ -336,57 +336,63 @@ fn relation_node_distance_m(osm: &OsmData, a: NodeIndex, b: NodeIndex) -> f64 {
 
 /// Rebuild the relation's exact OSM-node geometry in member order.
 ///
-/// Route relation members are ordered, but the underlying ways can be stored in
-/// either direction. `OsmRelation::nodes` preserves member order, so split it
-/// into contiguous runs and orient each run to minimize the gap to its neighbor.
+/// The old implementation tried to recover way boundaries from `rel.nodes` by
+/// asking whether adjacent flattened nodes happened to share a relation edge.
+/// That is ambiguous at rail junctions: two different member ways can touch the
+/// same junction, and a flattened list no longer tells us which way a node came
+/// from. On dense systems (notably CTA around Fullerton/The Loop) that can either
+/// make the exact-relation fast path fail or stitch the wrong branch together.
+///
+/// `OsmRelation::member_ways` keeps the actual relation-member boundaries. Keep
+/// those ways in their OSM relation order and only choose the orientation of
+/// each individual way.
 fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIndex>> {
-    let first = *rel.nodes.first()?;
-    let mut runs: Vec<Vec<NodeIndex>> = Vec::new();
-    let mut current = vec![first];
-
-    for &node in rel.nodes.iter().skip(1) {
-        let previous = *current.last().unwrap();
-        if node == previous {
-            continue;
-        }
-
-        if relation_has_edge(osm, rel, previous, node) {
-            current.push(node);
-        } else {
-            if current.len() >= 2 {
-                runs.push(current);
-            }
-            current = vec![node];
-        }
-    }
-    if current.len() >= 2 {
-        runs.push(current);
-    }
-    if runs.is_empty() {
+    let ways: Vec<&[NodeIndex]> = rel
+        .member_ways
+        .iter()
+        .filter(|nodes| nodes.len() >= 2)
+        .map(Vec::as_slice)
+        .collect();
+    if ways.is_empty() {
         return None;
     }
 
-    // Dynamic programming over forward/reverse orientation of every run.
-    let mut costs = vec![[f64::INFINITY; 2]; runs.len()];
-    let mut parents = vec![[0usize; 2]; runs.len()];
+    // Dynamic programming over forward/reverse orientation of every member way.
+    // A transition is legal only when consecutive member ways really meet (or
+    // are separated by a tiny mapping gap). This prevents a junction elsewhere
+    // in the relation from being used as an accidental stitch point.
+    let mut costs = vec![[f64::INFINITY; 2]; ways.len()];
+    let mut parents = vec![[0usize; 2]; ways.len()];
     costs[0] = [0.0, 0.0];
 
-    for i in 1..runs.len() {
+    for i in 1..ways.len() {
         for orientation in 0..2 {
             let start = if orientation == 0 {
-                runs[i][0]
+                ways[i][0]
             } else {
-                *runs[i].last().unwrap()
+                *ways[i].last().unwrap()
             };
 
             for previous_orientation in 0..2 {
+                if !costs[i - 1][previous_orientation].is_finite() {
+                    continue;
+                }
                 let previous_end = if previous_orientation == 0 {
-                    *runs[i - 1].last().unwrap()
+                    *ways[i - 1].last().unwrap()
                 } else {
-                    runs[i - 1][0]
+                    ways[i - 1][0]
                 };
-                let candidate = costs[i - 1][previous_orientation]
-                    + relation_node_distance_m(osm, previous_end, start);
+
+                let gap = if previous_end == start {
+                    0.0
+                } else {
+                    relation_node_distance_m(osm, previous_end, start)
+                };
+                if gap > EXACT_RELATION_MAX_JOIN_GAP_M {
+                    continue;
+                }
+
+                let candidate = costs[i - 1][previous_orientation] + gap;
                 if candidate < costs[i][orientation] {
                     costs[i][orientation] = candidate;
                     parents[i][orientation] = previous_orientation;
@@ -395,24 +401,29 @@ fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIn
         }
     }
 
-    let mut orientations = vec![0usize; runs.len()];
-    let mut state = if costs.last().unwrap()[0] <= costs.last().unwrap()[1] {
+    let last_costs = costs.last()?;
+    if !last_costs[0].is_finite() && !last_costs[1].is_finite() {
+        return None;
+    }
+
+    let mut orientations = vec![0usize; ways.len()];
+    let mut state = if last_costs[0] <= last_costs[1] {
         0
     } else {
         1
     };
-    for i in (1..runs.len()).rev() {
+    for i in (1..ways.len()).rev() {
         orientations[i] = state;
         state = parents[i][state];
     }
     orientations[0] = state;
 
     let mut ordered = Vec::new();
-    for (run, &orientation) in runs.iter().zip(&orientations) {
+    for (way, &orientation) in ways.iter().zip(&orientations) {
         let start = if orientation == 0 {
-            run[0]
+            way[0]
         } else {
-            *run.last().unwrap()
+            *way.last().unwrap()
         };
         if let Some(&previous_end) = ordered.last() {
             if previous_end != start
@@ -424,13 +435,13 @@ fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIn
         }
 
         if orientation == 0 {
-            for &node in run {
+            for &node in *way {
                 if ordered.last().copied() != Some(node) {
                     ordered.push(node);
                 }
             }
         } else {
-            for &node in run.iter().rev() {
+            for &node in way.iter().rev() {
                 if ordered.last().copied() != Some(node) {
                     ordered.push(node);
                 }
@@ -574,12 +585,31 @@ fn find_exact_relation_match(
         }
 
         let Some(ordered_nodes) = ordered_relation_nodes(osm, rel) else {
+            println!(
+                "[exact-relation] route {:?}: relation {} rejected: member ways are not contiguous in relation order",
+                route_short_name.or(route_long_name),
+                rel.id
+            );
             continue;
         };
         let Some(average_distance) = exact_relation_coverage(osm, &ordered_nodes, stop_coords)
         else {
+            println!(
+                "[exact-relation] route {:?}: relation {} rejected: endpoints, stop radius, or stop order did not match",
+                route_short_name.or(route_long_name),
+                rel.id
+            );
             continue;
         };
+
+        println!(
+            "[exact-relation] route {:?}: relation {} is a candidate (identity={}, avg stop distance={:.1}m, ways={})",
+            route_short_name.or(route_long_name),
+            rel.id,
+            identity_score,
+            average_distance,
+            rel.member_ways.len()
+        );
 
         let replace = best
             .as_ref()
@@ -599,6 +629,12 @@ fn find_exact_relation_match(
 
     let (_, _, relation_index, ordered_nodes) = best?;
     let rel = &osm.relations[relation_index];
+    println!(
+        "[exact-relation] route {:?}: USING OSM relation {} with raw member-way coordinates",
+        route_short_name.or(route_long_name),
+        rel.id
+    );
+
     let geometry = ordered_nodes
         .into_iter()
         .map(|node_index| {
@@ -777,18 +813,9 @@ fn match_one_pattern(
                         }
                     }
 
-                    // Check operator
-                    if !line_matches {
-                        if let (Some(target_op), Some(line_op)) =
-                            (&preferred_match.operator, &line.operator)
-                        {
-                            if target_op.contains(&line_op.to_lowercase())
-                                || line_op.to_lowercase().contains(target_op)
-                            {
-                                line_matches = true;
-                            }
-                        }
-                    }
+                    // Do not use operator as a route identity. A shared operator
+                    // (e.g. CTA) would mark Red, Brown, Purple, etc. as the same
+                    // line and poison the high-priority stop candidates.
                     if line_matches {
                         node_matches = true;
                         break;
@@ -830,17 +857,6 @@ fn match_one_pattern(
                         if name_matched {
                             node_matches = true;
                             break;
-                        }
-                        // Operator check
-                        if let (Some(target_op), Some(osm_op)) =
-                            (&preferred_match.operator, rel.tags.get("operator"))
-                        {
-                            if target_op.contains(&osm_op.to_lowercase())
-                                || osm_op.to_lowercase().contains(target_op)
-                            {
-                                node_matches = true;
-                                break;
-                            }
                         }
                     }
                 }
@@ -973,9 +989,31 @@ fn match_one_pattern(
         .map(|(k, _)| *k)
         .collect();
 
+    // If at least one relation candidate agrees with the GTFS route name/ref,
+    // never let an operator-only relation beat it. This matters on networks where
+    // one operator owns many intersecting rail lines.
+    let has_named_relation_candidate = candidates.iter().any(|&r_idx| {
+        relation_identity_score(
+            &osm.relations[r_idx],
+            route_short_name.as_deref(),
+            route_long_name.as_deref(),
+            agency_name.as_deref(),
+        ) >= 2
+    });
+    if has_named_relation_candidate {
+        candidates.retain(|&r_idx| {
+            relation_identity_score(
+                &osm.relations[r_idx],
+                route_short_name.as_deref(),
+                route_long_name.as_deref(),
+                agency_name.as_deref(),
+            ) >= 2
+        });
+    }
+
     // Sort candidates by:
-    // 1. Coverage Score (Desc)
-    // 2. Name/Operator Match (Desc)
+    // 1. Name/Operator Match (Desc)
+    // 2. Coverage Score (Desc)
     // 3. Candidate Count (Desc)
     candidates.sort_by(|&a, &b| {
         let (score_a, count_a) = relation_scores[&a];
@@ -1036,11 +1074,11 @@ fn match_one_pattern(
         let match_a = get_match_score(a);
         let match_b = get_match_score(b);
 
-        // Compare scores (f64)
-        score_b
-            .partial_cmp(&score_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| match_b.cmp(&match_a))
+        match_b
+            .cmp(&match_a)
+            .then_with(|| {
+                score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            })
             .then_with(|| count_b.cmp(&count_a))
     });
 
@@ -1120,6 +1158,12 @@ fn match_one_pattern(
             relation_found = true;
             full_path_geometry = candidate_geometry;
             matched_route_color = rel.tags.get("colour").map(|s| s.to_string());
+            println!(
+                "[relation-fallback] route {:?}: USING relation {} ({:?}); exact raw-relation path was not selected",
+                route_short_name.as_deref().or(route_long_name.as_deref()),
+                rel.id,
+                rel.tags.get("name").or_else(|| rel.tags.get("ref"))
+            );
             break;
         }
     }

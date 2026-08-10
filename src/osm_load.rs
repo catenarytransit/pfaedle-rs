@@ -43,6 +43,10 @@ pub struct OsmRelation {
     pub tags: Tags,
     pub nodes: Vec<NodeIndex>,      // All nodes in the relation
     pub edges: AHashSet<EdgeIndex>, // All edges in the relation
+    /// Infrastructure way geometries in relation-member order. Each inner vec
+    /// preserves the OSM way's native node order; the matcher may reverse an
+    /// individual way when stitching the route, but never reorders the ways.
+    pub member_ways: Vec<Vec<NodeIndex>>,
 }
 
 #[derive(Clone)]
@@ -529,6 +533,7 @@ impl OsmBuilder {
                 visited: &mut AHashSet<i64>,
                 out_nodes: &mut Vec<NodeIndex>,
                 out_edges: &mut AHashSet<EdgeIndex>,
+                out_member_ways: &mut Vec<Vec<NodeIndex>>,
                 out_final_node_to_rels: &mut AHashMap<NodeIndex, Vec<usize>>,
                 current_rel_idx: usize,
             ) {
@@ -552,6 +557,9 @@ impl OsmBuilder {
                             }
                             OsmId::Way(wid) => {
                                 if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
+                                    if nodes.len() >= 2 {
+                                        out_member_ways.push(nodes.clone());
+                                    }
                                     for &idx in nodes {
                                         out_nodes.push(idx);
                                         out_final_node_to_rels
@@ -577,6 +585,7 @@ impl OsmBuilder {
                                     visited,
                                     out_nodes,
                                     out_edges,
+                                    out_member_ways,
                                     out_final_node_to_rels,
                                     current_rel_idx,
                                 );
@@ -589,6 +598,7 @@ impl OsmBuilder {
             let rel_idx = relations_list.len();
             let mut rel_nodes = Vec::new();
             let mut rel_edges = AHashSet::new();
+            let mut rel_member_ways = Vec::new();
             let mut visited_rels = AHashSet::new();
 
             flatten_relation(
@@ -601,6 +611,7 @@ impl OsmBuilder {
                 &mut visited_rels,
                 &mut rel_nodes,
                 &mut rel_edges,
+                &mut rel_member_ways,
                 &mut final_node_to_rels,
                 rel_idx,
             );
@@ -610,6 +621,7 @@ impl OsmBuilder {
                 tags: r_pre.tags.clone(),
                 nodes: rel_nodes,
                 edges: rel_edges,
+                member_ways: rel_member_ways,
             });
         }
 
