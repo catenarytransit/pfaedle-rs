@@ -284,7 +284,6 @@ fn match_patterns_full_graph(
 
 const EXACT_RELATION_STOP_RADIUS_M: f64 = 120.0;
 const EXACT_RELATION_ENDPOINT_RADIUS_M: f64 = 300.0;
-const EXACT_RELATION_MAX_JOIN_GAP_M: f64 = 30.0;
 
 fn shape_id_for_pattern(pattern: &StopPattern) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -312,41 +311,15 @@ fn relation_mode_matches(route_type: Option<RouteType>, rel: &OsmRelation) -> bo
     }
 }
 
-fn relation_has_edge(osm: &OsmData, rel: &OsmRelation, a: NodeIndex, b: NodeIndex) -> bool {
-    if a == b {
-        return true;
-    }
-
-    osm.graph.node(a).edges().any(|&edge_idx| {
-        if !rel.edges.contains(&edge_idx) {
-            return false;
-        }
-        let edge = osm.graph.edge(edge_idx);
-        (edge.from == a && edge.to == b) || (edge.from == b && edge.to == a)
-    })
-}
-
-fn relation_node_distance_m(osm: &OsmData, a: NodeIndex, b: NodeIndex) -> f64 {
-    osm.graph
-        .node(a)
-        .payload
-        .point
-        .haversine_distance(&osm.graph.node(b).payload.point)
-}
-
-/// Rebuild the relation's exact OSM-node geometry in member order.
+/// Turn the route relation's running-way members into one continuous line.
 ///
-/// The old implementation tried to recover way boundaries from `rel.nodes` by
-/// asking whether adjacent flattened nodes happened to share a relation edge.
-/// That is ambiguous at rail junctions: two different member ways can touch the
-/// same junction, and a flattened list no longer tells us which way a node came
-/// from. On dense systems (notably CTA around Fullerton/The Loop) that can either
-/// make the exact-relation fast path fail or stitch the wrong branch together.
-///
-/// `OsmRelation::member_ways` keeps the actual relation-member boundaries. Keep
-/// those ways in their OSM relation order and only choose the orientation of
-/// each individual way.
-fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIndex>> {
+/// Do not trust the relation list as a ready-to-render polyline. PT relations
+/// contain stop/platform members, and real data occasionally has running ways
+/// slightly out of list order. After the loader has removed non-running members,
+/// build the line from shared OSM way endpoints. We deliberately require exact
+/// shared nodes rather than a distance tolerance: on parallel/branching railway
+/// infrastructure a "close enough" join can jump to a neighboring track.
+fn ordered_relation_nodes(_osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIndex>> {
     let ways: Vec<&[NodeIndex]> = rel
         .member_ways
         .iter()
@@ -357,99 +330,120 @@ fn ordered_relation_nodes(osm: &OsmData, rel: &OsmRelation) -> Option<Vec<NodeIn
         return None;
     }
 
-    // Dynamic programming over forward/reverse orientation of every member way.
-    // A transition is legal only when consecutive member ways really meet (or
-    // are separated by a tiny mapping gap). This prevents a junction elsewhere
-    // in the relation from being used as an accidental stitch point.
-    let mut costs = vec![[f64::INFINITY; 2]; ways.len()];
-    let mut parents = vec![[0usize; 2]; ways.len()];
-    costs[0] = [0.0, 0.0];
-
-    for i in 1..ways.len() {
-        for orientation in 0..2 {
-            let start = if orientation == 0 {
-                ways[i][0]
-            } else {
-                *ways[i].last().unwrap()
-            };
-
-            for previous_orientation in 0..2 {
-                if !costs[i - 1][previous_orientation].is_finite() {
-                    continue;
-                }
-                let previous_end = if previous_orientation == 0 {
-                    *ways[i - 1].last().unwrap()
-                } else {
-                    ways[i - 1][0]
-                };
-
-                let gap = if previous_end == start {
-                    0.0
-                } else {
-                    relation_node_distance_m(osm, previous_end, start)
-                };
-                if gap > EXACT_RELATION_MAX_JOIN_GAP_M {
-                    continue;
-                }
-
-                let candidate = costs[i - 1][previous_orientation] + gap;
-                if candidate < costs[i][orientation] {
-                    costs[i][orientation] = candidate;
-                    parents[i][orientation] = previous_orientation;
-                }
-            }
-        }
+    let mut endpoint_ways: AHashMap<NodeIndex, Vec<usize>> = AHashMap::new();
+    for (way_idx, way) in ways.iter().enumerate() {
+        endpoint_ways.entry(way[0]).or_default().push(way_idx);
+        endpoint_ways
+            .entry(*way.last().unwrap())
+            .or_default()
+            .push(way_idx);
     }
 
-    let last_costs = costs.last()?;
-    if !last_costs[0].is_finite() && !last_costs[1].is_finite() {
+    // A simple route line has no endpoint with more than two incident member
+    // ways. If it branches, choosing one branch would be guesswork and the exact
+    // relation fast path should decline the relation.
+    if endpoint_ways.values().any(|members| members.len() > 2) {
         return None;
     }
 
-    let mut orientations = vec![0usize; ways.len()];
-    let mut state = if last_costs[0] <= last_costs[1] {
-        0
-    } else {
-        1
-    };
-    for i in (1..ways.len()).rev() {
-        orientations[i] = state;
-        state = parents[i][state];
+    let terminals: Vec<NodeIndex> = endpoint_ways
+        .iter()
+        .filter_map(|(&node, members)| (members.len() == 1).then_some(node))
+        .collect();
+    if !terminals.is_empty() && terminals.len() != 2 {
+        return None;
     }
-    orientations[0] = state;
 
-    let mut ordered = Vec::new();
-    for (way, &orientation) in ways.iter().zip(&orientations) {
-        let start = if orientation == 0 {
-            way[0]
-        } else {
-            *way.last().unwrap()
-        };
-        if let Some(&previous_end) = ordered.last() {
-            if previous_end != start
-                && relation_node_distance_m(osm, previous_end, start)
-                    > EXACT_RELATION_MAX_JOIN_GAP_M
-            {
+    fn build_chain(
+        ways: &[&[NodeIndex]],
+        endpoint_ways: &AHashMap<NodeIndex, Vec<usize>>,
+        start_node: NodeIndex,
+        forced_first: Option<usize>,
+    ) -> Option<(Vec<NodeIndex>, Vec<usize>)> {
+        let mut used = vec![false; ways.len()];
+        let mut ordered_nodes = Vec::new();
+        let mut ordered_way_indices = Vec::with_capacity(ways.len());
+        let mut current = start_node;
+        let mut forced = forced_first;
+
+        loop {
+            let next_way = if let Some(idx) = forced.take() {
+                if used[idx] || (ways[idx][0] != current && *ways[idx].last()? != current) {
+                    return None;
+                }
+                idx
+            } else {
+                let mut candidates = endpoint_ways
+                    .get(&current)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|&idx| !used[idx]);
+                let first = candidates.next();
+                if candidates.next().is_some() {
+                    return None;
+                }
+                let Some(idx) = first else {
+                    break;
+                };
+                idx
+            };
+
+            let way = ways[next_way];
+            let forward = way[0] == current;
+            if !forward && *way.last()? != current {
                 return None;
             }
+
+            if forward {
+                for &node in way {
+                    if ordered_nodes.last().copied() != Some(node) {
+                        ordered_nodes.push(node);
+                    }
+                }
+                current = *way.last()?;
+            } else {
+                for &node in way.iter().rev() {
+                    if ordered_nodes.last().copied() != Some(node) {
+                        ordered_nodes.push(node);
+                    }
+                }
+                current = way[0];
+            }
+
+            used[next_way] = true;
+            ordered_way_indices.push(next_way);
         }
 
-        if orientation == 0 {
-            for &node in *way {
-                if ordered.last().copied() != Some(node) {
-                    ordered.push(node);
-                }
+        used.iter()
+            .all(|used| *used)
+            .then_some((ordered_nodes, ordered_way_indices))
+    }
+
+    // An open line has two possible global directions. A closed line has no
+    // degree-1 terminal, so anchor it on the first OSM member way and try both
+    // orientations. In either case prefer the direction that best agrees with
+    // the original relation-member order.
+    let mut chains = Vec::new();
+    if terminals.len() == 2 {
+        for start in terminals {
+            if let Some(chain) = build_chain(&ways, &endpoint_ways, start, None) {
+                chains.push(chain);
             }
-        } else {
-            for &node in way.iter().rev() {
-                if ordered.last().copied() != Some(node) {
-                    ordered.push(node);
-                }
+        }
+    } else {
+        let first = ways[0];
+        for start in [first[0], *first.last()?] {
+            if let Some(chain) = build_chain(&ways, &endpoint_ways, start, Some(0)) {
+                chains.push(chain);
             }
         }
     }
 
-    (ordered.len() >= 2).then_some(ordered)
+    chains
+        .into_iter()
+        .max_by_key(|(_, order)| order.windows(2).filter(|pair| pair[0] < pair[1]).count())
+        .map(|(nodes, _)| nodes)
 }
 
 /// Distance from a WGS84 point to a very short WGS84 segment, using a local
@@ -586,7 +580,7 @@ fn find_exact_relation_match(
 
         let Some(ordered_nodes) = ordered_relation_nodes(osm, rel) else {
             println!(
-                "[exact-relation] route {:?}: relation {} rejected: member ways are not contiguous in relation order",
+                "[exact-relation] route {:?}: relation {} rejected: running ways do not form one continuous non-branching line",
                 route_short_name.or(route_long_name),
                 rel.id
             );

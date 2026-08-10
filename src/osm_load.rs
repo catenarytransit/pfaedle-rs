@@ -185,6 +185,9 @@ impl OsmBuilder {
                     if is_route {
                         for member in &r.refs {
                             if let OsmId::Way(wid) = member.member {
+                                if !Self::is_route_geometry_role(&member.role) {
+                                    continue;
+                                }
                                 ways_in_relations.insert(wid.0);
                                 if r.tags.get("route").map_or(false, |s| s == "ferry") {
                                     ways_in_ferry_relations.insert(wid.0);
@@ -378,6 +381,9 @@ impl OsmBuilder {
             if let Some(info) = get_transit_info(r) {
                 for member in &r.members {
                     if let OsmId::Way(wid) = member.member {
+                        if !Self::is_route_geometry_role(&member.role) {
+                            continue;
+                        }
                         way_transit_info
                             .entry(wid.0)
                             .or_default()
@@ -507,6 +513,18 @@ impl OsmBuilder {
 
         Self::post_process(&mut graph);
 
+        // `post_process` adds reverse graph edges. Rebuild this lookup afterwards
+        // so a route relation contains both directions of every infrastructure
+        // segment. This lookup intentionally contains only graph-backed ways:
+        // platform/station/stop member ways never become graph edges and therefore
+        // cannot leak into route geometry below.
+        way_to_edge_indices.clear();
+        for (edge_idx, edge) in graph.edges.iter().enumerate() {
+            if edge.payload.osmid != 0 {
+                way_to_edge_indices.entry(edge.payload.osmid).or_default().push(edge_idx);
+            }
+        }
+
         // Build Output Relations
         let mut final_node_to_rels: AHashMap<NodeIndex, Vec<usize>> = AHashMap::new();
         let mut relations_list: Vec<OsmRelation> = Vec::new();
@@ -544,18 +562,29 @@ impl OsmBuilder {
                 if let Some(r_pre) = pre_rel_map.get(&r_id) {
                     for member in &r_pre.members {
                         match member.member {
-                            OsmId::Node(nid) => {
-                                if let Some(&idx) = osm_node_to_graph_idx.get(&nid.0) {
-                                    if !stop_node_indices.contains(&idx) {
-                                        out_nodes.push(idx);
-                                        out_final_node_to_rels
-                                            .entry(idx)
-                                            .or_default()
-                                            .push(current_rel_idx);
-                                    }
-                                }
-                            }
+                            // Direct node members in public-transport relations are
+                            // stops/stations/platforms or other metadata. Route
+                            // geometry comes from the infrastructure way members.
+                            // Nodes that are actually part of a track way are kept
+                            // through that way's node list below.
+                            OsmId::Node(_) => {}
                             OsmId::Way(wid) => {
+                                if !OsmBuilder::is_route_geometry_role(&member.role) {
+                                    continue;
+                                }
+
+                                // A way is shape geometry only if it produced graph
+                                // edges. This excludes railway=platform,
+                                // public_transport=platform, railway=stop/station
+                                // outlines, and other non-running-way relation
+                                // members even when their tagging is imperfect.
+                                let Some(edges) = way_to_edge_indices.get(&wid.0) else {
+                                    continue;
+                                };
+                                if edges.is_empty() {
+                                    continue;
+                                }
+
                                 if let Some(nodes) = way_id_to_node_indices.get(&wid.0) {
                                     if nodes.len() >= 2 {
                                         out_member_ways.push(nodes.clone());
@@ -568,13 +597,14 @@ impl OsmBuilder {
                                             .push(current_rel_idx);
                                     }
                                 }
-                                if let Some(edges) = way_to_edge_indices.get(&wid.0) {
-                                    for &e in edges {
-                                        out_edges.insert(e);
-                                    }
+                                for &e in edges {
+                                    out_edges.insert(e);
                                 }
                             }
                             OsmId::Relation(sub_rid) => {
+                                if !OsmBuilder::is_route_geometry_role(&member.role) {
+                                    continue;
+                                }
                                 flatten_relation(
                                     sub_rid.0,
                                     pre_rel_map,
@@ -815,6 +845,13 @@ impl OsmBuilder {
 
     pub fn is_valid_way(w: &osmpbfreader::Way) -> bool {
         w.nodes.len() > 1
+    }
+
+    /// Public-transport route geometry is carried by way members with an empty
+    /// role (PTv2) or the legacy forward/backward roles. stop*/platform* members
+    /// describe boarding locations and must never be mixed into the running path.
+    fn is_route_geometry_role(role: &str) -> bool {
+        matches!(role, "" | "forward" | "backward")
     }
 
     pub fn is_infrastructure(w: &osmpbfreader::Way) -> bool {
