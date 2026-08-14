@@ -225,6 +225,7 @@ fn match_patterns_full_graph(
         .transpose()?;
 
     let mut results = AHashMap::with_capacity(patterns.len());
+    let relation_name_index = RelationNameIndex::build(&osm.relations);
 
     for batch in patterns.chunks(batch_size) {
         let batch_results: Vec<_> = if let Some(ref pool) = pool {
@@ -234,7 +235,14 @@ fn match_patterns_full_graph(
                     .map_init(
                         pathfinding::PathfinderContext::new,
                         |ctx, (pattern, trips)| {
-                            let res = match_one_pattern(gtfs, osm, pattern, trips, ctx);
+                            let res = match_one_pattern(
+                                gtfs,
+                                osm,
+                                &relation_name_index,
+                                pattern,
+                                trips,
+                                ctx,
+                            );
                             ctx.discard_if_oversized(500_000);
                             res
                         },
@@ -247,7 +255,14 @@ fn match_patterns_full_graph(
                 .map_init(
                     pathfinding::PathfinderContext::new,
                     |ctx, (pattern, trips)| {
-                        let res = match_one_pattern(gtfs, osm, pattern, trips, ctx);
+                        let res = match_one_pattern(
+                            gtfs,
+                            osm,
+                            &relation_name_index,
+                            pattern,
+                            trips,
+                            ctx,
+                        );
                         ctx.discard_if_oversized(500_000);
                         res
                     },
@@ -284,6 +299,142 @@ fn match_patterns_full_graph(
 
 const EXACT_RELATION_STOP_RADIUS_M: f64 = 120.0;
 const EXACT_RELATION_ENDPOINT_RADIUS_M: f64 = 300.0;
+
+/// Inverted index over the identity-bearing tags of OSM route relations.
+///
+/// The existing matching semantics allow containment in either direction, e.g.
+/// "Red" matching "Red Line". Trigrams preserve that behavior for names with
+/// at least three characters without scanning every relation for every pattern.
+#[derive(Debug, Default)]
+struct RelationNameIndex {
+    trigrams: AHashMap<String, Vec<usize>>,
+    short_grams: AHashMap<String, Vec<usize>>,
+    short_identities: AHashMap<String, Vec<usize>>,
+}
+
+impl RelationNameIndex {
+    fn push_posting(
+        map: &mut AHashMap<String, Vec<usize>>,
+        key: String,
+        relation_index: usize,
+    ) {
+        let postings = map.entry(key).or_default();
+        if postings.last().copied() != Some(relation_index) {
+            postings.push(relation_index);
+        }
+    }
+
+    fn build(relations: &[OsmRelation]) -> Self {
+        let mut index = Self::default();
+
+        for (relation_index, rel) in relations.iter().enumerate() {
+            for tag in ["ref", "name", "official_name", "alt_name"] {
+                let Some(value) = rel.tags.get(tag) else {
+                    continue;
+                };
+
+                let normalized = value.trim().to_lowercase();
+                if normalized.is_empty() {
+                    continue;
+                }
+
+                let chars: Vec<char> = normalized.chars().collect();
+
+                if chars.len() <= 2 {
+                    Self::push_posting(
+                        &mut index.short_identities,
+                        normalized.clone(),
+                        relation_index,
+                    );
+                }
+
+                // Support one- and two-character route refs such as A, N, 1, etc.
+                for width in 1..=chars.len().min(2) {
+                    for window in chars.windows(width) {
+                        Self::push_posting(
+                            &mut index.short_grams,
+                            window.iter().copied().collect(),
+                            relation_index,
+                        );
+                    }
+                }
+
+                if chars.len() >= 3 {
+                    for window in chars.windows(3) {
+                        Self::push_posting(
+                            &mut index.trigrams,
+                            window.iter().copied().collect(),
+                            relation_index,
+                        );
+                    }
+                }
+            }
+        }
+
+        index
+    }
+
+    fn extend_postings(
+        map: &AHashMap<String, Vec<usize>>,
+        key: &str,
+        candidates: &mut AHashSet<usize>,
+    ) {
+        if let Some(postings) = map.get(key) {
+            candidates.extend(postings.iter().copied());
+        }
+    }
+
+    fn add_identity_candidates(&self, value: &str, candidates: &mut AHashSet<usize>) {
+        let normalized = value.trim().to_lowercase();
+        if normalized.is_empty() {
+            return;
+        }
+
+        let chars: Vec<char> = normalized.chars().collect();
+
+        if chars.len() >= 3 {
+            for window in chars.windows(3) {
+                let trigram: String = window.iter().copied().collect();
+                Self::extend_postings(&self.trigrams, &trigram, candidates);
+            }
+        } else {
+            Self::extend_postings(&self.short_grams, &normalized, candidates);
+        }
+
+        // Preserve reverse containment when the OSM identity itself is only one
+        // or two characters and the GTFS identity is longer.
+        for width in 1..=chars.len().min(2) {
+            for window in chars.windows(width) {
+                let short_identity: String = window.iter().copied().collect();
+                Self::extend_postings(
+                    &self.short_identities,
+                    &short_identity,
+                    candidates,
+                );
+            }
+        }
+    }
+
+    fn candidates(
+        &self,
+        route_short_name: Option<&str>,
+        route_long_name: Option<&str>,
+    ) -> Vec<usize> {
+        let mut candidates = AHashSet::new();
+
+        if let Some(name) = route_short_name {
+            self.add_identity_candidates(name, &mut candidates);
+        }
+        if let Some(name) = route_long_name {
+            self.add_identity_candidates(name, &mut candidates);
+        }
+
+        // Preserve original relation order for deterministic tie-breaking.
+        let mut candidates: Vec<_> = candidates.into_iter().collect();
+        candidates.sort_unstable();
+        candidates
+    }
+}
 
 fn shape_id_for_pattern(pattern: &StopPattern) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -557,6 +708,7 @@ fn relation_identity_score(
 /// The returned geometry is made only from original OSM relation node coords.
 fn find_exact_relation_match(
     osm: &OsmData,
+    relation_name_index: &RelationNameIndex,
     stop_coords: &[Point<f64>],
     route_type: Option<RouteType>,
     route_short_name: Option<&str>,
@@ -565,7 +717,9 @@ fn find_exact_relation_match(
 ) -> Option<(Vec<(f64, f64)>, Option<String>)> {
     let mut best: Option<(u8, f64, usize, Vec<NodeIndex>)> = None;
 
-    for (relation_index, rel) in osm.relations.iter().enumerate() {
+    for relation_index in relation_name_index.candidates(route_short_name, route_long_name) {
+        let rel = &osm.relations[relation_index];
+
         if !relation_mode_matches(route_type, rel) {
             continue;
         }
@@ -646,6 +800,7 @@ fn find_exact_relation_match(
 fn match_one_pattern(
     gtfs: &GtfsData,
     osm: &OsmData,
+    relation_name_index: &RelationNameIndex,
     pattern: &StopPattern,
     _trips: &Vec<String>,
     ctx: &mut pathfinding::PathfinderContext,
@@ -698,6 +853,7 @@ fn match_one_pattern(
     if stop_coords.len() == pattern.stop_ids.len() {
         if let Some((geometry, matched_route_color)) = find_exact_relation_match(
             osm,
+            relation_name_index,
             &stop_coords,
             pattern.route_type,
             route_short_name.as_deref(),
