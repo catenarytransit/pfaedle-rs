@@ -438,8 +438,14 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                         for cand in fr_cands {
                             if let Some(cand_e) = cand.edge {
                                 let progr_start = if cand.progr > 0.0 {
-                                    self.get_edge_cost(Some(cand_e), None, None, &to_tr_nd.r_attrs, r_opts, restrict)
-                                        as f64
+                                    self.get_edge_cost(
+                                        Some(cand_e),
+                                        None,
+                                        None,
+                                        &to_tr_nd.r_attrs,
+                                        r_opts,
+                                        restrict,
+                                    ) as f64
                                         * cand.progr
                                 } else {
                                     0.0
@@ -683,7 +689,10 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                 }
             }
 
-            if r_opts.turn_restr_cost > 0 && edge.payload.restriction && !restrict.may(from_idx, to_idx, n_idx) {
+            if r_opts.turn_restr_cost > 0
+                && edge.payload.restriction
+                && !restrict.may(from_idx, to_idx, n_idx)
+            {
                 c = c.saturating_add(r_opts.turn_restr_cost);
             }
         }
@@ -700,7 +709,11 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
         r_opts: &RoutingOpts,
         restrict: &Restrictor,
         reconstruct_target: Option<EdgeIndex>,
-    ) -> (AHashMap<EdgeIndex, (u32, EdgeIndex)>, AHashMap<EdgeIndex, RouteEdge>, Option<Vec<EdgeIndex>>) {
+    ) -> (
+        AHashMap<EdgeIndex, (u32, EdgeIndex)>,
+        AHashMap<EdgeIndex, RouteEdge>,
+        Option<Vec<EdgeIndex>>,
+    ) {
         let mut dists: AHashMap<EdgeIndex, (u32, EdgeIndex)> = AHashMap::new();
         let mut settled: AHashMap<EdgeIndex, RouteEdge> = AHashMap::new();
         let mut pq = BinaryHeap::new();
@@ -1007,7 +1020,8 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
                 if e_fr == e_to {
                     if fr.progr <= to.progr {
-                        let cost_to = self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
+                        let cost_to =
+                            self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
                         let progr_c_fr = (cost_fr as f64 * fr.progr) as u32;
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c += progr_c_to - progr_c_fr;
@@ -1023,7 +1037,8 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                         }
                     }
                     if to.progr > 0.0 {
-                        let cost_to = self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
+                        let cost_to =
+                            self.get_edge_cost(Some(e_to), None, None, r_attrs, r_opts, restrict);
                         let progr_c_to = (cost_to as f64 * to.progr) as u32;
                         c = c.saturating_add(progr_c_to);
                         if TW::need_dist() {
@@ -1184,7 +1199,8 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             if let Some(fr_cands) = e_fr_cands.get(&from_edg) {
                 for &fr_id in fr_cands {
                     let fr = &froms[fr_id];
-                    let cost_fr = self.get_edge_cost(Some(from_edg), None, None, r_attrs, r_opts, restrict);
+                    let cost_fr =
+                        self.get_edge_cost(Some(from_edg), None, None, r_attrs, r_opts, restrict);
 
                     if let Some(to_cands) = e_to_cands.get(&to_edg) {
                         for &to_id in to_cands {
@@ -1193,7 +1209,14 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
 
                             if from_edg == to_edg {
                                 if fr.progr <= to.progr {
-                                    let cost_to = self.get_edge_cost(Some(to_edg), None, None, r_attrs, r_opts, restrict);
+                                    let cost_to = self.get_edge_cost(
+                                        Some(to_edg),
+                                        None,
+                                        None,
+                                        r_attrs,
+                                        r_opts,
+                                        restrict,
+                                    );
                                     let progr_c_fr = ((cost_fr as f64) * fr.progr) as u32;
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost
@@ -1207,7 +1230,14 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                                     wr_cost = wr_cost.saturating_sub(progr_c_fr);
                                 }
                                 if to.progr > 0.0 {
-                                    let cost_to = self.get_edge_cost(Some(to_edg), None, None, r_attrs, r_opts, restrict);
+                                    let cost_to = self.get_edge_cost(
+                                        Some(to_edg),
+                                        None,
+                                        None,
+                                        r_attrs,
+                                        r_opts,
+                                        restrict,
+                                    );
                                     let progr_c_to = ((cost_to as f64) * to.progr) as u32;
                                     wr_cost = wr_cost.saturating_add(progr_c_to);
                                 }

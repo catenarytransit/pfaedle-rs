@@ -51,6 +51,70 @@ impl PartialOrd for LineSimilarity {
     }
 }
 
+/// Cheap line-name comparison used on every explored routing edge.
+///
+/// Upstream pfaedle accepts exact matches plus whole-token prefix/suffix
+/// matches. We also compare ASCII-alphanumeric streams so common GTFS/OSM
+/// spelling differences such as `RE3` versus `RE 3` do not require allocating
+/// normalized Strings in the Dijkstra hot path.
+fn line_simi(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+
+    fn compact_eq(a: &str, b: &str) -> bool {
+        // Do not let two punctuation-only strings compare equal after filtering.
+        if !a.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            || !b.bytes().any(|byte| byte.is_ascii_alphanumeric())
+        {
+            return false;
+        }
+
+        a.bytes()
+            .filter(|byte| byte.is_ascii_alphanumeric())
+            .map(|byte| byte.to_ascii_lowercase())
+            .eq(b
+                .bytes()
+                .filter(|byte| byte.is_ascii_alphanumeric())
+                .map(|byte| byte.to_ascii_lowercase()))
+    }
+
+    fn begins_with_word(longer: &str, shorter: &str) -> bool {
+        if longer.len() <= shorter.len() + 1 || !longer.is_char_boundary(shorter.len()) {
+            return false;
+        }
+        longer[..shorter.len()].eq_ignore_ascii_case(shorter)
+            && longer[shorter.len()..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+    }
+
+    fn ends_with_word(longer: &str, shorter: &str) -> bool {
+        if longer.len() <= shorter.len() + 1 || longer.len() < shorter.len() {
+            return false;
+        }
+        let start = longer.len() - shorter.len();
+        if !longer.is_char_boundary(start) || start == 0 {
+            return false;
+        }
+        longer[start..].eq_ignore_ascii_case(shorter)
+            && longer[..start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+    }
+
+    compact_eq(a, b)
+        || begins_with_word(a, b)
+        || ends_with_word(a, b)
+        || begins_with_word(b, a)
+        || ends_with_word(b, a)
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct RoutingAttrs {
     pub short_name: String,
@@ -74,10 +138,22 @@ impl RoutingAttrs {
     }
 
     pub fn simi(&self, info: &TransitInfo) -> LineSimilarity {
+        // Match upstream's shortcut: an edge with no line information should not
+        // be punished merely because its metadata is absent.
+        if info.short_name.is_empty() && info.from_str.is_empty() && info.to_str.is_empty() {
+            return LineSimilarity {
+                name_similar: true,
+                from_similar: true,
+                to_similar: true,
+            };
+        }
+
         LineSimilarity {
-            name_similar: self.short_name == info.short_name,
-            from_similar: self.line_from == info.from_str,
-            to_similar: self.line_to == info.to_str,
+            name_similar: self.short_name.is_empty()
+                || line_simi(&info.short_name, &self.short_name),
+            from_similar: self.line_from.is_empty()
+                || info.from_str.eq_ignore_ascii_case(&self.line_from),
+            to_similar: self.line_to.is_empty() || info.to_str.eq_ignore_ascii_case(&self.line_to),
         }
     }
 }
@@ -127,3 +203,18 @@ impl TransWeight for ExpoTransWeight {
 
 // TODO: Implement NormDistrTransWeight if needed
 // TODO: Implement DistDiffTransWeight if needed
+
+#[cfg(test)]
+mod tests {
+    use super::line_simi;
+
+    #[test]
+    fn line_similarity_is_token_aware() {
+        assert!(line_simi("Red Line", "Red"));
+        assert!(line_simi("RE 3", "RE3"));
+        assert!(line_simi("re3", "RE 3"));
+        assert!(!line_simi("62", "162"));
+        assert!(!line_simi("RE3", "RE55"));
+        assert!(!line_simi("---", "___"));
+    }
+}

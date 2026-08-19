@@ -583,12 +583,15 @@ mod tests {
     fn test_pathfind_preference_by_long_name() {
         let mut graph = Graph::new();
         let n0 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.0),
         });
         let n1 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.0, 0.1),
         });
         let n2 = graph.add_node(NodePL {
+            comp_id: 0,
             point: Point::new(0.1, 0.05),
         });
 
@@ -656,7 +659,6 @@ mod tests {
         .expect("Should find path cost");
         assert_eq!(cost, 2800.0);
     }
-
 }
 
 pub fn pathfind_cost_with_context(

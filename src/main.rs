@@ -106,12 +106,18 @@ fn main() -> Result<()> {
     let args = Args::parse();
     println!("Running pfaedle-rs with args: {:?}", args);
 
+    #[cfg(not(windows))]
     if args.low_priority {
         if let Err(e) = rustix::process::nice(10) {
             eprintln!("Failed to set priority: {}", e);
         } else {
             println!("Process priority set to low (nice +10).");
         }
+    }
+
+    #[cfg(windows)]
+    if args.low_priority {
+        eprintln!("Warning: --low-priority is not supported on Windows.");
     }
 
     let out_dir = args.out_dir.as_ref().unwrap_or(&args.gtfs_dir);
