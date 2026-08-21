@@ -554,6 +554,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
     }
 
     fn transit_line_simi(
+        &self,
         edge: &EdgePL,
         r_attrs: &RoutingAttrs,
     ) -> crate::router::weights::LineSimilarity {
@@ -574,7 +575,10 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
             to_similar: false,
         };
 
-        for line in &edge.lines {
+        for &line_id in &edge.lines {
+            let Some(line) = self.graph.transit_info(line_id) else {
+                continue;
+            };
             let simi = r_attrs.simi(line);
             if simi.name_similar && simi.to_similar && simi.from_similar {
                 return simi;
@@ -630,7 +634,7 @@ impl<'a, TW: TransWeight> RouterImpl<'a, TW> {
                 && r_attrs.line_to.is_empty());
 
         if !no_line_simi_pen {
-            let simi = Self::transit_line_simi(&edge.payload, r_attrs);
+            let simi = self.transit_line_simi(&edge.payload, r_attrs);
 
             if !simi.name_similar {
                 if r_opts.line_unmatched_punish_fact < 1.0 {

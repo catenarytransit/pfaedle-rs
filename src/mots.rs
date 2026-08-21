@@ -97,8 +97,8 @@ pub fn map_route_type_to_category(rt: RouteType) -> MotCategory {
 /// Trams are excluded as they use dedicated track infrastructure.
 pub fn is_bus_like_route_type(rt: RouteType) -> bool {
     matches!(
-        rt,
-        RouteType::Bus | RouteType::Coach | RouteType::Other(11) | RouteType::Other(800)
+        map_route_type_to_category(rt),
+        MotCategory::Bus | MotCategory::Coach | MotCategory::Trolleybus
     )
 }
 

@@ -1,16 +1,21 @@
 mod color;
+#[path = "trgraph.rs"]
 mod graph;
 mod gtfs_load;
 mod hilbert;
 mod matcher;
 mod mots;
+#[path = "osm_builder.rs"]
 mod osm_load;
+#[path = "osm_split_upstream.rs"]
 mod osm_split;
 mod pathfinding;
 mod router;
-mod segment_matcher;
+#[path = "streaming_bus.rs"]
 mod streaming_matcher;
-mod tile;
+mod tile_loader;
+mod upstream_graph;
+mod upstream_match;
 
 use ahash::AHashMap;
 use anyhow::{Context, Result};

@@ -26,7 +26,7 @@ pub struct BinaryShapeRecord {
 }
 
 #[derive(Debug, Clone)]
-struct SpatialEdge {
+pub(crate) struct SpatialEdge {
     edge_idx: crate::graph::EdgeIndex,
     envelope: rstar::AABB<[f64; 2]>,
 }
@@ -46,11 +46,13 @@ struct ProjectedEdgeCandidate {
     progress: f64,
 }
 
-fn build_match_edge_index(osm: &crate::osm_load::OsmData) -> rstar::RTree<SpatialEdge> {
-    // Full-graph matching only handles non-bus modes. Keeping road-only edges
-    // out of this index mirrors upstream's per-MOT graph/index construction and
-    // avoids doubling memory on large metropolitan extracts.
-    let indexed_modes = MODE_RAIL | MODE_TRAM | MODE_SUBWAY | MODE_FERRY | MODE_GONDOLA;
+pub(crate) fn build_match_edge_index(
+    osm: &crate::osm_load::OsmData,
+    indexed_modes: u8,
+) -> rstar::RTree<SpatialEdge> {
+    // Upstream ShapeBuilder inserts the complete collapsed edge geometry into
+    // EdgeGrid. Using only from/to endpoints would miss curved or looping
+    // polylines after C++-style degree-2 collapse.
     let edges = osm
         .graph
         .edges
@@ -61,10 +63,24 @@ fn build_match_edge_index(osm: &crate::osm_load::OsmData) -> rstar::RTree<Spatia
                 return None;
             }
 
-            let from = osm.graph.node(edge.from).payload.point;
-            let to = osm.graph.node(edge.to).payload.point;
-            let min = [from.x().min(to.x()), from.y().min(to.y())];
-            let max = [from.x().max(to.x()), from.y().max(to.y())];
+            let (min, max) = if edge.payload.geometry.0.len() >= 2 {
+                let mut min = [f64::INFINITY, f64::INFINITY];
+                let mut max = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+                for coord in &edge.payload.geometry.0 {
+                    min[0] = min[0].min(coord.x);
+                    min[1] = min[1].min(coord.y);
+                    max[0] = max[0].max(coord.x);
+                    max[1] = max[1].max(coord.y);
+                }
+                (min, max)
+            } else {
+                let from = osm.graph.node(edge.from).payload.point;
+                let to = osm.graph.node(edge.to).payload.point;
+                (
+                    [from.x().min(to.x()), from.y().min(to.y())],
+                    [from.x().max(to.x()), from.y().max(to.y())],
+                )
+            };
 
             Some(SpatialEdge {
                 edge_idx,
@@ -367,7 +383,6 @@ pub fn match_patterns(
 ) -> Result<AHashMap<StopPattern, ShapeResult>, anyhow::Error> {
     use crate::mots::is_bus_like_route_type;
     use crate::osm_load::OsmBuilder;
-    use crate::osm_load::load_osm;
     use crate::streaming_matcher::StreamingMatcher;
     use anyhow::Context;
 
@@ -388,94 +403,31 @@ pub fn match_patterns(
         bus_count, other_count
     );
 
-    // 2. Light OSM pass for relations/colors (only if needed by bus patterns)
-    let light_osm = if bus_count > 0 {
-        println!("Performing light OSM pass...");
-        OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?
-    } else {
-        println!("No bus-like patterns found. Skipping light OSM pass.");
-        crate::osm_load::LightOsmData {
-            relations: Vec::new(),
-            way_to_relations: ahash::AHashMap::new(),
-        }
-    };
-
-    // 3. Process non-bus patterns with existing full-graph approach
+    // 3. Upstream constructs a fresh graph per MOT configuration. Processing
+    // rail, tram/subway, ferry and aerial profiles sequentially prevents the
+    // largest graph from coexisting with unrelated mode networks and ensures
+    // collapse uses the correct pfaedle.cfg level/one-way rules.
     let other_results = if other_count > 0 {
-        println!("Loading FULL OSM graph for rail/ferry/subway matching...");
-
-        // We only load full graph if we have non-bus patterns
-        // We need to calculate BBox for these specific patterns if possible,
-        // effectively optimizing the "other" load too.
-        // For now, let's use the full bbox logic from main.rs but filtered to other_patterns.
-        // Or just load everything for "other" modes?
-        // Safety: use existing logic but restricted.
-
-        let mut types = ahash::AHashSet::new();
-        for (pattern, _) in &other_patterns {
-            if let Some(rt) = pattern.route_type {
-                types.insert(rt);
-            }
-        }
-
-        // Calculate bounding box from pattern stops (critical for memory efficiency)
-        let bbox = {
-            let mut min_lat = f64::MAX;
-            let mut max_lat = f64::MIN;
-            let mut min_lon = f64::MAX;
-            let mut max_lon = f64::MIN;
-            let mut found_any = false;
-
-            for (pattern, _) in &other_patterns {
-                for stop_id in &pattern.stop_ids {
-                    if let Some(stop) = gtfs.gtfs.stops.get(stop_id) {
-                        if let (Some(lat), Some(lon)) = (stop.latitude, stop.longitude) {
-                            min_lat = min_lat.min(lat);
-                            max_lat = max_lat.max(lat);
-                            min_lon = min_lon.min(lon);
-                            max_lon = max_lon.max(lon);
-                            found_any = true;
-                        }
-                    }
-                }
-            }
-
-            if found_any {
-                // Add padding (0.5 degrees ~= 55km) to ensure we capture nearby infrastructure
-                let padding = 0.5;
-                Some((
-                    min_lon - padding,
-                    min_lat - padding,
-                    max_lon + padding,
-                    max_lat + padding,
-                ))
-            } else {
-                None
-            }
-        };
-
-        println!("  Calculated bbox for {} patterns: {:?}", other_count, bbox);
-        let osm_data = load_osm(osm_path, &types, bbox, false)?;
-
-        let results = match_patterns_full_graph(
-            &gtfs,
-            &osm_data,
+        crate::upstream_match::match_nonbus_profiles(
+            gtfs,
+            osm_path,
             other_patterns,
             cache_file_path,
             match_threads,
-        )?;
-        results
+        )?
     } else {
         println!("No non-bus patterns found. Skipping full graph load.");
         AHashMap::new()
     };
 
-    // 4. Process bus-like patterns with streaming approach
+    // 4. Process bus-like patterns with streaming approach. Build the light
+    // relation index only after all non-bus graphs have been dropped so it
+    // cannot contribute to the full-graph peak RSS.
     let bus_results = if bus_count > 0 {
-        // Cache size: 100 tiles * ~50MB/tile = ~5GB peak?
-        // Tiles are much smaller if stripped of buildings/etc.
-        // 100 tiles is generous. 0.5 deg tile = 50x50km.
-        let mut matcher = StreamingMatcher::new(osm_path, 50, light_osm, skip_small_roads)?;
+        println!("Performing light OSM relation pass for bus/coach matching...");
+        let light_osm =
+            OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?;
+        let mut matcher = StreamingMatcher::new(osm_path, 0, light_osm, skip_small_roads)?;
         matcher.match_all(gtfs, bus_patterns, cache_file_path)
     } else {
         AHashMap::new()
@@ -523,7 +475,7 @@ pub fn match_patterns(
 }
 
 /// Full-graph matching (original implementation for non-bus modes)
-fn match_patterns_full_graph(
+pub(crate) fn match_patterns_full_graph(
     gtfs: &GtfsData,
     osm: &OsmData,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
@@ -593,7 +545,8 @@ fn match_patterns_full_graph(
     // Upstream ShapeBuilder indexes graph edges, not graph nodes, for station
     // candidates. Build that index once per full-graph run and share it across
     // pattern workers.
-    let edge_index = build_match_edge_index(osm);
+    let indexed_modes = MODE_RAIL | MODE_TRAM | MODE_SUBWAY | MODE_FERRY | MODE_GONDOLA;
+    let edge_index = build_match_edge_index(osm, indexed_modes);
     println!(
         "Built edge snap index with {} directed edges",
         edge_index.size()
@@ -656,7 +609,7 @@ fn shape_id_for_pattern(pattern: &StopPattern) -> String {
     format!("shape_{}", hasher.finish())
 }
 
-fn match_one_pattern(
+pub(crate) fn match_one_pattern(
     gtfs: &GtfsData,
     osm: &OsmData,
     edge_index: &rstar::RTree<SpatialEdge>,
@@ -728,13 +681,23 @@ fn match_one_pattern(
     // nearby *nodes*, required one to exist, and assigned progression 0. That
     // changes both reachability and routing cost, especially on long rail ways.
     const STATION_MOVE_PENALTY_PER_METER: f64 = 0.0039;
-    let max_snap_distance_m = if allowed_modes == MODE_RAIL {
-        200.0
+    // Defaults from the matching upstream pfaedle.cfg sections. Bus used to
+    // snap to graph nodes in the Rust streaming matcher; after collapse it now
+    // uses the same projected edge candidates as upstream ShapeBuilder.
+    let (max_snap_distance_m, max_snap_level, non_station_penalty) = if allowed_modes == MODE_RAIL {
+        (200.0, 2, 0.4)
+    } else if allowed_modes == MODE_BUS {
+        (100.0, 5, 0.4)
+    } else if allowed_modes == MODE_FERRY {
+        (500.0, 4, 0.4)
+    } else if allowed_modes == MODE_TRAM
+        || allowed_modes == MODE_SUBWAY
+        || allowed_modes == MODE_GONDOLA
+    {
+        (100.0, 4, 0.4)
     } else {
-        50.0
+        (50.0, 7, 0.0)
     };
-    let max_snap_level = if allowed_modes == MODE_RAIL { 2 } else { 7 };
-    let non_station_penalty = if allowed_modes == MODE_RAIL { 0.4 } else { 0.0 };
 
     let mut stop_candidates: Vec<EdgeCandGroup> = Vec::with_capacity(stop_coords.len());
     for &point in &stop_coords {
@@ -876,9 +839,27 @@ fn match_one_pattern(
     r_opts.line_name_to_unmatched_punish_fact = 1.1;
     r_opts.line_name_from_unmatched_punish_fact = 1.05;
     if allowed_modes == MODE_RAIL {
-        // pfaedle.cfg [rail]: discourage full reversals through station throats.
+        // pfaedle.cfg [rail]
         r_opts.full_turn_punish_fac = 1_800;
         r_opts.full_turn_angle = 100.0;
+    } else if allowed_modes == MODE_BUS {
+        // pfaedle.cfg [bus, coach]
+        r_opts.full_turn_punish_fac = 1_200;
+        r_opts.full_turn_angle = 20.0;
+    } else if allowed_modes == MODE_TRAM || allowed_modes == MODE_SUBWAY {
+        // pfaedle.cfg [tram, subway]
+        r_opts.full_turn_punish_fac = 1_800;
+        r_opts.full_turn_angle = 80.0;
+    } else if allowed_modes == MODE_FERRY {
+        // pfaedle.cfg [ferry]
+        r_opts.full_turn_punish_fac = 1_200;
+        r_opts.full_turn_angle = 45.0;
+        r_opts.line_name_to_unmatched_punish_fact = 1.15;
+        r_opts.line_name_from_unmatched_punish_fact = 1.1;
+    } else if allowed_modes == MODE_GONDOLA {
+        // pfaedle.cfg [gondola] and [funicular]
+        r_opts.full_turn_punish_fac = 1_200;
+        r_opts.full_turn_angle = 80.0;
     }
 
     let mut hop_cache = HopCache::new();

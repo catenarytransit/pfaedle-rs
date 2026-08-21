@@ -218,7 +218,10 @@ pub fn pathfind_with_context(
     let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
         let mut cost = edge.payload.cost as f64;
         if let Some(pm) = preferred_match {
-            for line in &edge.payload.lines {
+            for &line_id in &edge.payload.lines {
+                let Some(line) = graph.transit_info(line_id) else {
+                    continue;
+                };
                 let mut matches = false;
                 // Check short name
                 if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
@@ -242,17 +245,6 @@ pub fn pathfind_with_context(
                         }
                     }
                 }
-                // Check operator
-                if !matches {
-                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
-                        if contains_ignore_case(line_op, target_op)
-                            || target_op.contains(&line_op.to_lowercase())
-                        {
-                            matches = true;
-                        }
-                    }
-                }
-
                 if matches {
                     cost *= 0.2; // Discount for matching lines
                     break;
@@ -504,8 +496,20 @@ mod tests {
     }
 
     #[test]
-    fn test_pathfind_preference() {
+    fn test_pathfind_preference_by_short_name() {
         let mut graph = Graph::new();
+        graph.transit_lines = vec![
+            crate::graph::TransitInfo {
+                short_name: "L1".into(),
+                from_str: String::new(),
+                to_str: String::new(),
+            },
+            crate::graph::TransitInfo {
+                short_name: "L2".into(),
+                from_str: String::new(),
+                to_str: String::new(),
+            },
+        ];
         let n0 = graph.add_node(NodePL {
             comp_id: 0,
             point: Point::new(0.0, 0.0),
@@ -514,74 +518,56 @@ mod tests {
             comp_id: 0,
             point: Point::new(0.0, 0.1),
         });
-
-        use crate::graph::TransitInfo;
-
-        // Edge 0: Direct but wrong operator
-        // Cost = 12000 (approx 11km)
-        let mut e_wrong = EdgePL::new();
-        e_wrong.allowed_modes = MODE_RAIL;
-        e_wrong.cost = 12000;
-        e_wrong.add_line(TransitInfo {
-            short_name: "L1".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: Some("OtherOp".into()),
-        });
-        let idx_wrong = graph.add_edge(n0, n1, e_wrong);
-
-        // Edge 1: Detour but correct operator
-        // Cost = 7000 * 2 = 14000 (longer)
-        // With preference ("MyOp"), cost becomes 14000 * 0.2 = 2800.
         let n2 = graph.add_node(NodePL {
             comp_id: 0,
             point: Point::new(0.1, 0.05),
         });
 
+        let mut e_wrong = EdgePL::new();
+        e_wrong.allowed_modes = MODE_RAIL;
+        e_wrong.cost = 12000;
+        e_wrong.lines = vec![0];
+        let idx_wrong = graph.add_edge(n0, n1, e_wrong);
+
         let mut e_right1 = EdgePL::new();
         e_right1.allowed_modes = MODE_RAIL;
         e_right1.cost = 7000;
-        e_right1.add_line(TransitInfo {
-            short_name: "L2".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: Some("MyOp".into()),
-        });
+        e_right1.lines = vec![1];
         let idx_right1 = graph.add_edge(n0, n2, e_right1);
 
         let mut e_right2 = EdgePL::new();
         e_right2.allowed_modes = MODE_RAIL;
         e_right2.cost = 7000;
-        e_right2.add_line(TransitInfo {
-            short_name: "L2".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: Some("MyOp".into()),
-        });
+        e_right2.lines = vec![1];
         let idx_right2 = graph.add_edge(n2, n1, e_right2);
 
         let match_pref = TransitMatch {
-            short_name: None,
+            short_name: Some("l2".to_string()),
             long_name: None,
-            operator: Some("myop".to_string()), // Lowercase for matching
+            operator: None,
         };
 
-        // Pathfind with preference
-        let result = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref))
+        let (_, path) = pathfind(&graph, n0, n1, MODE_RAIL, 0, None, Some(&match_pref))
             .expect("Should find path");
-        let (_, path) = result;
-
-        // Should choose path via n2 because (55+55)*0.2 = 22 < 100
-        assert_eq!(path.len(), 2);
-        assert_eq!(path[0], idx_right1);
-        assert_eq!(path[1], idx_right2);
-
+        assert_eq!(path, vec![idx_right1, idx_right2]);
         assert!(!path.contains(&idx_wrong));
     }
 
     #[test]
     fn test_pathfind_preference_by_long_name() {
         let mut graph = Graph::new();
+        graph.transit_lines = vec![
+            crate::graph::TransitInfo {
+                short_name: "Blue".into(),
+                from_str: String::new(),
+                to_str: String::new(),
+            },
+            crate::graph::TransitInfo {
+                short_name: "Red".into(),
+                from_str: String::new(),
+                to_str: String::new(),
+            },
+        ];
         let n0 = graph.add_node(NodePL {
             comp_id: 0,
             point: Point::new(0.0, 0.0),
@@ -595,42 +581,22 @@ mod tests {
             point: Point::new(0.1, 0.05),
         });
 
-        use crate::graph::TransitInfo;
-
-        // Direct route is cheaper without a preference.
         let mut e_other = EdgePL::new();
         e_other.allowed_modes = MODE_RAIL;
         e_other.cost = 12000;
-        e_other.add_line(TransitInfo {
-            short_name: "Blue".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: None,
-        });
+        e_other.lines = vec![0];
         let idx_other = graph.add_edge(n0, n1, e_other);
 
-        // The Red route is longer, but should win when "Red" matches
-        // GTFS route_long_name="Red Line".
         let mut e_red1 = EdgePL::new();
         e_red1.allowed_modes = MODE_RAIL;
         e_red1.cost = 7000;
-        e_red1.add_line(TransitInfo {
-            short_name: "Red".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: None,
-        });
+        e_red1.lines = vec![1];
         let idx_red1 = graph.add_edge(n0, n2, e_red1);
 
         let mut e_red2 = EdgePL::new();
         e_red2.allowed_modes = MODE_RAIL;
         e_red2.cost = 7000;
-        e_red2.add_line(TransitInfo {
-            short_name: "Red".into(),
-            from_str: "".into(),
-            to_str: "".into(),
-            operator: None,
-        });
+        e_red2.lines = vec![1];
         let idx_red2 = graph.add_edge(n2, n1, e_red2);
 
         let match_pref = TransitMatch {
@@ -727,30 +693,27 @@ pub fn pathfind_cost_with_context(
     let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
         let mut cost = edge.payload.cost as f64;
         if let Some(pm) = preferred_match {
-            for line in &edge.payload.lines {
+            for &line_id in &edge.payload.lines {
+                let Some(line) = graph.transit_info(line_id) else {
+                    continue;
+                };
                 let mut matches = false;
-                if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
+                if let Some(target) = &pm.short_name {
+                    let line_name = &line.short_name;
                     if contains_ignore_case(line_name, target)
                         || target.contains(&line_name.to_lowercase())
                     {
                         matches = true;
                     }
                 }
-                // Check long name
+                // The C++ TransitEdgeLine identity is short-name/from/to only.
+                // Rust also accepts the GTFS long name as an alternate query
+                // against the OSM relation line name, but never operator here.
                 if !matches {
                     if let Some(target) = &pm.long_name {
                         let line_name = &line.short_name;
                         if contains_ignore_case(line_name, target)
                             || target.contains(&line_name.to_lowercase())
-                        {
-                            matches = true;
-                        }
-                    }
-                }
-                if !matches {
-                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
-                        if contains_ignore_case(line_op, target_op)
-                            || target_op.contains(&line_op.to_lowercase())
                         {
                             matches = true;
                         }
@@ -964,9 +927,13 @@ pub fn multi_target_dijkstra(
     let get_edge_cost = |edge: &crate::graph::Edge<EdgePL>| -> f64 {
         let mut cost = edge.payload.cost as f64;
         if let Some(pm) = preferred_match {
-            for line in &edge.payload.lines {
+            for &line_id in &edge.payload.lines {
+                let Some(line) = graph.transit_info(line_id) else {
+                    continue;
+                };
                 let mut matches = false;
-                if let (Some(target), Some(line_name)) = (&pm.short_name, Some(&line.short_name)) {
+                if let Some(target) = &pm.short_name {
+                    let line_name = &line.short_name;
                     if contains_ignore_case(line_name, target)
                         || target.contains(&line_name.to_lowercase())
                     {
@@ -974,9 +941,10 @@ pub fn multi_target_dijkstra(
                     }
                 }
                 if !matches {
-                    if let (Some(target_op), Some(line_op)) = (&pm.operator, &line.operator) {
-                        if contains_ignore_case(line_op, target_op)
-                            || target_op.contains(&line_op.to_lowercase())
+                    if let Some(target) = &pm.long_name {
+                        let line_name = &line.short_name;
+                        if contains_ignore_case(line_name, target)
+                            || target.contains(&line_name.to_lowercase())
                         {
                             matches = true;
                         }
