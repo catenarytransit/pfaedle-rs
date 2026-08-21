@@ -25,6 +25,339 @@ pub struct BinaryShapeRecord {
     pub shape_pt_sequence: usize,
 }
 
+#[derive(Debug, Clone)]
+struct SpatialEdge {
+    edge_idx: crate::graph::EdgeIndex,
+    envelope: rstar::AABB<[f64; 2]>,
+}
+
+impl rstar::RTreeObject for SpatialEdge {
+    type Envelope = rstar::AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        self.envelope.clone()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedEdgeCandidate {
+    edge_idx: crate::graph::EdgeIndex,
+    distance_m: f64,
+    progress: f64,
+}
+
+fn build_match_edge_index(osm: &crate::osm_load::OsmData) -> rstar::RTree<SpatialEdge> {
+    // Full-graph matching only handles non-bus modes. Keeping road-only edges
+    // out of this index mirrors upstream's per-MOT graph/index construction and
+    // avoids doubling memory on large metropolitan extracts.
+    let indexed_modes = MODE_RAIL | MODE_TRAM | MODE_SUBWAY | MODE_FERRY | MODE_GONDOLA;
+    let edges = osm
+        .graph
+        .edges
+        .iter()
+        .enumerate()
+        .filter_map(|(edge_idx, edge)| {
+            if edge.payload.oneway == 2 || (edge.payload.allowed_modes & indexed_modes) == 0 {
+                return None;
+            }
+
+            let from = osm.graph.node(edge.from).payload.point;
+            let to = osm.graph.node(edge.to).payload.point;
+            let min = [from.x().min(to.x()), from.y().min(to.y())];
+            let max = [from.x().max(to.x()), from.y().max(to.y())];
+
+            Some(SpatialEdge {
+                edge_idx,
+                envelope: rstar::AABB::from_corners(min, max),
+            })
+        })
+        .collect();
+
+    rstar::RTree::bulk_load(edges)
+}
+
+fn snap_envelope(point: Point<f64>, max_distance_m: f64) -> rstar::AABB<[f64; 2]> {
+    const METERS_PER_DEGREE_LAT: f64 = 111_320.0;
+    let lat_pad = max_distance_m / METERS_PER_DEGREE_LAT;
+    let lon_scale = point.y().to_radians().cos().abs().max(0.01);
+    let lon_pad = max_distance_m / (METERS_PER_DEGREE_LAT * lon_scale);
+
+    rstar::AABB::from_corners(
+        [point.x() - lon_pad, point.y() - lat_pad],
+        [point.x() + lon_pad, point.y() + lat_pad],
+    )
+}
+
+fn oriented_edge_points(
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    edge_idx: crate::graph::EdgeIndex,
+) -> Vec<Point<f64>> {
+    let edge = graph.edge(edge_idx);
+    let mut points: Vec<Point<f64>> = if edge.payload.geometry.0.len() >= 2 {
+        edge.payload
+            .geometry
+            .0
+            .iter()
+            .map(|coord| Point::new(coord.x, coord.y))
+            .collect()
+    } else {
+        vec![
+            graph.node(edge.from).payload.point,
+            graph.node(edge.to).payload.point,
+        ]
+    };
+
+    if edge.payload.is_reverse && edge.payload.geometry.0.len() >= 2 {
+        points.reverse();
+    }
+    points
+}
+
+fn project_point_onto_edge(
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    edge_idx: crate::graph::EdgeIndex,
+    point: Point<f64>,
+) -> Option<(Point<f64>, f64, f64)> {
+    let points = oriented_edge_points(graph, edge_idx);
+    if points.len() < 2 {
+        return None;
+    }
+
+    let total_length: f64 = points
+        .windows(2)
+        .map(|segment| segment[0].haversine_distance(&segment[1]))
+        .sum();
+    if !total_length.is_finite() || total_length <= f64::EPSILON {
+        return None;
+    }
+
+    let lon_scale = point.y().to_radians().cos().abs().max(0.01);
+    let mut best: Option<(Point<f64>, f64, f64)> = None;
+    let mut distance_before = 0.0;
+
+    for segment in points.windows(2) {
+        let a = segment[0];
+        let b = segment[1];
+        let dx = (b.x() - a.x()) * lon_scale;
+        let dy = b.y() - a.y();
+        let len_sq = dx * dx + dy * dy;
+        let t = if len_sq <= f64::EPSILON {
+            0.0
+        } else {
+            let px = (point.x() - a.x()) * lon_scale;
+            let py = point.y() - a.y();
+            ((px * dx + py * dy) / len_sq).clamp(0.0, 1.0)
+        };
+
+        let projected = Point::new(a.x() + (b.x() - a.x()) * t, a.y() + (b.y() - a.y()) * t);
+        let distance_m = point.haversine_distance(&projected);
+        let segment_length = a.haversine_distance(&b);
+        let progress = ((distance_before + segment_length * t) / total_length).clamp(0.0, 1.0);
+
+        if best
+            .as_ref()
+            .map_or(true, |(_, best_distance, _)| distance_m < *best_distance)
+        {
+            best = Some((projected, distance_m, progress));
+        }
+        distance_before += segment_length;
+    }
+
+    best
+}
+
+fn edge_candidates_for_stop(
+    edge_index: &rstar::RTree<SpatialEdge>,
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    point: Point<f64>,
+    allowed_modes: u8,
+    max_distance_m: f64,
+    max_snap_level: i32,
+) -> Vec<ProjectedEdgeCandidate> {
+    let envelope = snap_envelope(point, max_distance_m);
+    let mut best_by_way_direction: AHashMap<(i64, bool), ProjectedEdgeCandidate> = AHashMap::new();
+    let mut unkeyed = Vec::new();
+
+    for indexed in edge_index.locate_in_envelope_intersecting(&envelope) {
+        let edge = graph.edge(indexed.edge_idx);
+        if (edge.payload.allowed_modes & allowed_modes) == 0
+            || edge.payload.oneway == 2
+            || edge.payload.level > max_snap_level
+        {
+            continue;
+        }
+
+        let Some((_projected, distance_m, progress)) =
+            project_point_onto_edge(graph, indexed.edge_idx, point)
+        else {
+            continue;
+        };
+        if distance_m > max_distance_m {
+            continue;
+        }
+
+        let candidate = ProjectedEdgeCandidate {
+            edge_idx: indexed.edge_idx,
+            distance_m,
+            progress,
+        };
+
+        if edge.payload.osmid == 0 {
+            unkeyed.push(candidate);
+            continue;
+        }
+
+        let key = (edge.payload.osmid, edge.payload.is_reverse);
+        match best_by_way_direction.get_mut(&key) {
+            Some(best) if candidate.distance_m < best.distance_m => *best = candidate,
+            Some(_) => {}
+            None => {
+                best_by_way_direction.insert(key, candidate);
+            }
+        }
+    }
+
+    let mut candidates: Vec<_> = best_by_way_direction.into_values().collect();
+    candidates.extend(unkeyed);
+    candidates.sort_by(|a, b| {
+        a.distance_m
+            .partial_cmp(&b.distance_m)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.edge_idx.cmp(&b.edge_idx))
+    });
+    candidates
+}
+
+fn point_at_edge_progress(
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    edge_idx: crate::graph::EdgeIndex,
+    progress: f64,
+) -> Option<Point<f64>> {
+    let points = oriented_edge_points(graph, edge_idx);
+    if points.is_empty() {
+        return None;
+    }
+    if points.len() == 1 {
+        return Some(points[0]);
+    }
+
+    let lengths: Vec<f64> = points
+        .windows(2)
+        .map(|segment| segment[0].haversine_distance(&segment[1]))
+        .collect();
+    let total: f64 = lengths.iter().sum();
+    if total <= f64::EPSILON {
+        return points.first().copied();
+    }
+
+    let target = progress.clamp(0.0, 1.0) * total;
+    let mut traversed = 0.0;
+    for (i, length) in lengths.iter().copied().enumerate() {
+        if target <= traversed + length || i + 1 == lengths.len() {
+            let fraction = if length <= f64::EPSILON {
+                0.0
+            } else {
+                ((target - traversed) / length).clamp(0.0, 1.0)
+            };
+            let a = points[i];
+            let b = points[i + 1];
+            return Some(Point::new(
+                a.x() + (b.x() - a.x()) * fraction,
+                a.y() + (b.y() - a.y()) * fraction,
+            ));
+        }
+        traversed += length;
+    }
+
+    points.last().copied()
+}
+
+fn push_shape_point(points: &mut Vec<(f64, f64)>, point: Point<f64>) {
+    let candidate = (point.y(), point.x());
+    if points.last().copied() != Some(candidate) {
+        points.push(candidate);
+    }
+}
+
+fn append_edge_slice(
+    output: &mut Vec<(f64, f64)>,
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    edge_idx: crate::graph::EdgeIndex,
+    start_progress: f64,
+    end_progress: f64,
+) {
+    let start_progress = start_progress.clamp(0.0, 1.0);
+    let end_progress = end_progress.clamp(0.0, 1.0);
+    let Some(start) = point_at_edge_progress(graph, edge_idx, start_progress) else {
+        return;
+    };
+    let Some(end) = point_at_edge_progress(graph, edge_idx, end_progress) else {
+        return;
+    };
+
+    if end_progress < start_progress {
+        push_shape_point(output, start);
+        push_shape_point(output, end);
+        return;
+    }
+
+    let edge_points = oriented_edge_points(graph, edge_idx);
+    let lengths: Vec<f64> = edge_points
+        .windows(2)
+        .map(|segment| segment[0].haversine_distance(&segment[1]))
+        .collect();
+    let total: f64 = lengths.iter().sum();
+
+    push_shape_point(output, start);
+    if total > f64::EPSILON {
+        let start_distance = start_progress * total;
+        let end_distance = end_progress * total;
+        let mut traversed = 0.0;
+        for (i, length) in lengths.iter().copied().enumerate() {
+            traversed += length;
+            if i + 1 < edge_points.len() - 1
+                && traversed > start_distance
+                && traversed < end_distance
+            {
+                push_shape_point(output, edge_points[i + 1]);
+            }
+        }
+    }
+    push_shape_point(output, end);
+}
+
+fn append_hop_geometry(
+    output: &mut Vec<(f64, f64)>,
+    graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
+    hop: &crate::router::types::EdgeHop,
+) {
+    if !hop.edges.is_empty() {
+        let last = hop.edges.len() - 1;
+        for (i, &edge_idx) in hop.edges.iter().enumerate() {
+            let start = if i == 0 { hop.start_progr } else { 0.0 };
+            let end = if i == last { hop.end_progr } else { 1.0 };
+            append_edge_slice(output, graph, edge_idx, start, end);
+        }
+        return;
+    }
+
+    let start = hop
+        .start_edge
+        .and_then(|edge_idx| point_at_edge_progress(graph, edge_idx, hop.start_progr))
+        .or(hop.start_point);
+    let end = hop
+        .end_edge
+        .and_then(|edge_idx| point_at_edge_progress(graph, edge_idx, hop.end_progr))
+        .or(hop.end_point);
+
+    if let Some(point) = start {
+        push_shape_point(output, point);
+    }
+    if let Some(point) = end {
+        push_shape_point(output, point);
+    }
+}
+
 pub fn match_patterns(
     gtfs: &GtfsData,
     osm_path: &std::path::Path,
@@ -206,6 +539,7 @@ fn match_patterns_full_graph(
     fn process_patterns(
         gtfs: &GtfsData,
         osm: &OsmData,
+        edge_index: &rstar::RTree<SpatialEdge>,
         patterns: &[(&StopPattern, &Vec<String>)],
         writer: &Mutex<BufWriter<File>>,
         results: &Mutex<AHashMap<StopPattern, ShapeResult>>,
@@ -217,7 +551,7 @@ fn match_patterns_full_graph(
             .map_init(
                 pathfinding::PathfinderContext::new,
                 |ctx, (pattern, trips)| {
-                    let matched = match_one_pattern(gtfs, osm, pattern, trips, ctx);
+                    let matched = match_one_pattern(gtfs, osm, edge_index, pattern, trips, ctx);
                     ctx.discard_if_oversized(500_000);
                     matched
                 },
@@ -256,6 +590,15 @@ fn match_patterns_full_graph(
     let total_patterns = patterns.len();
     println!("Matching {} patterns (full-graph)...", total_patterns);
 
+    // Upstream ShapeBuilder indexes graph edges, not graph nodes, for station
+    // candidates. Build that index once per full-graph run and share it across
+    // pattern workers.
+    let edge_index = build_match_edge_index(osm);
+    println!(
+        "Built edge snap index with {} directed edges",
+        edge_index.size()
+    );
+
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -273,6 +616,7 @@ fn match_patterns_full_graph(
             process_patterns(
                 gtfs,
                 osm,
+                &edge_index,
                 &patterns,
                 &writer,
                 &results,
@@ -284,6 +628,7 @@ fn match_patterns_full_graph(
         process_patterns(
             gtfs,
             osm,
+            &edge_index,
             &patterns,
             &writer,
             &results,
@@ -314,6 +659,7 @@ fn shape_id_for_pattern(pattern: &StopPattern) -> String {
 fn match_one_pattern(
     gtfs: &GtfsData,
     osm: &OsmData,
+    edge_index: &rstar::RTree<SpatialEdge>,
     pattern: &StopPattern,
     trips: &Vec<String>,
     ctx: &mut pathfinding::PathfinderContext,
@@ -336,6 +682,12 @@ fn match_one_pattern(
         .short_name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            sample_trip
+                .trip_short_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+        })
         .or_else(|| route.long_name.as_deref())
         .unwrap_or("")
         .to_string();
@@ -371,73 +723,51 @@ fn match_one_pattern(
     };
     let all_allowed_modes = allowed_modes | fallback_modes;
 
-    let index = osm.spatial_tree.as_ref()?;
-    let (search_node_limit, target_candidates, max_dist_meters) = if allowed_modes == MODE_RAIL {
-        // pfaedle's rail default is 200 m. A larger radius multiplies the number
-        // of graph alternatives at dense Deutsche Bahn stations.
-        (4000, 20, 200.0)
-    } else if allowed_modes == MODE_BUS {
-        (100, 10, 40.0)
+    // ShapeBuilder::getEdgCands always starts with a null candidate and then
+    // projects the stop onto nearby graph edges. The old Rust port searched
+    // nearby *nodes*, required one to exist, and assigned progression 0. That
+    // changes both reachability and routing cost, especially on long rail ways.
+    const STATION_MOVE_PENALTY_PER_METER: f64 = 0.0039;
+    let max_snap_distance_m = if allowed_modes == MODE_RAIL {
+        200.0
     } else {
-        (100, 20, f64::INFINITY)
+        50.0
     };
+    let max_snap_level = if allowed_modes == MODE_RAIL { 2 } else { 7 };
+    let non_station_penalty = if allowed_modes == MODE_RAIL { 0.4 } else { 0.0 };
 
-    let mut stop_candidates: Vec<Vec<usize>> = Vec::with_capacity(stop_coords.len());
-    for point in &stop_coords {
-        let neighbors = index
-            .nearest_neighbor_iter(&[point.x(), point.y()])
-            .filter(|sn| (sn.modes & all_allowed_modes) != 0)
-            .take(search_node_limit);
+    let mut stop_candidates: Vec<EdgeCandGroup> = Vec::with_capacity(stop_coords.len());
+    for &point in &stop_coords {
+        // This candidate must never be removed. Upstream uses it to preserve
+        // geometry when OSM is missing, disconnected, or cannot be snapped.
+        let mut group = vec![EdgeCand {
+            edge: None,
+            point: Some(point),
+            pen: 0.0,
+            time: 0.0,
+            progr: 0.0,
+            dep_prede: Vec::new(),
+        }];
 
-        let mut candidates = Vec::with_capacity(target_candidates);
-        let mut fallback_candidates = Vec::with_capacity(target_candidates);
-        let mut seen_ways: AHashSet<i64> = AHashSet::new();
-
-        for sn in neighbors {
-            if max_dist_meters.is_finite() {
-                let distance = osm
-                    .graph
-                    .node(sn.index)
-                    .payload
-                    .point
-                    .haversine_distance(point);
-                if distance > max_dist_meters {
-                    break;
-                }
-            }
-
-            let node = osm.graph.node(sn.index);
-            let node_ways: Vec<i64> = node
-                .edges()
-                .filter_map(|&edge_idx| {
-                    let osmid = osm.graph.edge(edge_idx).payload.osmid;
-                    (osmid != 0).then_some(osmid)
-                })
-                .collect();
-            let introduces_new_way = node_ways.iter().any(|way| !seen_ways.contains(way));
-
-            if introduces_new_way && candidates.len() < target_candidates {
-                candidates.push(sn.index);
-                seen_ways.extend(node_ways);
-            } else if fallback_candidates.len() < target_candidates {
-                fallback_candidates.push(sn.index);
-            }
-
-            if candidates.len() >= target_candidates {
-                break;
-            }
+        for snapped in edge_candidates_for_stop(
+            edge_index,
+            &osm.graph,
+            point,
+            all_allowed_modes,
+            max_snap_distance_m,
+            max_snap_level,
+        ) {
+            group.push(EdgeCand {
+                edge: Some(snapped.edge_idx),
+                point: None,
+                pen: snapped.distance_m * STATION_MOVE_PENALTY_PER_METER + non_station_penalty,
+                time: 0.0,
+                progr: snapped.progress,
+                dep_prede: Vec::new(),
+            });
         }
 
-        // Preserve a few alternatives on the same way for complicated station
-        // throats while keeping the candidate graph bounded.
-        if candidates.len() < 5 {
-            let needed = 5 - candidates.len();
-            candidates.extend(fallback_candidates.into_iter().take(needed));
-        }
-        if candidates.is_empty() {
-            return None;
-        }
-        stop_candidates.push(candidates);
+        stop_candidates.push(group);
     }
 
     let r_attrs = RoutingAttrs {
@@ -452,39 +782,23 @@ fn match_one_pattern(
     let mut trie = TripTrie::new();
     for trip_id in trips {
         if let Some(trip) = gtfs.gtfs.trips.get(trip_id) {
-            trie.add_trip(trip, &r_attrs, true, false);
+            // Upstream only time-expands the trie for the `timenorm`
+            // transition model. The default model is `exp`, so equivalent trips
+            // should share trie nodes and contribute to averaged hop times.
+            trie.add_trip(trip, &r_attrs, false, false);
         }
     }
 
     fn build_candidate_group(
-        stop_cands: &[crate::graph::NodeIndex],
+        stop_cands: &[EdgeCand],
         nd: &crate::router::trip_trie::TripTrieNd,
-        graph: &crate::graph::Graph<crate::graph::NodePL, crate::graph::EdgePL>,
     ) -> EdgeCandGroup {
-        let mut group = Vec::new();
-        group.push(EdgeCand {
-            edge: None,
-            point: Some(nd.pos),
-            pen: 0.0,
-            time: nd.time as f64,
-            progr: 0.0,
-            dep_prede: vec![],
-        });
-
-        for &node_idx in stop_cands.iter().take(5) {
-            let graph_node = graph.node(node_idx);
-            for &edge_idx in graph_node.edges() {
-                let edge = graph.edge(edge_idx);
-                if edge.from == node_idx {
-                    group.push(EdgeCand {
-                        edge: Some(edge_idx),
-                        point: Some(graph_node.payload.point),
-                        pen: 0.0,
-                        time: nd.time as f64,
-                        progr: 0.0,
-                        dep_prede: vec![],
-                    });
-                }
+        let mut group = stop_cands.to_vec();
+        for candidate in &mut group {
+            candidate.time = nd.time as f64;
+            candidate.dep_prede.clear();
+            if candidate.edge.is_none() {
+                candidate.point = Some(nd.pos);
             }
         }
         group
@@ -520,7 +834,7 @@ fn match_one_pattern(
             .get(stop_idx)
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let mut group = build_candidate_group(stop_cands, nd, &osm.graph);
+        let mut group = build_candidate_group(stop_cands, nd);
         let arrival_time = average_time(nd);
         for candidate in &mut group {
             candidate.time = arrival_time;
@@ -561,6 +875,11 @@ fn match_one_pattern(
     r_opts.line_unmatched_punish_fact = 1.2;
     r_opts.line_name_to_unmatched_punish_fact = 1.1;
     r_opts.line_name_from_unmatched_punish_fact = 1.05;
+    if allowed_modes == MODE_RAIL {
+        // pfaedle.cfg [rail]: discourage full reversals through station throats.
+        r_opts.full_turn_punish_fac = 1_800;
+        r_opts.full_turn_angle = 100.0;
+    }
 
     let mut hop_cache = HopCache::new();
     let routes = router.route(
@@ -574,13 +893,13 @@ fn match_one_pattern(
 
     let mut full_path_geometry = Vec::new();
     if let Some((_leaf_nid, hops)) = routes.into_iter().next() {
-        for hop in hops {
-            for edge_idx in hop.edges {
-                let edge = osm.graph.edge(edge_idx);
-                for point in edge.payload.geometry.coords().skip(1) {
-                    full_path_geometry.push((point.y, point.x));
-                }
-            }
+        for hop in &hops {
+            // Upstream ShapeBuilder::getGeom renders *every* hop. A routed hop
+            // is cropped using start/end progression; a failed hop is rendered
+            // as the straight fallback between its candidate positions. Dropping
+            // empty-edge hops is what made entire services vanish and caused
+            // otherwise-correct shapes to stop at the first failed hop.
+            append_hop_geometry(&mut full_path_geometry, &osm.graph, hop);
         }
     }
 
@@ -1005,6 +1324,80 @@ mod tests {
     use super::*;
     use crate::graph::{EdgePL, Graph, NodePL};
     use geo::LineString;
+
+    #[test]
+    fn edge_projection_tracks_progress_along_the_edge() {
+        let mut graph = Graph::new();
+        let from = graph.add_node(NodePL {
+            comp_id: 0,
+            point: Point::new(0.0, 0.0),
+        });
+        let to = graph.add_node(NodePL {
+            comp_id: 0,
+            point: Point::new(0.01, 0.0),
+        });
+        let mut edge = EdgePL::new();
+        edge.geometry = LineString::new(vec![(0.0, 0.0).into(), (0.01, 0.0).into()]);
+        edge.allowed_modes = MODE_RAIL;
+        edge.osmid = 1;
+        let edge_idx = graph.add_edge(from, to, edge);
+
+        let (_, distance_m, progress) =
+            project_point_onto_edge(&graph, edge_idx, Point::new(0.005, 0.001)).unwrap();
+        assert!((0.45..0.55).contains(&progress));
+        assert!((100.0..125.0).contains(&distance_m));
+    }
+
+    #[test]
+    fn fallback_hops_are_emitted_as_geometry() {
+        let graph: Graph<NodePL, EdgePL> = Graph::new();
+        let hop = crate::router::types::EdgeHop {
+            edges: Vec::new(),
+            start_edge: None,
+            end_edge: None,
+            start_progr: 0.0,
+            end_progr: 0.0,
+            start_point: Some(Point::new(-88.0, 42.0)),
+            end_point: Some(Point::new(-88.1, 42.1)),
+        };
+        let mut points = Vec::new();
+
+        append_hop_geometry(&mut points, &graph, &hop);
+
+        assert_eq!(points, vec![(42.0, -88.0), (42.1, -88.1)]);
+    }
+
+    #[test]
+    fn routed_hops_are_cropped_to_candidate_progress() {
+        let mut graph = Graph::new();
+        let from = graph.add_node(NodePL {
+            comp_id: 0,
+            point: Point::new(0.0, 0.0),
+        });
+        let to = graph.add_node(NodePL {
+            comp_id: 0,
+            point: Point::new(1.0, 0.0),
+        });
+        let mut edge = EdgePL::new();
+        edge.geometry = LineString::new(vec![(0.0, 0.0).into(), (1.0, 0.0).into()]);
+        let edge_idx = graph.add_edge(from, to, edge);
+        let hop = crate::router::types::EdgeHop {
+            edges: vec![edge_idx],
+            start_edge: Some(edge_idx),
+            end_edge: Some(edge_idx),
+            start_progr: 0.25,
+            end_progr: 0.75,
+            start_point: None,
+            end_point: None,
+        };
+        let mut points = Vec::new();
+
+        append_hop_geometry(&mut points, &graph, &hop);
+
+        assert_eq!(points.len(), 2);
+        assert!((points[0].1 - 0.25).abs() < 1e-9);
+        assert!((points[1].1 - 0.75).abs() < 1e-9);
+    }
 
     #[test]
     fn test_backtracking_dead_end() {

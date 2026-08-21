@@ -738,51 +738,19 @@ impl OsmBuilder {
     }
 
     fn post_process(graph: &mut Graph<NodePL, EdgePL>) {
-        // writeODirEdgs: Add reverse edges
+        // Upstream writeODirEdgs creates the opposite-direction edge with the
+        // same base traversal cost. Directionality is represented by the
+        // one-way state and punished afterwards; there is no generic 10% reverse
+        // penalty and no made-up 0.9/1.2 preferred-direction multiplier.
         let existing_edges: AHashSet<(NodeIndex, NodeIndex)> =
             graph.edges.iter().map(|e| (e.from, e.to)).collect();
 
         let mut edges_to_add = Vec::new();
-        for edge in &mut graph.edges {
-            // Apply preferred direction penalties to the forward edge
-            // 0: Neutral, 1: Forward (benefit), 2: Backward (penalty)
-            if edge.payload.preferred_direction == 1 {
-                // Forward is preferred: slight benefit (0.9x)
-                edge.payload.cost = (edge.payload.cost as f64 * 0.9).round() as u32;
-            } else if edge.payload.preferred_direction == 2 {
-                // Backward is preferred: slight penalty (1.2x) for forward traversal
-                edge.payload.cost = (edge.payload.cost as f64 * 1.2).round() as u32;
-            }
-
+        for edge in &graph.edges {
             let u = edge.from;
             let v = edge.to;
             if !existing_edges.contains(&(v, u)) {
-                let mut rev_pl = edge.payload.rev_copy();
-
-                // Logic for reverse edge cost based on preferred direction
-                // Original edge had preferred_direction:
-                // 1 (Forward): Reverse edge is AGAINST preference -> Penalty (1.2x)
-                // 2 (Backward): Reverse edge is WITH preference -> Benefit (0.9x)
-
-                let mut base_cost = edge.payload.cost as f64;
-                if edge.payload.preferred_direction == 1 {
-                    base_cost /= 0.9;
-                } else if edge.payload.preferred_direction == 2 {
-                    base_cost /= 1.2;
-                }
-
-                if edge.payload.preferred_direction == 1 {
-                    // Reverse is against preference
-                    rev_pl.cost = (base_cost * 1.2).round() as u32;
-                } else if edge.payload.preferred_direction == 2 {
-                    // Reverse is with preference
-                    rev_pl.cost = (base_cost * 0.9).round() as u32;
-                } else {
-                    // No preference, apply standard 10% penalty for reverse
-                    rev_pl.cost = (base_cost * 1.1).round() as u32;
-                }
-
-                edges_to_add.push((v, u, rev_pl));
+                edges_to_add.push((v, u, edge.payload.rev_copy()));
             }
         }
 
@@ -790,11 +758,13 @@ impl OsmBuilder {
             graph.add_edge(from, to, pl);
         }
 
-        // writeOneWayPens: Penalize forbidden directions
+        // pfaedle's rail configuration uses osm_one_way_speed_penalty_fac=5.
+        // Keep the forbidden direction available as a costly fallback rather
+        // than multiplying every segment by 100 and making valid rail corridors
+        // effectively unreachable.
         for edge in &mut graph.edges {
             if edge.payload.oneway == 2 {
-                // Severe penalty for wrong direction of one-way
-                edge.payload.cost = edge.payload.cost.saturating_mul(100);
+                edge.payload.cost = edge.payload.cost.saturating_mul(5);
             }
         }
 
@@ -849,16 +819,14 @@ impl OsmBuilder {
         if Self::is_platform(w) {
             return false;
         }
-        // Filter out industrial usage
-        if w.tags.get("usage").map_or(false, |u| u == "industrial") {
-            return false;
-        }
 
-        // Critical Fix: Explicitly include route=ferry ways even if they lack highway tags
+        // Do not drop usage=industrial rail here. Upstream keeps industrial,
+        // military, test and spur tracks at routing level 5 so they remain
+        // available as expensive fallbacks. Removing them can split a passenger
+        // rail component at yards and junction throats.
         if w.tags.get("route").map_or(false, |r| r == "ferry") {
             return true;
         }
-        // Critical Fix: Explicitly include aerialway ways for gondolas
         if w.tags.contains_key("aerialway") {
             return true;
         }
@@ -918,23 +886,50 @@ impl OsmBuilder {
     }
 
     fn parse_level(tags: &Tags) -> i32 {
-        if let Some(l) = tags.get("layer") {
-            l.parse().unwrap_or(0)
+        // This is pfaedle's routing/filter level, not OSM's physical `layer`.
+        // The rail defaults in pfaedle.cfg deliberately keep secondary tracks
+        // but route through them at progressively lower speeds.
+        let service = tags.get("service").map(|s| s.as_str());
+        let usage = tags.get("usage").map(|s| s.as_str());
+        let railway = tags.get("railway").map(|s| s.as_str());
+        let traffic_mode = tags.get("railway:traffic_mode").map(|s| s.as_str());
+
+        if matches!(usage, Some("industrial" | "military" | "test"))
+            || service == Some("spur")
+            || traffic_mode == Some("freight")
+        {
+            5
+        } else if matches!(service, Some("crossover" | "yard")) {
+            3
+        } else if service == Some("siding") || railway == Some("tram") {
+            2
+        } else if usage == Some("branch") {
+            1
         } else {
             0
         }
     }
 
     fn parse_oneway(tags: &Tags) -> u8 {
-        if let Some(ow) = tags.get("oneway") {
-            if ow == "yes" || ow == "true" {
-                return 1;
-            }
-            if ow == "-1" {
-                return 2;
-            }
+        // Explicit bidirectionality overrides preferred-direction tagging.
+        if matches!(tags.get("oneway").map(|s| s.as_str()), Some("no" | "false"))
+            || tags.get("railway:preferred_direction").map(|s| s.as_str()) == Some("both")
+            || tags.get("railway:bidirectional").map(|s| s.as_str()) == Some("regular")
+        {
+            return 0;
         }
-        0
+
+        match tags.get("oneway").map(|s| s.as_str()) {
+            Some("yes" | "true" | "1") => return 1,
+            Some("-1") => return 2,
+            _ => {}
+        }
+
+        match tags.get("railway:preferred_direction").map(|s| s.as_str()) {
+            Some("forward") => 1,
+            Some("backward") => 2,
+            _ => 0,
+        }
     }
 
     fn parse_preferred_direction(tags: &Tags) -> u8 {
@@ -984,41 +979,18 @@ impl OsmBuilder {
     }
 
     fn calculate_cost(tags: &Tags, length_iters: f64) -> u32 {
-        let speed = Self::get_speed(tags);
-        let time_sec = length_iters / speed;
-        let mut cost_float = time_sec * 10.0;
+        let railway = tags.get("railway").map(|s| s.as_str());
+        let speed = if matches!(railway, Some("rail" | "light_rail" | "narrow_gauge")) {
+            // pfaedle.cfg [rail] osm_lvl{0..7}_avg_speed defaults, km/h.
+            const RAIL_LEVEL_SPEED_KMH: [f64; 8] = [120.0, 90.0, 65.0, 50.0, 30.0, 20.0, 10.0, 5.0];
+            let level = Self::parse_level(tags).clamp(0, 7) as usize;
+            RAIL_LEVEL_SPEED_KMH[level] / 3.6
+        } else {
+            Self::get_speed(tags)
+        };
 
-        // Apply penalties
-        let penalty_factor = 100000.0;
-        let mut penalized = false;
-
-        let is_rail = tags.get("railway").map_or(false, |r| r == "rail");
-        let is_industrial = tags.get("usage").map_or(false, |u| u == "industrial");
-
-        // Extreme penalty for industrial rail
-        if is_rail && is_industrial {
-            cost_float *= 10.0 * penalty_factor;
-        }
-
-        if let Some(service) = tags.get("service") {
-            if service.as_str() == "yard"
-                || service.as_str() == "siding"
-                || service.as_str() == "spur"
-            {
-                penalized = true;
-            }
-        }
-        if let Some(usage) = tags.get("usage") {
-            if usage.as_str() == "industrial" || usage.as_str() == "military" {
-                penalized = true;
-            }
-        }
-
-        if penalized {
-            cost_float *= penalty_factor;
-        }
-
-        cost_float.min(u32::MAX as f64).ceil() as u32
+        let time_sec = length_iters / speed.max(0.1);
+        (time_sec * 10.0).min(u32::MAX as f64).ceil() as u32
     }
     pub fn read_relations_only(path: &Path) -> Result<LightOsmData> {
         println!("Reading OSM relations only (light pass) from {:?}...", path);
