@@ -11,6 +11,7 @@ use crate::graph::{
     EdgeIndex, EdgePL, Graph, MODE_BUS, MODE_FERRY, MODE_GONDOLA, MODE_RAIL, MODE_SUBWAY,
     MODE_TRAM, NodeIndex, NodePL, TransitInfo, TransitInfoInterner,
 };
+use crate::osm_filter::OsmFilter;
 use crate::upstream_graph::{
     NODE_FLAG_RESTRICTION, NODE_FLAG_STATION, apply_one_way_penalty, collapse_edges, node_flags,
     write_components, write_other_direction_edges,
@@ -1005,7 +1006,7 @@ impl OsmBuilder {
                     || tags.get("public_transport").map(|v| v.as_str()) == Some("platform")
                     || tags.get("service").map(|v| v.as_str()) == Some("alley")
             }
-            OsmProfile::Bus => Self::bus_way_dropped(way),
+            OsmProfile::Bus => OsmFilter::bus_way_dropped(&way.tags),
             OsmProfile::Ferry => false,
             OsmProfile::Generic(_) => Self::is_platform(way),
         }
@@ -1047,7 +1048,7 @@ impl OsmBuilder {
                     || tags.get("subway").map(|v| v.as_str()) == Some("yes")
                     || tags.get("tram").map(|v| v.as_str()) == Some("yes")
             }
-            OsmProfile::Bus => Self::bus_way_kept(way),
+            OsmProfile::Bus => OsmFilter::bus_way_kept(&way.tags),
             OsmProfile::Ferry => {
                 route == Some("ferry")
                     || ferry_ways.contains(&way.id.0)
@@ -1237,95 +1238,8 @@ impl OsmBuilder {
         let metro = railway == Some("subway");
         let ferry = route == Some("ferry") || ferry_ways.contains(&way.id.0);
         let gondola = aerialway.is_some();
-        let bus = !ferry && !gondola && Self::bus_way_kept(way);
+        let bus = !ferry && !gondola && OsmFilter::bus_way_kept(&way.tags);
         (rail, tram, metro, bus, ferry, gondola)
-    }
-
-    /// Way-level subset of upstream pfaedle.cfg `[bus, coach]` keep/drop rules.
-    /// Relation-member ways are handled separately by the resource pass, just
-    /// like C++ `relKeep()`.
-    fn bus_way_dropped(way: &osmpbfreader::Way) -> bool {
-        let tags = &way.tags;
-        let highway = tags.get("highway").map(|value| value.as_str());
-        // `train=yes|no_match_ways` deliberately does not apply to ways.
-        // `public_transport=stop_area|no_match_nds|no_match_rels` applies only
-        // to ways. This mirrors MotConfigReader's filter flags exactly.
-        tags.get("area").map(|v| v.as_str()) == Some("yes")
-            || tags.get("public_transport").map(|v| v.as_str()) == Some("stop_area")
-            || tags.get("type").map(|v| v.as_str()) == Some("multipolygon")
-            || matches!(
-                tags.get("railway").map(|v| v.as_str()),
-                Some("platform" | "station")
-            )
-            || matches!(highway, Some("proposed" | "footway" | "construction"))
-            || tags
-                .get("building")
-                .is_some_and(|v| v == "yes" || v == "train_station")
-            || tags
-                .get("leisure")
-                .is_some_and(|v| v == "garden" || v == "park")
-    }
-
-    fn bus_way_kept(way: &osmpbfreader::Way) -> bool {
-        let tags = &way.tags;
-        let highway = tags.get("highway").map(|value| value.as_str());
-
-        // Upstream drop rules win even when a keep rule also matches.
-        if Self::bus_way_dropped(way) {
-            return false;
-        }
-
-        if matches!(
-            highway,
-            Some(
-                "motorway"
-                    | "trunk"
-                    | "primary"
-                    | "secondary"
-                    | "tertiary"
-                    | "residential"
-                    | "living_street"
-                    | "unclassified"
-                    | "motorway_link"
-                    | "trunk_link"
-                    | "primary_link"
-                    | "secondary_link"
-                    | "tertiary_link"
-                    | "residential_link"
-                    | "bus_guideway"
-            )
-        ) {
-            return true;
-        }
-
-        let any_value = |key: &str| tags.contains_key(key);
-        let one_of = |key: &str, values: &[&str]| {
-            tags.get(key)
-                .is_some_and(|v| values.iter().any(|candidate| v.as_str() == *candidate))
-        };
-
-        matches!(
-            tags.get("way").map(|v| v.as_str()),
-            Some("primary" | "seconday" | "bus_guideway")
-        ) || any_value("busway")
-            || one_of("psv", &["yes", "designated"])
-            || one_of("bus", &["yes", "designated"])
-            || one_of("minibus", &["yes", "designated"])
-            || one_of("trolley_wire", &["yes"])
-            || one_of("trolleywire", &["yes"])
-            || one_of("trolleybus", &["yes"])
-            || one_of("trolley_bus", &["yes"])
-            || matches!(
-                tags.get("route").map(|v| v.as_str()),
-                Some("bus" | "trolleybus")
-            )
-            || one_of("bus:lanes", &["yes", "designated", "1"])
-            || one_of("lanes:bus", &["1", "2", "3"])
-            || one_of("lanes:psv", &["1", "2", "3"])
-            || any_value("bus_stop")
-            || any_value("stop")
-            || tags.get("public_transport").map(|v| v.as_str()) == Some("stop_position")
-            || highway == Some("bus_stop")
     }
 
     fn parse_level(tags: &Tags) -> i32 {

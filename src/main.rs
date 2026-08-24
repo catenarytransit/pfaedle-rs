@@ -5,6 +5,7 @@ mod gtfs_load;
 mod hilbert;
 mod matcher;
 mod mots;
+mod osm_filter;
 #[path = "osm_builder.rs"]
 mod osm_load;
 #[path = "osm_split_upstream.rs"]
