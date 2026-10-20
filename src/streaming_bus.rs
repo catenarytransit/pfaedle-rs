@@ -66,6 +66,7 @@ impl StreamingMatcher {
     pub fn match_all(
         &mut self,
         gtfs: &GtfsData,
+        assigned_shape_ids: &AHashMap<StopPattern, String>,
         patterns: Vec<(&StopPattern, &Vec<String>)>,
         cache_file_path: &std::path::Path,
     ) -> AHashMap<StopPattern, ShapeResult> {
@@ -206,7 +207,7 @@ impl StreamingMatcher {
                     .par_iter()
                     .map_init(PathfinderContext::new, |ctx, (pattern, trips)| {
                         let mut matched =
-                            match_one_pattern(gtfs, &osm, &edge_index, pattern, trips, ctx);
+                            match_one_pattern(gtfs, assigned_shape_ids, &osm, &edge_index, pattern, trips, ctx);
                         ctx.discard_if_oversized(500_000);
 
                         let Some((matched_pattern, mut shape_result, points)) = matched.take()
