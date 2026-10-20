@@ -12,6 +12,7 @@ mod osm_load;
 mod osm_split;
 mod pathfinding;
 mod router;
+mod shape_ids;
 #[path = "streaming_bus.rs"]
 mod streaming_matcher;
 mod tile_loader;
@@ -166,8 +167,10 @@ fn main() -> Result<()> {
     // 2. Match Patterns (loads OSM on demand)
     // We strictly skip processing small roads for performance unless configured otherwise
     let cache_file_path = out_dir.join("shapes_cache.bin");
+    let assigned_shape_ids = shape_ids::assign_shape_ids(gtfs_data.patterns.keys(), &shapes_path)?;
     let results = matcher::match_patterns(
         &gtfs_data,
+        &assigned_shape_ids,
         &args.osm_file,
         args.skip_small_roads,
         &cache_file_path,
