@@ -10,12 +10,15 @@ use std::path::Path;
 pub struct StopPattern {
     pub stop_ids: Vec<String>,
     pub route_type: Option<RouteType>,
+    pub route_id: String,
+    pub route_name: String,
 }
 
 // Implement Hash/Eq for StopPattern to use as key
 impl PartialEq for StopPattern {
     fn eq(&self, other: &Self) -> bool {
         self.stop_ids == other.stop_ids && self.route_type == other.route_type
+            && self.route_id == other.route_id && self.route_name == other.route_name
     }
 }
 impl Eq for StopPattern {}
@@ -23,6 +26,8 @@ impl std::hash::Hash for StopPattern {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.stop_ids.hash(state);
         self.route_type.hash(state);
+        self.route_id.hash(state);
+        self.route_name.hash(state);
     }
 }
 
@@ -140,10 +145,17 @@ pub fn load_gtfs(path: &Path, allowed_mots: &AHashSet<MotCategory>) -> Result<Gt
         }
 
         let route_type = route.map(|r| r.route_type);
+        let route_name = route
+            .and_then(|r| r.short_name.as_deref())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&trip.route_id)
+            .to_owned();
 
         let pattern = StopPattern {
             stop_ids,
             route_type,
+            route_id: trip.route_id.clone(),
+            route_name,
         };
         patterns.entry(pattern).or_default().push(trip_id.clone());
     }
