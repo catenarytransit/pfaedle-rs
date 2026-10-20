@@ -376,6 +376,7 @@ fn append_hop_geometry(
 
 pub fn match_patterns(
     gtfs: &GtfsData,
+    assigned_shape_ids: &AHashMap<StopPattern, String>,
     osm_path: &std::path::Path,
     skip_small_roads: bool,
     cache_file_path: &std::path::Path,
@@ -410,6 +411,7 @@ pub fn match_patterns(
     let other_results = if other_count > 0 {
         crate::upstream_match::match_nonbus_profiles(
             gtfs,
+            assigned_shape_ids,
             osm_path,
             other_patterns,
             cache_file_path,
@@ -428,7 +430,7 @@ pub fn match_patterns(
         let light_osm =
             OsmBuilder::read_relations_only(osm_path).context("Failed to read OSM relations")?;
         let mut matcher = StreamingMatcher::new(osm_path, 0, light_osm, skip_small_roads)?;
-        matcher.match_all(gtfs, bus_patterns, cache_file_path)
+        matcher.match_all(gtfs, assigned_shape_ids, bus_patterns, cache_file_path)
     } else {
         AHashMap::new()
     };
@@ -437,46 +439,13 @@ pub fn match_patterns(
     let mut results = other_results;
     results.extend(bus_results);
 
-    // 6. Deduplicate shape IDs (handle hash collisions)
-    // It's possible (though unlikely) that two different patterns hash to the same shape_id.
-    // If this happens, one would overwrite the other in main.rs.
-    // We must ensure unique shape IDs for distinct patterns.
-    let mut id_to_patterns: AHashMap<String, Vec<StopPattern>> = AHashMap::new();
-    for (pattern, result) in &results {
-        id_to_patterns
-            .entry(result.shape_id.clone())
-            .or_default()
-            .push(pattern.clone());
-    }
-
-    for (shape_id, patterns) in id_to_patterns {
-        if patterns.len() > 1 {
-            // Collision detected!
-            // We need to update the shape_ids for all but one.
-            // Sort patterns to ensure deterministic reassignment
-            let mut sorted_patterns = patterns;
-            // We can't easily sort StopPattern without Ord, but Hash is stable-ish?
-            // Actually StopPattern usually implements Ord/PartialOrd in gtfs-structures?
-            // Let's assume arbitrary order from map iteration is not deterministic enough if we want 100% reproducibility.
-            // But for preventing overwrite, just distinct suffices.
-            // To be purely deterministic, we should sort by something.
-            // Let's skip sort for now reliance on iteration order (might vary),
-            // but collision is rare enough.
-
-            for (i, pattern) in sorted_patterns.iter().enumerate().skip(1) {
-                if let Some(res) = results.get_mut(pattern) {
-                    res.shape_id = format!("{}_{}", shape_id, i);
-                }
-            }
-        }
-    }
-
     Ok(results)
 }
 
 /// Full-graph matching (original implementation for non-bus modes)
 pub(crate) fn match_patterns_full_graph(
     gtfs: &GtfsData,
+    assigned_shape_ids: &AHashMap<StopPattern, String>,
     osm: &OsmData,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
     cache_file_path: &std::path::Path,
@@ -490,6 +459,7 @@ pub(crate) fn match_patterns_full_graph(
 
     fn process_patterns(
         gtfs: &GtfsData,
+        assigned_shape_ids: &AHashMap<StopPattern, String>,
         osm: &OsmData,
         edge_index: &rstar::RTree<SpatialEdge>,
         patterns: &[(&StopPattern, &Vec<String>)],
@@ -503,7 +473,7 @@ pub(crate) fn match_patterns_full_graph(
             .map_init(
                 pathfinding::PathfinderContext::new,
                 |ctx, (pattern, trips)| {
-                    let matched = match_one_pattern(gtfs, osm, edge_index, pattern, trips, ctx);
+                    let matched = match_one_pattern(gtfs, assigned_shape_ids, osm, edge_index, pattern, trips, ctx);
                     ctx.discard_if_oversized(500_000);
                     matched
                 },
@@ -568,6 +538,7 @@ pub(crate) fn match_patterns_full_graph(
         pool.install(|| {
             process_patterns(
                 gtfs,
+                assigned_shape_ids,
                 osm,
                 &edge_index,
                 &patterns,
@@ -580,6 +551,7 @@ pub(crate) fn match_patterns_full_graph(
     } else {
         process_patterns(
             gtfs,
+            assigned_shape_ids,
             osm,
             &edge_index,
             &patterns,
@@ -600,17 +572,9 @@ pub(crate) fn match_patterns_full_graph(
         .map_err(|_| anyhow::anyhow!("shape result lock poisoned"))
 }
 
-fn shape_id_for_pattern(pattern: &StopPattern) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    pattern.hash(&mut hasher);
-    format!("shape_{}", hasher.finish())
-}
-
 pub(crate) fn match_one_pattern(
     gtfs: &GtfsData,
+    assigned_shape_ids: &AHashMap<StopPattern, String>,
     osm: &OsmData,
     edge_index: &rstar::RTree<SpatialEdge>,
     pattern: &StopPattern,
@@ -884,7 +848,7 @@ pub(crate) fn match_one_pattern(
         }
     }
 
-    let shape_id = shape_id_for_pattern(pattern);
+    let shape_id = assigned_shape_ids.get(pattern)?.clone();
     let empty_geometry = full_path_geometry.is_empty();
     Some((
         (*pattern).clone(),
