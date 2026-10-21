@@ -81,6 +81,7 @@ fn patterns_bbox(
 
 pub fn match_nonbus_profiles(
     gtfs: &GtfsData,
+    assigned_shape_ids: &AHashMap<StopPattern, String>,
     osm_path: &std::path::Path,
     patterns: Vec<(&StopPattern, &Vec<String>)>,
     cache_file_path: &std::path::Path,
@@ -125,6 +126,7 @@ pub fn match_nonbus_profiles(
         let osm = load_osm(osm_path, &route_types, bbox, false)?;
         let results = match_patterns_full_graph(
             gtfs,
+            assigned_shape_ids,
             &osm,
             profile_patterns,
             cache_file_path,
